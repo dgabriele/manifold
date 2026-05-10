@@ -604,6 +604,8 @@ impl TableNamespace<'_> {
 
     fn set_root(&mut self, root: Option<BtreeHeader>) {
         assert!(self.open_tables.is_empty());
+        self.table_tree.clear_pending_table_updates();
+        self.freed_pages.lock().unwrap().clear();
         self.table_tree.set_root(root);
     }
 
