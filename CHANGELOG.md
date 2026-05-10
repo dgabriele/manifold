@@ -1,5 +1,14 @@
 # redb - Changelog
 
+## 4.0.0 - 2026-04-02
+* Implement `Drop` on `AccessGuardMut` and `AccessGuardMutInPlace`, which requires that these be dropped
+  before the `Table` they borrow from.
+  This fixes a critical bug where the accessor could outlive the `Table`, and be dropped after the
+  transaction had already committed. This could cause data loss due to the data in the accessor
+  being written out after the transaction had already completed.
+* Remove `Legacy` type. To migrate off the `Legacy` type, use the `Legacy` type in the 3.x release
+  and copy the data to a table with plain tuples, before upgrading to the 4.x release.
+
 ## 3.1.3 - 2026-04-02
 * Fix a data loss bug which can occur when the guard returned from `Table::get_mut()` is dropped
   after the transaction has been committed.
