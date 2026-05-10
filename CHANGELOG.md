@@ -1,5 +1,30 @@
 # redb - Changelog
 
+## 4.2.0 - 2026-XX-XX
+* Optimize `Table::retain()` and `Table::retain_in()`. Some benchmarks on large tables show a 25x speedup.
+* Add `Table::entry()` and the associated `Entry`, `OccupiedEntry`, and `VacantEntry`
+  types, mirroring `std::collections::BTreeMap::entry`. Supports `or_insert`,
+  `or_insert_with`, `or_insert_with_key`, `and_modify`, and the usual `OccupiedEntry`
+  / `VacantEntry` accessors.
+* `Table::retain()`, `Table::retain_in()`, `Table::extract_if()`, and `Table::extract_from_if()`
+  now poison the write transaction if their predicate panics, causing `WriteTransaction::commit()`
+  to return `CommitError::TransactionPoisoned`.
+* Add `ExtractIf::close()` to explicitly finalize an extract iterator without removing unread
+  entries.
+* Optimize `Table::pop_first()` and `Table::pop_last()` to be about 2x faster.
+* Enable file space reclamation during non-durable transactions performed while a savepoint exists.
+* Reuse pages freed by a durable write transaction in the next write transaction when no
+  live read transaction or savepoint still needs them. Previously, pages were not reused for one
+  additional transaction.
+* Fix a bug where calling `compact()` on a database could cause the file to grow
+  rather than shrink in some cases.
+
+### Python bindings
+* Add `Database.create(path)` for creating or opening a database file.
+* Add `Database.begin_write()`, which returns a `WriteTransaction`
+  context manager. Exiting the `with` block commits the transaction on success
+  and aborts it if an exception propagates out of the block.
+
 ## 4.1.0 - 2026-04-19
 **This release contains a large number of bug fixes discovered by AI coding agents**
 

@@ -31,6 +31,23 @@ fix the underlying issue — do not bypass checks.
 If you are touching workspace crates beyond the main `redb` crate, run
 `just test_all` instead, which also builds and tests the full workspace.
 
+## Style guide
+- Comments should be brief and focus on important invariants, architectural details, or other
+  long-term relevant information. They should not contain minor implementation details of the current
+  commit.
+
+## Git commits
+1) git commits should use your human's name and email address for authorship. Add "Assisted-by:" and
+   your agent name at the end of the commit message. In the same style as the
+   [Linux Kernel's coding assistant guidelines](https://github.com/torvalds/linux/blob/master/Documentation/process/coding-assistants.rst).
+2) Make one commit per feature / bug fix when opening a PR. Multiple commits or "fixup" commits are
+   should not be merged to master.
+
+## Release notes
+
+Changes that are significant to users should be documented in `CHANGELOG.md`. Entries should be
+brief and focus on the user-facing impact of the change, not on implementation details.
+
 ## Fuzzing
 
 `just fuzz` runs the libFuzzer-based harness under `fuzz/` (`fuzz_redb`) with

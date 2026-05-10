@@ -86,7 +86,7 @@ struct LRUWriteCache {
 impl LRUWriteCache {
     fn new() -> Self {
         Self {
-            cache: Default::default(),
+            cache: LRUCache::default(),
         }
     }
 
@@ -280,15 +280,15 @@ impl PagedCachedFile {
             max_cache_size,
             next_eviction_stripe: AtomicUsize::new(0),
             #[cfg(feature = "cache_metrics")]
-            reads_total: Default::default(),
+            reads_total: AtomicU64::default(),
             #[cfg(feature = "cache_metrics")]
-            reads_hits: Default::default(),
+            reads_hits: AtomicU64::default(),
             #[cfg(feature = "cache_metrics")]
-            writes_total: Default::default(),
+            writes_total: AtomicU64::default(),
             #[cfg(feature = "cache_metrics")]
-            writes_hits: Default::default(),
+            writes_hits: AtomicU64::default(),
             #[cfg(feature = "cache_metrics")]
-            evictions: Default::default(),
+            evictions: AtomicU64::default(),
             read_cache,
             write_buffer: Arc::new(Mutex::new(LRUWriteCache::new())),
         })
@@ -459,10 +459,31 @@ impl PagedCachedFile {
 
     // Caller should invalidate all cached pages that are no longer valid
     pub(super) fn resize(&self, len: u64) -> Result {
-        // TODO: be more fine-grained about this invalidation
-        self.invalidate_cache_all();
+        // Growing leaves all existing cached pages valid. Shrinking only
+        // invalidates pages whose offset falls past the new end-of-file.
+        let old_len = self.file.len()?;
+        if len < old_len {
+            self.invalidate_read_cache_above(len);
+        }
 
         self.file.set_len(len)
+    }
+
+    // Drop cached read pages whose offset is at or beyond `threshold`.
+    fn invalidate_read_cache_above(&self, threshold: u64) {
+        for cache_slot in 0..self.read_cache.len() {
+            let mut lock = self.read_cache[cache_slot].write().unwrap();
+            let stale: Vec<u64> = lock
+                .iter_mut()
+                .filter_map(|(k, _)| (*k >= threshold).then_some(*k))
+                .collect();
+            for k in stale {
+                if let Some(removed) = lock.remove(k) {
+                    self.read_cache_bytes
+                        .fetch_sub(removed.len(), Ordering::AcqRel);
+                }
+            }
+        }
     }
 
     pub(super) fn flush(&self) -> Result {
@@ -597,7 +618,6 @@ impl PagedCachedFile {
         assert_eq!(0, offset % self.page_size);
         let mut lock = self.write_buffer.lock().unwrap();
 
-        // TODO: allow hint that page is known to be dirty and will not be in the read cache
         let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
         let existing = {
             let mut lock = self.read_cache[cache_slot].write().unwrap();
@@ -721,5 +741,27 @@ mod test {
         t2.join().unwrap();
         cached_file.invalidate_cache(0, 128);
         assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn resize_preserves_cached_pages() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(1024).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 4096).unwrap();
+
+        // Populate the read cache with two pages from opposite ends of the file.
+        cached_file.read(0, 128, PageHint::None).unwrap();
+        cached_file.read(512, 128, PageHint::None).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 256);
+
+        // Growing must keep every cached page valid.
+        cached_file.resize(2048).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 256);
+        assert_eq!(cached_file.raw_file_len().unwrap(), 2048);
+
+        // Shrinking only drops pages whose offset is at or beyond the new end.
+        cached_file.resize(256).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
+        assert_eq!(cached_file.raw_file_len().unwrap(), 256);
     }
 }

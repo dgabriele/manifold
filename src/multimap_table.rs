@@ -3,451 +3,26 @@ use crate::multimap_table::DynamicCollectionType::{Inline, SubtreeV2};
 use crate::sealed::Sealed;
 use crate::table::{ReadableTableMetadata, TableStats};
 use crate::tree_store::{
-    AllPageNumbersBtreeIter, BRANCH, BranchAccessor, BranchMutator, Btree, BtreeHeader, BtreeMut,
-    BtreeRangeIter, BtreeStats, Checksum, DEFERRED, LEAF, LeafAccessor, LeafMutator,
-    MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, Page, PageHint, PageNumber, PagePath, PageTrackerPolicy,
-    RawBtree, RawLeafBuilder, TransactionalMemory, UntypedBtree, UntypedBtreeMut, btree_stats,
+    AllPageNumbersBtreeIter, BRANCH, Btree, BtreeHeader, BtreeMut, BtreeRangeIter,
+    DynamicCollection, DynamicCollectionType, LEAF, LeafAccessor, MAX_PAIR_LENGTH,
+    MAX_VALUE_LENGTH, Page, PageAllocator, PageHint, PageNumber, PageResolver, PageTrackerPolicy,
+    RawBtree, RawLeafBuilder, multimap_btree_stats,
 };
-use crate::types::{Key, TypeName, Value};
+use crate::types::{Key, Value};
 use crate::{AccessGuard, MultimapTableHandle, Result, StorageError, WriteTransaction};
 use std::borrow::Borrow;
-use std::cmp::max;
-use std::collections::HashMap;
-use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::mem;
-use std::mem::size_of;
-use std::ops::{RangeBounds, RangeFull};
+use std::ops::{Range, RangeBounds, RangeFull};
 use std::sync::{Arc, Mutex};
 
-pub(crate) fn multimap_btree_stats(
-    root: Option<PageNumber>,
-    mem: &TransactionalMemory,
-    fixed_key_size: Option<usize>,
-    fixed_value_size: Option<usize>,
-    hint: PageHint,
-) -> Result<BtreeStats> {
-    if let Some(root) = root {
-        multimap_stats_helper(root, mem, fixed_key_size, fixed_value_size, hint)
-    } else {
-        Ok(BtreeStats {
-            tree_height: 0,
-            leaf_pages: 0,
-            branch_pages: 0,
-            stored_leaf_bytes: 0,
-            metadata_bytes: 0,
-            fragmented_bytes: 0,
-        })
-    }
-}
-
-fn multimap_stats_helper(
-    page_number: PageNumber,
-    mem: &TransactionalMemory,
-    fixed_key_size: Option<usize>,
-    fixed_value_size: Option<usize>,
-    hint: PageHint,
-) -> Result<BtreeStats> {
-    let page = mem.get_page(page_number, hint)?;
-    let node_mem = page.memory();
-    match node_mem[0] {
-        LEAF => {
-            let accessor = LeafAccessor::new(
-                page.memory(),
-                fixed_key_size,
-                DynamicCollection::<()>::fixed_width_with(fixed_value_size),
-            );
-            let mut leaf_bytes = 0u64;
-            let mut is_branch = false;
-            for i in 0..accessor.num_pairs() {
-                let entry = accessor.entry(i).unwrap();
-                let collection: &UntypedDynamicCollection =
-                    UntypedDynamicCollection::new(entry.value());
-                match collection.collection_type() {
-                    Inline => {
-                        let inline_accessor = LeafAccessor::new(
-                            collection.as_inline(),
-                            fixed_value_size,
-                            <() as Value>::fixed_width(),
-                        );
-                        leaf_bytes +=
-                            inline_accessor.length_of_pairs(0, inline_accessor.num_pairs()) as u64;
-                    }
-                    SubtreeV2 => {
-                        is_branch = true;
-                    }
-                }
-            }
-            let mut overhead_bytes = (accessor.total_length() as u64) - leaf_bytes;
-            let mut fragmented_bytes = (page.memory().len() - accessor.total_length()) as u64;
-            let mut max_child_height = 0;
-            let (mut leaf_pages, mut branch_pages) = if is_branch { (0, 1) } else { (1, 0) };
-
-            for i in 0..accessor.num_pairs() {
-                let entry = accessor.entry(i).unwrap();
-                let collection: &UntypedDynamicCollection =
-                    UntypedDynamicCollection::new(entry.value());
-                match collection.collection_type() {
-                    Inline => {
-                        // data is inline, so it was already counted above
-                    }
-                    SubtreeV2 => {
-                        // this is a sub-tree, so traverse it
-                        let stats = btree_stats(
-                            Some(collection.as_subtree().root),
-                            mem,
-                            fixed_value_size,
-                            <() as Value>::fixed_width(),
-                            hint,
-                        )?;
-                        max_child_height = max(max_child_height, stats.tree_height);
-                        branch_pages += stats.branch_pages;
-                        leaf_pages += stats.leaf_pages;
-                        fragmented_bytes += stats.fragmented_bytes;
-                        overhead_bytes += stats.metadata_bytes;
-                        leaf_bytes += stats.stored_leaf_bytes;
-                    }
-                }
-            }
-
-            Ok(BtreeStats {
-                tree_height: max_child_height + 1,
-                leaf_pages,
-                branch_pages,
-                stored_leaf_bytes: leaf_bytes,
-                metadata_bytes: overhead_bytes,
-                fragmented_bytes,
-            })
-        }
-        BRANCH => {
-            let accessor = BranchAccessor::new(&page, fixed_key_size);
-            let mut max_child_height = 0;
-            let mut leaf_pages = 0;
-            let mut branch_pages = 1;
-            let mut stored_leaf_bytes = 0;
-            let mut metadata_bytes = accessor.total_length() as u64;
-            let mut fragmented_bytes = (page.memory().len() - accessor.total_length()) as u64;
-            for i in 0..accessor.count_children() {
-                if let Some(child) = accessor.child_page(i) {
-                    let stats =
-                        multimap_stats_helper(child, mem, fixed_key_size, fixed_value_size, hint)?;
-                    max_child_height = max(max_child_height, stats.tree_height);
-                    leaf_pages += stats.leaf_pages;
-                    branch_pages += stats.branch_pages;
-                    stored_leaf_bytes += stats.stored_leaf_bytes;
-                    metadata_bytes += stats.metadata_bytes;
-                    fragmented_bytes += stats.fragmented_bytes;
-                }
-            }
-
-            Ok(BtreeStats {
-                tree_height: max_child_height + 1,
-                leaf_pages,
-                branch_pages,
-                stored_leaf_bytes,
-                metadata_bytes,
-                fragmented_bytes,
-            })
-        }
-        _ => unreachable!(),
-    }
-}
-
-// Verify all the checksums in the tree, including any Dynamic collection subtrees
-pub(crate) fn verify_tree_and_subtree_checksums(
-    root: Option<BtreeHeader>,
-    key_size: Option<usize>,
-    value_size: Option<usize>,
-    mem: Arc<TransactionalMemory>,
-    hint: PageHint,
-) -> Result<bool> {
-    if let Some(header) = root {
-        if !RawBtree::new(
-            Some(header),
-            key_size,
-            DynamicCollection::<()>::fixed_width_with(value_size),
-            mem.clone(),
-            hint,
-        )
-        .verify_checksum()?
-        {
-            return Ok(false);
-        }
-
-        let table_pages_iter = AllPageNumbersBtreeIter::new(
-            header.root,
-            key_size,
-            DynamicCollection::<()>::fixed_width_with(value_size),
-            mem.clone(),
-            hint,
-        )?;
-        for table_page in table_pages_iter {
-            let page = mem.get_page(table_page?, hint)?;
-            let subtree_roots = parse_subtree_roots(&page, key_size, value_size);
-            for header in subtree_roots {
-                if !RawBtree::new(
-                    Some(header),
-                    value_size,
-                    <()>::fixed_width(),
-                    mem.clone(),
-                    hint,
-                )
-                .verify_checksum()?
-                {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-
-    Ok(true)
-}
-
-// Relocate all subtrees to lower index pages, if possible
-pub(crate) fn relocate_subtrees(
-    root: (PageNumber, Checksum),
-    key_size: Option<usize>,
-    value_size: Option<usize>,
-    mem: Arc<TransactionalMemory>,
-    freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-    relocation_map: &HashMap<PageNumber, PageNumber>,
-) -> Result<(PageNumber, Checksum)> {
-    let old_page = mem.get_page(root.0, PageHint::None)?;
-    let mut new_page = if let Some(new_page_number) = relocation_map.get(&root.0) {
-        mem.get_page_mut(*new_page_number)?
-    } else {
-        return Ok(root);
-    };
-    let new_page_number = new_page.get_page_number();
-    new_page.memory_mut().copy_from_slice(old_page.memory());
-
-    match old_page.memory()[0] {
-        LEAF => {
-            let accessor = LeafAccessor::new(
-                old_page.memory(),
-                key_size,
-                UntypedDynamicCollection::fixed_width_with(value_size),
-            );
-            // TODO: maybe there's a better abstraction, so that we don't need to call into this low-level method?
-            let mut mutator = LeafMutator::new(
-                new_page.memory_mut(),
-                key_size,
-                UntypedDynamicCollection::fixed_width_with(value_size),
-            );
-            for i in 0..accessor.num_pairs() {
-                let entry = accessor.entry(i).unwrap();
-                let collection = UntypedDynamicCollection::from_bytes(entry.value());
-                if matches!(collection.collection_type(), SubtreeV2) {
-                    let sub_root = collection.as_subtree();
-                    let mut tree = UntypedBtreeMut::new(
-                        Some(sub_root),
-                        mem.clone(),
-                        freed_pages.clone(),
-                        value_size,
-                        <() as Value>::fixed_width(),
-                    );
-                    tree.relocate(relocation_map)?;
-                    if sub_root != tree.get_root().unwrap() {
-                        let new_collection =
-                            UntypedDynamicCollection::make_subtree_data(tree.get_root().unwrap());
-                        mutator.replace(i, &new_collection);
-                    }
-                }
-            }
-        }
-        BRANCH => {
-            let accessor = BranchAccessor::new(&old_page, key_size);
-            let mut mutator = BranchMutator::new(new_page.memory_mut());
-            for i in 0..accessor.count_children() {
-                if let Some(child) = accessor.child_page(i) {
-                    let child_checksum = accessor.child_checksum(i).unwrap();
-                    let (new_child, new_checksum) = relocate_subtrees(
-                        (child, child_checksum),
-                        key_size,
-                        value_size,
-                        mem.clone(),
-                        freed_pages.clone(),
-                        relocation_map,
-                    )?;
-                    mutator.write_child_page(i, new_child, new_checksum);
-                }
-            }
-        }
-        _ => unreachable!(),
-    }
-
-    let old_page_number = old_page.get_page_number();
-    drop(old_page);
-    // No need to track allocations, because this method is only called during compaction when
-    // there can't be any savepoints
-    let mut ignore = PageTrackerPolicy::Ignore;
-    if !mem.free_if_uncommitted(old_page_number, &mut ignore) {
-        freed_pages.lock().unwrap().push(old_page_number);
-    }
-    Ok((new_page_number, DEFERRED))
-}
-
-// Finalize all the checksums in the tree, including any Dynamic collection subtrees
-// Returns the root checksum
-pub(crate) fn finalize_tree_and_subtree_checksums(
-    root: Option<BtreeHeader>,
-    key_size: Option<usize>,
-    value_size: Option<usize>,
-    mem: Arc<TransactionalMemory>,
-) -> Result<Option<BtreeHeader>> {
-    let freed_pages = Arc::new(Mutex::new(vec![]));
-    let mut tree = UntypedBtreeMut::new(
-        root,
-        mem.clone(),
-        freed_pages.clone(),
-        key_size,
-        DynamicCollection::<()>::fixed_width_with(value_size),
-    );
-    tree.dirty_leaf_visitor(|mut leaf_page| {
-        let mut sub_root_updates = vec![];
-        let accessor = LeafAccessor::new(
-            leaf_page.memory(),
-            key_size,
-            DynamicCollection::<()>::fixed_width_with(value_size),
-        );
-        for i in 0..accessor.num_pairs() {
-            let entry = accessor.entry(i).unwrap();
-            let collection = <&DynamicCollection<()>>::from_bytes(entry.value());
-            if matches!(collection.collection_type(), SubtreeV2) {
-                let sub_root = collection.as_subtree();
-                if mem.uncommitted(sub_root.root) {
-                    let mut subtree = UntypedBtreeMut::new(
-                        Some(sub_root),
-                        mem.clone(),
-                        freed_pages.clone(),
-                        value_size,
-                        <()>::fixed_width(),
-                    );
-                    let subtree_root = subtree.finalize_dirty_checksums()?.unwrap();
-                    sub_root_updates.push((i, subtree_root));
-                }
-            }
-        }
-        // TODO: maybe there's a better abstraction, so that we don't need to call into this low-level method?
-        let mut mutator = LeafMutator::new(
-            leaf_page.memory_mut(),
-            key_size,
-            DynamicCollection::<()>::fixed_width_with(value_size),
-        );
-        for (i, sub_root) in sub_root_updates {
-            let collection = DynamicCollection::<()>::make_subtree_data(sub_root);
-            mutator.replace(i, &collection);
-        }
-
-        Ok(())
-    })?;
-
-    let root = tree.finalize_dirty_checksums()?;
-    // No pages should have been freed by this operation
-    assert!(freed_pages.lock().unwrap().is_empty());
-    Ok(root)
-}
-
-fn parse_subtree_roots<T: Page>(
-    page: &T,
-    fixed_key_size: Option<usize>,
-    fixed_value_size: Option<usize>,
-) -> Vec<BtreeHeader> {
-    match page.memory()[0] {
-        BRANCH => {
-            vec![]
-        }
-        LEAF => {
-            let mut result = vec![];
-            let accessor = LeafAccessor::new(
-                page.memory(),
-                fixed_key_size,
-                DynamicCollection::<()>::fixed_width_with(fixed_value_size),
-            );
-            for i in 0..accessor.num_pairs() {
-                let entry = accessor.entry(i).unwrap();
-                let collection = <&DynamicCollection<()>>::from_bytes(entry.value());
-                if matches!(collection.collection_type(), SubtreeV2) {
-                    result.push(collection.as_subtree());
-                }
-            }
-
-            result
-        }
-        _ => unreachable!(),
-    }
-}
-
-pub(crate) struct UntypedMultiBtree {
-    mem: Arc<TransactionalMemory>,
-    root: Option<BtreeHeader>,
-    hint: PageHint,
-    key_width: Option<usize>,
-    value_width: Option<usize>,
-}
-
-impl UntypedMultiBtree {
-    pub(crate) fn new(
-        root: Option<BtreeHeader>,
-        mem: Arc<TransactionalMemory>,
-        hint: PageHint,
-        key_width: Option<usize>,
-        value_width: Option<usize>,
-    ) -> Self {
-        Self {
-            mem,
-            root,
-            hint,
-            key_width,
-            value_width,
-        }
-    }
-
-    // Applies visitor to pages in the tree
-    pub(crate) fn visit_all_pages<F>(&self, mut visitor: F) -> Result
-    where
-        F: FnMut(&PagePath) -> Result,
-    {
-        let tree = UntypedBtree::new(
-            self.root,
-            self.mem.clone(),
-            self.hint,
-            self.key_width,
-            UntypedDynamicCollection::fixed_width_with(self.value_width),
-        );
-        tree.visit_all_pages(|path| {
-            visitor(path)?;
-            let page = self.mem.get_page(path.page_number(), self.hint)?;
-            match page.memory()[0] {
-                LEAF => {
-                    for header in parse_subtree_roots(&page, self.key_width, self.value_width) {
-                        let subtree = UntypedBtree::new(
-                            Some(header),
-                            self.mem.clone(),
-                            self.hint,
-                            self.value_width,
-                            <() as Value>::fixed_width(),
-                        );
-                        subtree.visit_all_pages(|subpath| {
-                            let full_path = path.with_subpath(subpath);
-                            visitor(&full_path)
-                        })?;
-                    }
-                }
-                BRANCH => {
-                    // No-op. The tree.visit_pages() call will process this sub-tree
-                }
-                _ => unreachable!(),
-            }
-            Ok(())
-        })?;
-
-        Ok(())
-    }
-}
-
 pub(crate) struct LeafKeyIter<'a, V: Key + 'static> {
-    inline_collection: AccessGuard<'a, &'static DynamicCollection<V>>,
+    // Kept alive so any Drop side-effects on `data` (e.g. `remove_on_drop`) still run.
+    _inline_collection: AccessGuard<'a, &'static DynamicCollection<V>>,
+    // Arc-backed view of the page holding the inline collection.
+    page_data: Arc<[u8]>,
+    // Byte range in `page_data` holding the inline leaf data for the collection.
+    inline_range: Range<usize>,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
     start_entry: isize, // inclusive
@@ -460,11 +35,18 @@ impl<'a, V: Key> LeafKeyIter<'a, V> {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
     ) -> Self {
-        let accessor =
-            LeafAccessor::new(data.value().as_inline(), fixed_key_size, fixed_value_size);
+        let (page_data, value_range) = data.arc_view();
+        let inline_range = DynamicCollection::<V>::inline_range_within(value_range);
+        let accessor = LeafAccessor::new(
+            &page_data[inline_range.clone()],
+            fixed_key_size,
+            fixed_value_size,
+        );
         let end_entry = isize::try_from(accessor.num_pairs()).unwrap() - 1;
         Self {
-            inline_collection: data,
+            _inline_collection: data,
+            page_data,
+            inline_range,
             fixed_key_size,
             fixed_value_size,
             start_entry: 0,
@@ -472,203 +54,131 @@ impl<'a, V: Key> LeafKeyIter<'a, V> {
         }
     }
 
-    fn next_key(&mut self) -> Option<&[u8]> {
-        if self.end_entry < self.start_entry {
-            return None;
-        }
+    fn inline_bytes(&self) -> &[u8] {
+        &self.page_data[self.inline_range.clone()]
+    }
+
+    fn num_values(&self) -> u64 {
         let accessor = LeafAccessor::new(
-            self.inline_collection.value().as_inline(),
+            self.inline_bytes(),
             self.fixed_key_size,
             self.fixed_value_size,
         );
+        accessor.num_pairs() as u64
+    }
+
+    fn key_at(&self, n: usize) -> Option<AccessGuard<'static, V>> {
+        let accessor = LeafAccessor::new(
+            self.inline_bytes(),
+            self.fixed_key_size,
+            self.fixed_value_size,
+        );
+        let (key_range, _) = accessor.entry_ranges(n)?;
+        let absolute =
+            (self.inline_range.start + key_range.start)..(self.inline_range.start + key_range.end);
+        Some(AccessGuard::with_arc_page(self.page_data.clone(), absolute))
+    }
+
+    fn next_key(&mut self) -> Option<AccessGuard<'static, V>> {
+        if self.end_entry < self.start_entry {
+            return None;
+        }
         self.start_entry += 1;
-        accessor
-            .entry((self.start_entry - 1).try_into().unwrap())
-            .map(|e| e.key())
+        self.key_at((self.start_entry - 1).try_into().unwrap())
     }
 
-    fn next_key_back(&mut self) -> Option<&[u8]> {
+    fn next_key_back(&mut self) -> Option<AccessGuard<'static, V>> {
         if self.end_entry < self.start_entry {
             return None;
         }
-        let accessor = LeafAccessor::new(
-            self.inline_collection.value().as_inline(),
-            self.fixed_key_size,
-            self.fixed_value_size,
-        );
         self.end_entry -= 1;
-        accessor
-            .entry((self.end_entry + 1).try_into().unwrap())
-            .map(|e| e.key())
+        self.key_at((self.end_entry + 1).try_into().unwrap())
     }
 }
 
-enum DynamicCollectionType {
-    Inline,
-    // Was used in file format version 1
-    // Subtree,
-    SubtreeV2,
+enum ValueIterState<'a, V: Key + 'static> {
+    Subtree(Box<BtreeRangeIter<V, ()>>),
+    InlineLeaf(LeafKeyIter<'a, V>),
 }
 
-impl From<u8> for DynamicCollectionType {
-    fn from(value: u8) -> Self {
-        match value {
-            LEAF => Inline,
-            // 2 => Subtree,
-            3 => SubtreeV2,
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<u8> for DynamicCollectionType {
-    fn into(self) -> u8 {
-        match self {
-            // Reuse the LEAF type id, so that we can cast this directly into the format used by
-            // LeafAccessor
-            Inline => LEAF,
-            // Subtree => 2,
-            SubtreeV2 => 3,
-        }
-    }
-}
-
-/// Layout:
-/// type (1 byte):
-/// * 1 = inline data
-/// * 2 = sub tree
-///
-/// (when type = 1) data (n bytes): inlined leaf node
-///
-/// (when type = 2) root (8 bytes): sub tree root page number
-/// (when type = 2) checksum (16 bytes): sub tree checksum
-///
-/// NOTE: Even though the [`PhantomData`] is zero-sized, the inner data DST must be placed last.
-/// See [Exotically Sized Types](https://doc.rust-lang.org/nomicon/exotic-sizes.html#dynamically-sized-types-dsts)
-/// section of the Rustonomicon for more details.
-#[repr(transparent)]
-struct DynamicCollection<V: Key> {
+pub struct MultimapValue<'a, V: Key + 'static> {
+    inner: Option<ValueIterState<'a, V>>,
+    remaining: u64,
+    freed_pages: Option<Arc<Mutex<Vec<PageNumber>>>>,
+    allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
+    free_on_drop: Vec<PageNumber>,
+    _transaction_guard: Arc<TransactionGuard>,
+    page_allocator: Option<PageAllocator>,
     _value_type: PhantomData<V>,
-    data: [u8],
 }
 
-impl<V: Key> std::fmt::Debug for DynamicCollection<V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynamicCollection")
-            .field("data", &&self.data)
-            .finish()
-    }
-}
-
-impl<V: Key> Value for &DynamicCollection<V> {
-    type SelfType<'a>
-        = &'a DynamicCollection<V>
-    where
-        Self: 'a;
-    type AsBytes<'a>
-        = &'a [u8]
-    where
-        Self: 'a;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> &'a DynamicCollection<V>
-    where
-        Self: 'a,
-    {
-        DynamicCollection::new(data)
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> &'a [u8]
-    where
-        Self: 'b,
-    {
-        &value.data
-    }
-
-    fn type_name() -> TypeName {
-        TypeName::internal("redb::DynamicCollection")
-    }
-}
-
-impl<V: Key> DynamicCollection<V> {
-    fn new(data: &[u8]) -> &Self {
-        unsafe { &*(std::ptr::from_ref::<[u8]>(data) as *const DynamicCollection<V>) }
-    }
-
-    fn collection_type(&self) -> DynamicCollectionType {
-        DynamicCollectionType::from(self.data[0])
-    }
-
-    fn as_inline(&self) -> &[u8] {
-        debug_assert!(matches!(self.collection_type(), Inline));
-        &self.data[1..]
-    }
-
-    fn as_subtree(&self) -> BtreeHeader {
-        assert!(matches!(self.collection_type(), SubtreeV2));
-        BtreeHeader::from_le_bytes(
-            self.data[1..=BtreeHeader::serialized_size()]
-                .try_into()
-                .unwrap(),
-        )
-    }
-
-    fn get_num_values(&self) -> u64 {
-        match self.collection_type() {
-            Inline => {
-                let leaf_data = self.as_inline();
-                let accessor =
-                    LeafAccessor::new(leaf_data, V::fixed_width(), <() as Value>::fixed_width());
-                accessor.num_pairs() as u64
-            }
-            SubtreeV2 => {
-                let offset = 1 + PageNumber::serialized_size() + size_of::<Checksum>();
-                u64::from_le_bytes(
-                    self.data[offset..(offset + size_of::<u64>())]
-                        .try_into()
-                        .unwrap(),
-                )
-            }
+impl<'a, V: Key + 'static> MultimapValue<'a, V> {
+    fn new_subtree(
+        inner: BtreeRangeIter<V, ()>,
+        num_values: u64,
+        guard: Arc<TransactionGuard>,
+    ) -> Self {
+        Self {
+            inner: Some(ValueIterState::Subtree(Box::new(inner))),
+            remaining: num_values,
+            freed_pages: None,
+            allocated_pages: Arc::new(Mutex::new(PageTrackerPolicy::Closed)),
+            free_on_drop: vec![],
+            _transaction_guard: guard,
+            page_allocator: None,
+            _value_type: PhantomData,
         }
     }
 
-    fn make_inline_data(data: &[u8]) -> Vec<u8> {
-        let mut result = vec![Inline.into()];
-        result.extend_from_slice(data);
-
-        result
+    fn new_subtree_free_on_drop(
+        inner: BtreeRangeIter<V, ()>,
+        num_values: u64,
+        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
+        allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
+        pages: Vec<PageNumber>,
+        guard: Arc<TransactionGuard>,
+        page_allocator: PageAllocator,
+    ) -> Self {
+        Self {
+            inner: Some(ValueIterState::Subtree(Box::new(inner))),
+            remaining: num_values,
+            freed_pages: Some(freed_pages),
+            free_on_drop: pages,
+            allocated_pages,
+            _transaction_guard: guard,
+            page_allocator: Some(page_allocator),
+            _value_type: PhantomData,
+        }
     }
 
-    fn make_subtree_data(header: BtreeHeader) -> Vec<u8> {
-        let mut result = vec![SubtreeV2.into()];
-        result.extend_from_slice(&header.to_le_bytes());
-        result
+    fn new_inline(inner: LeafKeyIter<'a, V>, guard: Arc<TransactionGuard>) -> Self {
+        let remaining = inner.num_values();
+        Self {
+            inner: Some(ValueIterState::InlineLeaf(inner)),
+            remaining,
+            freed_pages: None,
+            allocated_pages: Arc::new(Mutex::new(PageTrackerPolicy::Closed)),
+            free_on_drop: vec![],
+            _transaction_guard: guard,
+            page_allocator: None,
+            _value_type: PhantomData,
+        }
     }
 
-    pub(crate) fn fixed_width_with(_value_width: Option<usize>) -> Option<usize> {
-        None
-    }
-}
-
-impl<V: Key> DynamicCollection<V> {
-    fn iter<'a>(
+    fn from_collection(
         collection: AccessGuard<'a, &'static DynamicCollection<V>>,
         guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
-    ) -> Result<MultimapValue<'a, V>> {
+        mem: PageResolver,
+    ) -> Result<Self> {
         Ok(match collection.value().collection_type() {
             Inline => {
                 let leaf_iter =
                     LeafKeyIter::new(collection, V::fixed_width(), <() as Value>::fixed_width());
-                MultimapValue::new_inline(leaf_iter, guard)
+                Self::new_inline(leaf_iter, guard)
             }
             SubtreeV2 => {
                 let root = collection.value().as_subtree().root;
-                MultimapValue::new_subtree(
+                Self::new_subtree(
                     BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(
                         &(..),
                         Some(root),
@@ -682,153 +192,40 @@ impl<V: Key> DynamicCollection<V> {
         })
     }
 
-    fn iter_free_on_drop<'a>(
+    fn from_collection_free_on_drop(
         collection: AccessGuard<'a, &'static DynamicCollection<V>>,
         pages: Vec<PageNumber>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
         guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
-    ) -> Result<MultimapValue<'a, V>> {
+        page_allocator: PageAllocator,
+    ) -> Result<Self> {
         let num_values = collection.value().get_num_values();
         Ok(match collection.value().collection_type() {
             Inline => {
                 let leaf_iter =
                     LeafKeyIter::new(collection, V::fixed_width(), <() as Value>::fixed_width());
-                MultimapValue::new_inline(leaf_iter, guard)
+                Self::new_inline(leaf_iter, guard)
             }
             SubtreeV2 => {
                 let root = collection.value().as_subtree().root;
                 let inner = BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(
                     &(..),
                     Some(root),
-                    mem.clone(),
+                    page_allocator.resolver(),
                     PageHint::None,
                 )?;
-                MultimapValue::new_subtree_free_on_drop(
+                Self::new_subtree_free_on_drop(
                     inner,
                     num_values,
                     freed_pages,
                     allocated_pages,
                     pages,
                     guard,
-                    mem,
+                    page_allocator,
                 )
             }
         })
-    }
-}
-
-#[repr(transparent)]
-struct UntypedDynamicCollection {
-    data: [u8],
-}
-
-impl UntypedDynamicCollection {
-    pub(crate) fn fixed_width_with(_value_width: Option<usize>) -> Option<usize> {
-        None
-    }
-
-    fn new(data: &[u8]) -> &Self {
-        unsafe { &*(std::ptr::from_ref::<[u8]>(data) as *const UntypedDynamicCollection) }
-    }
-
-    fn make_subtree_data(header: BtreeHeader) -> Vec<u8> {
-        let mut result = vec![SubtreeV2.into()];
-        result.extend_from_slice(&header.to_le_bytes());
-        result
-    }
-
-    fn from_bytes(data: &[u8]) -> &Self {
-        Self::new(data)
-    }
-
-    fn collection_type(&self) -> DynamicCollectionType {
-        DynamicCollectionType::from(self.data[0])
-    }
-
-    fn as_inline(&self) -> &[u8] {
-        debug_assert!(matches!(self.collection_type(), Inline));
-        &self.data[1..]
-    }
-
-    fn as_subtree(&self) -> BtreeHeader {
-        assert!(matches!(self.collection_type(), SubtreeV2));
-        BtreeHeader::from_le_bytes(
-            self.data[1..=BtreeHeader::serialized_size()]
-                .try_into()
-                .unwrap(),
-        )
-    }
-}
-
-enum ValueIterState<'a, V: Key + 'static> {
-    Subtree(BtreeRangeIter<V, ()>),
-    InlineLeaf(LeafKeyIter<'a, V>),
-}
-
-pub struct MultimapValue<'a, V: Key + 'static> {
-    inner: Option<ValueIterState<'a, V>>,
-    remaining: u64,
-    freed_pages: Option<Arc<Mutex<Vec<PageNumber>>>>,
-    allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
-    free_on_drop: Vec<PageNumber>,
-    _transaction_guard: Arc<TransactionGuard>,
-    mem: Option<Arc<TransactionalMemory>>,
-    _value_type: PhantomData<V>,
-}
-
-impl<'a, V: Key + 'static> MultimapValue<'a, V> {
-    fn new_subtree(
-        inner: BtreeRangeIter<V, ()>,
-        num_values: u64,
-        guard: Arc<TransactionGuard>,
-    ) -> Self {
-        Self {
-            inner: Some(ValueIterState::Subtree(inner)),
-            remaining: num_values,
-            freed_pages: None,
-            allocated_pages: Arc::new(Mutex::new(PageTrackerPolicy::Closed)),
-            free_on_drop: vec![],
-            _transaction_guard: guard,
-            mem: None,
-            _value_type: Default::default(),
-        }
-    }
-
-    fn new_subtree_free_on_drop(
-        inner: BtreeRangeIter<V, ()>,
-        num_values: u64,
-        freed_pages: Arc<Mutex<Vec<PageNumber>>>,
-        allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
-        pages: Vec<PageNumber>,
-        guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
-    ) -> Self {
-        Self {
-            inner: Some(ValueIterState::Subtree(inner)),
-            remaining: num_values,
-            freed_pages: Some(freed_pages),
-            free_on_drop: pages,
-            allocated_pages,
-            _transaction_guard: guard,
-            mem: Some(mem),
-            _value_type: Default::default(),
-        }
-    }
-
-    fn new_inline(inner: LeafKeyIter<'a, V>, guard: Arc<TransactionGuard>) -> Self {
-        let remaining = inner.inline_collection.value().get_num_values();
-        Self {
-            inner: Some(ValueIterState::InlineLeaf(inner)),
-            remaining,
-            freed_pages: None,
-            allocated_pages: Arc::new(Mutex::new(PageTrackerPolicy::Closed)),
-            free_on_drop: vec![],
-            _transaction_guard: guard,
-            mem: None,
-            _value_type: Default::default(),
-        }
     }
 
     /// Returns the number of times this iterator will return `Some(Ok(_))`
@@ -847,35 +244,53 @@ impl<'a, V: Key + 'static> Iterator for MultimapValue<'a, V> {
     type Item = Result<AccessGuard<'a, V>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // TODO: optimize out this copy
-        let bytes = match self.inner.as_mut().unwrap() {
+        // If `free_on_drop` is non-empty, the subtree pages backing the iteration will be
+        // freed when this `MultimapValue` is dropped (the `remove_all` path). Yielded
+        // guards may outlive the iterator (e.g. via `collect`), so in that case we must
+        // return owned copies rather than references into soon-to-be-freed pages.
+        let copy_values = !self.free_on_drop.is_empty();
+        let guard = match self.inner.as_mut().unwrap() {
             ValueIterState::Subtree(iter) => match iter.next()? {
-                Ok(e) => e.key_data(),
+                Ok(e) => {
+                    if copy_values {
+                        AccessGuard::with_owned_value(e.key_data())
+                    } else {
+                        let (page, key_range, _) = e.into_raw();
+                        AccessGuard::with_page(page, key_range)
+                    }
+                }
                 Err(err) => {
                     return Some(Err(err));
                 }
             },
-            ValueIterState::InlineLeaf(iter) => iter.next_key()?.to_vec(),
+            ValueIterState::InlineLeaf(iter) => iter.next_key()?,
         };
         self.remaining -= 1;
-        Some(Ok(AccessGuard::with_owned_value(bytes)))
+        Some(Ok(guard))
     }
 }
 
 impl<V: Key + 'static> DoubleEndedIterator for MultimapValue<'_, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        // TODO: optimize out this copy
-        let bytes = match self.inner.as_mut().unwrap() {
+        let copy_values = !self.free_on_drop.is_empty();
+        let guard = match self.inner.as_mut().unwrap() {
             ValueIterState::Subtree(iter) => match iter.next_back()? {
-                Ok(e) => e.key_data(),
+                Ok(e) => {
+                    if copy_values {
+                        AccessGuard::with_owned_value(e.key_data())
+                    } else {
+                        let (page, key_range, _) = e.into_raw();
+                        AccessGuard::with_page(page, key_range)
+                    }
+                }
                 Err(err) => {
                     return Some(Err(err));
                 }
             },
-            ValueIterState::InlineLeaf(iter) => iter.next_key_back()?.to_vec(),
+            ValueIterState::InlineLeaf(iter) => iter.next_key_back()?,
         };
         self.remaining -= 1;
-        Some(Ok(AccessGuard::with_owned_value(bytes)))
+        Some(Ok(guard))
     }
 }
 
@@ -888,7 +303,7 @@ impl<V: Key + 'static> Drop for MultimapValue<'_, V> {
             let mut allocated_pages = self.allocated_pages.lock().unwrap();
             for page in &self.free_on_drop {
                 if !self
-                    .mem
+                    .page_allocator
                     .as_ref()
                     .unwrap()
                     .free_if_uncommitted(*page, &mut allocated_pages)
@@ -902,7 +317,7 @@ impl<V: Key + 'static> Drop for MultimapValue<'_, V> {
 
 pub struct MultimapRange<'a, K: Key + 'static, V: Key + 'static> {
     inner: BtreeRangeIter<K, &'static DynamicCollection<V>>,
-    mem: Arc<TransactionalMemory>,
+    mem: PageResolver,
     transaction_guard: Arc<TransactionGuard>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
@@ -913,15 +328,15 @@ impl<K: Key + 'static, V: Key + 'static> MultimapRange<'_, K, V> {
     fn new(
         inner: BtreeRangeIter<K, &'static DynamicCollection<V>>,
         guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
+        mem: PageResolver,
     ) -> Self {
         Self {
             inner,
             mem,
             transaction_guard: guard,
-            _key_type: Default::default(),
-            _value_type: Default::default(),
-            _lifetime: Default::default(),
+            _key_type: PhantomData,
+            _value_type: PhantomData,
+            _lifetime: PhantomData,
         }
     }
 }
@@ -936,7 +351,7 @@ impl<'a, K: Key + 'static, V: Key + 'static> Iterator for MultimapRange<'a, K, V
                 let (page, _, value_range) = entry.into_raw();
                 let collection = AccessGuard::with_page(page, value_range);
                 Some(
-                    DynamicCollection::iter(
+                    MultimapValue::from_collection(
                         collection,
                         self.transaction_guard.clone(),
                         self.mem.clone(),
@@ -957,7 +372,7 @@ impl<K: Key + 'static, V: Key + 'static> DoubleEndedIterator for MultimapRange<'
                 let (page, _, value_range) = entry.into_raw();
                 let collection = AccessGuard::with_page(page, value_range);
                 Some(
-                    DynamicCollection::iter(
+                    MultimapValue::from_collection(
                         collection,
                         self.transaction_guard.clone(),
                         self.mem.clone(),
@@ -979,8 +394,8 @@ pub struct MultimapTable<'txn, K: Key + 'static, V: Key + 'static> {
     transaction: &'txn WriteTransaction,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
-    tree: BtreeMut<'txn, K, &'static DynamicCollection<V>>,
-    mem: Arc<TransactionalMemory>,
+    tree: BtreeMut<K, &'static DynamicCollection<V>>,
+    page_allocator: PageAllocator,
     _value_type: PhantomData<V>,
 }
 
@@ -991,13 +406,14 @@ impl<K: Key + 'static, V: Key + 'static> MultimapTableHandle for MultimapTable<'
 }
 
 impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: &str,
         table_root: Option<BtreeHeader>,
         num_values: u64,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
-        mem: Arc<TransactionalMemory>,
+        page_allocator: PageAllocator,
         transaction: &'txn WriteTransaction,
     ) -> MultimapTable<'txn, K, V> {
         MultimapTable {
@@ -1009,12 +425,12 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
             tree: BtreeMut::new(
                 table_root,
                 transaction.transaction_guard(),
-                mem.clone(),
+                page_allocator.clone(),
                 freed_pages,
                 allocated_pages,
             ),
-            mem,
-            _value_type: Default::default(),
+            page_allocator,
+            _value_type: PhantomData,
         }
     }
 
@@ -1074,7 +490,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                         <() as Value>::fixed_width(),
                     );
 
-                    if required_inline_bytes < self.mem.get_page_size() / 2 {
+                    if required_inline_bytes < self.page_allocator.get_page_size() / 2 {
                         let mut data = vec![0; required_inline_bytes];
                         let mut builder = RawLeafBuilder::new(
                             &mut data,
@@ -1102,7 +518,9 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                     } else {
                         // convert into a subtree
                         let mut allocated = self.allocated_pages.lock().unwrap();
-                        let mut page = self.mem.allocate(leaf_data.len(), &mut allocated)?;
+                        let mut page = self
+                            .page_allocator
+                            .allocate(leaf_data.len(), &mut allocated)?;
                         drop(allocated);
                         page.memory_mut()[..leaf_data.len()].copy_from_slice(leaf_data);
                         let page_number = page.get_page_number();
@@ -1110,10 +528,10 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                         drop(guard);
 
                         // Don't bother computing the checksum, since we're about to modify the tree
-                        let mut subtree: BtreeMut<'_, V, ()> = BtreeMut::new(
+                        let mut subtree: BtreeMut<V, ()> = BtreeMut::new(
                             Some(BtreeHeader::new(page_number, 0, num_pairs as u64)),
                             self.transaction.transaction_guard(),
-                            self.mem.clone(),
+                            self.page_allocator.clone(),
                             self.freed_pages.clone(),
                             self.allocated_pages.clone(),
                         );
@@ -1128,10 +546,10 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                     found
                 }
                 SubtreeV2 => {
-                    let mut subtree: BtreeMut<'_, V, ()> = BtreeMut::new(
+                    let mut subtree: BtreeMut<V, ()> = BtreeMut::new(
                         Some(guard.value().as_subtree()),
                         self.transaction.transaction_guard(),
-                        self.mem.clone(),
+                        self.page_allocator.clone(),
                         self.freed_pages.clone(),
                         self.allocated_pages.clone(),
                     );
@@ -1153,7 +571,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                 V::fixed_width(),
                 <() as Value>::fixed_width(),
             );
-            if required_inline_bytes < self.mem.get_page_size() / 2 {
+            if required_inline_bytes < self.page_allocator.get_page_size() / 2 {
                 let mut data = vec![0; required_inline_bytes];
                 let mut builder = RawLeafBuilder::new(
                     &mut data,
@@ -1168,10 +586,10 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                 self.tree
                     .insert(key.borrow(), &DynamicCollection::new(&inline_data))?;
             } else {
-                let mut subtree: BtreeMut<'_, V, ()> = BtreeMut::new(
+                let mut subtree: BtreeMut<V, ()> = BtreeMut::new(
                     None,
                     self.transaction.transaction_guard(),
-                    self.mem.clone(),
+                    self.page_allocator.clone(),
                     self.freed_pages.clone(),
                     self.allocated_pages.clone(),
                 );
@@ -1258,7 +676,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                 let mut subtree: BtreeMut<V, ()> = BtreeMut::new(
                     Some(v.as_subtree()),
                     self.transaction.transaction_guard(),
-                    self.mem.clone(),
+                    self.page_allocator.clone(),
                     self.freed_pages.clone(),
                     self.allocated_pages.clone(),
                 );
@@ -1271,7 +689,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                     length: new_length,
                 }) = subtree.get_root()
                 {
-                    let page = self.mem.get_page(new_root, PageHint::None)?;
+                    let page = self.page_allocator.get_page(new_root, PageHint::None)?;
                     match page.memory()[0] {
                         LEAF => {
                             let accessor = LeafAccessor::new(
@@ -1280,14 +698,17 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                                 <() as Value>::fixed_width(),
                             );
                             let len = accessor.total_length();
-                            if len < self.mem.get_page_size() / 2 {
+                            if len < self.page_allocator.get_page_size() / 2 {
                                 let inline_data =
                                     DynamicCollection::<V>::make_inline_data(&page.memory()[..len]);
                                 self.tree
                                     .insert(key.borrow(), &DynamicCollection::new(&inline_data))?;
                                 drop(page);
                                 let mut allocated_pages = self.allocated_pages.lock().unwrap();
-                                if !self.mem.free_if_uncommitted(new_root, &mut allocated_pages) {
+                                if !self
+                                    .page_allocator
+                                    .free_if_uncommitted(new_root, &mut allocated_pages)
+                                {
                                     (*self.freed_pages).lock().unwrap().push(new_root);
                                 }
                             } else {
@@ -1343,7 +764,7 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
                     root,
                     V::fixed_width(),
                     <() as Value>::fixed_width(),
-                    self.mem.clone(),
+                    self.page_allocator.resolver(),
                     PageHint::None,
                 )?;
                 for page in all_pages {
@@ -1353,20 +774,20 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
 
             self.num_values -= collection.value().get_num_values();
 
-            DynamicCollection::iter_free_on_drop(
+            MultimapValue::from_collection_free_on_drop(
                 collection,
                 pages,
                 self.freed_pages.clone(),
                 self.allocated_pages.clone(),
                 self.transaction.transaction_guard(),
-                self.mem.clone(),
+                self.page_allocator.clone(),
             )?
         } else {
             MultimapValue::new_subtree(
                 BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(
                     &(..),
                     None,
-                    self.mem.clone(),
+                    self.page_allocator.resolver(),
                     PageHint::None,
                 )?,
                 0,
@@ -1382,7 +803,7 @@ impl<K: Key + 'static, V: Key + 'static> ReadableTableMetadata for MultimapTable
     fn stats(&self) -> Result<TableStats> {
         let tree_stats = multimap_btree_stats(
             self.tree.get_root().map(|x| x.root),
-            &self.mem,
+            &self.page_allocator.resolver(),
             K::fixed_width(),
             V::fixed_width(),
             PageHint::None,
@@ -1408,13 +829,13 @@ impl<K: Key + 'static, V: Key + 'static> ReadableMultimapTable<K, V> for Multima
     fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<MultimapValue<'_, V>> {
         let guard = self.transaction.transaction_guard();
         let iter = if let Some(collection) = self.tree.get(key.borrow())? {
-            DynamicCollection::iter(collection, guard, self.mem.clone())?
+            MultimapValue::from_collection(collection, guard, self.page_allocator.resolver())?
         } else {
             MultimapValue::new_subtree(
                 BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(
                     &(..),
                     None,
-                    self.mem.clone(),
+                    self.page_allocator.resolver(),
                     PageHint::None,
                 )?,
                 0,
@@ -1433,7 +854,7 @@ impl<K: Key + 'static, V: Key + 'static> ReadableMultimapTable<K, V> for Multima
         Ok(MultimapRange::new(
             inner,
             self.transaction.transaction_guard(),
-            self.mem.clone(),
+            self.page_allocator.resolver(),
         ))
     }
 }
@@ -1470,7 +891,7 @@ pub struct ReadOnlyUntypedMultimapTable {
     hint: PageHint,
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
-    mem: Arc<TransactionalMemory>,
+    mem: PageResolver,
 }
 
 impl Sealed for ReadOnlyUntypedMultimapTable {}
@@ -1508,7 +929,7 @@ impl ReadOnlyUntypedMultimapTable {
         hint: PageHint,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        mem: Arc<TransactionalMemory>,
+        mem: PageResolver,
     ) -> Self {
         Self {
             num_values,
@@ -1531,7 +952,7 @@ impl ReadOnlyUntypedMultimapTable {
 pub struct ReadOnlyMultimapTable<K: Key + 'static, V: Key + 'static> {
     tree: Btree<K, &'static DynamicCollection<V>>,
     num_values: u64,
-    mem: Arc<TransactionalMemory>,
+    mem: PageResolver,
     transaction_guard: Arc<TransactionGuard>,
     _value_type: PhantomData<V>,
 }
@@ -1542,14 +963,14 @@ impl<K: Key + 'static, V: Key + 'static> ReadOnlyMultimapTable<K, V> {
         num_values: u64,
         hint: PageHint,
         guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
+        mem: PageResolver,
     ) -> Result<ReadOnlyMultimapTable<K, V>> {
         Ok(ReadOnlyMultimapTable {
             tree: Btree::new(root, hint, guard.clone(), mem.clone())?,
             num_values,
             mem,
             transaction_guard: guard,
-            _value_type: Default::default(),
+            _value_type: PhantomData,
         })
     }
 
@@ -1557,7 +978,11 @@ impl<K: Key + 'static, V: Key + 'static> ReadOnlyMultimapTable<K, V> {
     /// alive until it is dropped.
     pub fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<MultimapValue<'static, V>> {
         let iter = if let Some(collection) = self.tree.get(key.borrow())? {
-            DynamicCollection::iter(collection, self.transaction_guard.clone(), self.mem.clone())?
+            MultimapValue::from_collection(
+                collection,
+                self.transaction_guard.clone(),
+                self.mem.clone(),
+            )?
         } else {
             MultimapValue::new_subtree(
                 BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(
@@ -1620,7 +1045,11 @@ impl<K: Key + 'static, V: Key + 'static> ReadableMultimapTable<K, V>
     /// Returns an iterator over all values for the given key. Values are in ascending order.
     fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<MultimapValue<'_, V>> {
         let iter = if let Some(collection) = self.tree.get(key.borrow())? {
-            DynamicCollection::iter(collection, self.transaction_guard.clone(), self.mem.clone())?
+            MultimapValue::from_collection(
+                collection,
+                self.transaction_guard.clone(),
+                self.mem.clone(),
+            )?
         } else {
             MultimapValue::new_subtree(
                 BtreeRangeIter::new::<RangeFull, &V::SelfType<'_>>(

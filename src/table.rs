@@ -2,8 +2,8 @@ use crate::db::TransactionGuard;
 use crate::sealed::Sealed;
 use crate::tree_store::{
     AccessGuardMutInPlace, Btree, BtreeExtractIf, BtreeHeader, BtreeMut, BtreeRangeIter,
-    MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, PageHint, PageNumber, PageTrackerPolicy, RawBtree,
-    TransactionalMemory,
+    MAX_PAIR_LENGTH, MAX_VALUE_LENGTH, PageAllocator, PageHint, PageNumber, PageResolver,
+    PageTrackerPolicy, RawBtree,
 };
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{AccessGuard, AccessGuardMut, StorageError, WriteTransaction};
@@ -13,6 +13,7 @@ use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 // Chunk size for bulk operations - balances memory usage and performance
 const BULK_INSERT_CHUNK_SIZE: usize = 10_000;
@@ -65,12 +66,38 @@ impl TableStats {
 pub struct Table<'txn, K: Key + 'static, V: Value + 'static> {
     name: String,
     transaction: &'txn WriteTransaction,
-    tree: BtreeMut<'txn, K, V>,
+    tree: BtreeMut<K, V>,
 }
 
 impl<K: Key + 'static, V: Value + 'static> TableHandle for Table<'_, K, V> {
     fn name(&self) -> &str {
         &self.name
+    }
+}
+
+struct RetainPanicGuard<'txn> {
+    transaction: &'txn WriteTransaction,
+    disarmed: bool,
+}
+
+impl<'txn> RetainPanicGuard<'txn> {
+    fn new(transaction: &'txn WriteTransaction) -> Self {
+        Self {
+            transaction,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for RetainPanicGuard<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed && thread::panicking() {
+            self.transaction.poison();
+        }
     }
 }
 
@@ -80,7 +107,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         table_root: Option<BtreeHeader>,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
-        mem: Arc<TransactionalMemory>,
+        page_allocator: PageAllocator,
         transaction: &'txn WriteTransaction,
     ) -> Table<'txn, K, V> {
         Table {
@@ -89,7 +116,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
             tree: BtreeMut::new(
                 table_root,
                 transaction.transaction_guard(),
-                mem,
+                page_allocator,
                 freed_pages,
                 allocated_pages,
             ),
@@ -111,44 +138,22 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
 
     /// Removes and returns the first key-value pair in the table
     pub fn pop_first(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        // TODO: optimize this
-        let first = self
-            .iter()?
-            .next()
-            .map(|x| x.map(|(key, _)| K::as_bytes(&key.value()).as_ref().to_vec()));
-        if let Some(owned_key) = first {
-            let owned_key = owned_key?;
-            let key = K::from_bytes(&owned_key);
-            let value = self.remove(&key)?.unwrap();
-            drop(key);
-            Ok(Some((AccessGuard::with_owned_value(owned_key), value)))
-        } else {
-            Ok(None)
-        }
+        self.tree.pop_first()
     }
 
     /// Removes and returns the last key-value pair in the table
     pub fn pop_last(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        // TODO: optimize this
-        let last = self
-            .iter()?
-            .next_back()
-            .map(|x| x.map(|(key, _)| K::as_bytes(&key.value()).as_ref().to_vec()));
-        if let Some(owned_key) = last {
-            let owned_key = owned_key?;
-            let key = K::from_bytes(&owned_key);
-            let value = self.remove(&key)?.unwrap();
-            drop(key);
-            Ok(Some((AccessGuard::with_owned_value(owned_key), value)))
-        } else {
-            Ok(None)
-        }
+        self.tree.pop_last()
     }
 
     /// Applies `predicate` to all key-value pairs. All entries for which
     /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
     ///
     /// Note: values not read from the iterator will not be removed
+    ///
+    /// The predicate must not panic. If it panics, the write transaction is
+    /// poisoned and [`crate::WriteTransaction::commit`] will return
+    /// [`crate::CommitError::TransactionPoisoned`].
     pub fn extract_if<F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         predicate: F,
@@ -160,6 +165,10 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     /// `predicate` evaluates to `true` are returned in an iterator, and those which are read from the iterator are removed
     ///
     /// Note: values not read from the iterator will not be removed
+    ///
+    /// The predicate must not panic. If it panics, the write transaction is
+    /// poisoned and [`crate::WriteTransaction::commit`] will return
+    /// [`crate::CommitError::TransactionPoisoned`].
     pub fn extract_from_if<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         range: impl RangeBounds<KR> + 'a,
@@ -168,23 +177,33 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        self.tree
-            .extract_from_if(&range, predicate)
-            .map(ExtractIf::new)
+        let inner = self.tree.extract_from_if(&range, predicate)?;
+        Ok(ExtractIf::new(inner, Some(self.transaction)))
     }
 
     /// Applies `predicate` to all key-value pairs. All entries for which
     /// `predicate` evaluates to `false` are removed.
     ///
+    /// The predicate must not panic. If it panics, the write transaction is
+    /// poisoned and [`crate::WriteTransaction::commit`] will return
+    /// [`crate::CommitError::TransactionPoisoned`].
+    ///
     pub fn retain<F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
         predicate: F,
     ) -> Result {
-        self.tree.retain_in::<K::SelfType<'_>, F>(predicate, ..)
+        let mut panic_guard = RetainPanicGuard::new(self.transaction);
+        let result = self.tree.retain_in::<K::SelfType<'_>, F>(predicate, ..);
+        panic_guard.disarm();
+        result
     }
 
     /// Applies `predicate` to all key-value pairs in the range `start..end`. All entries for which
     /// `predicate` evaluates to `false` are removed.
+    ///
+    /// The predicate must not panic. If it panics, the write transaction is
+    /// poisoned and [`crate::WriteTransaction::commit`] will return
+    /// [`crate::CommitError::TransactionPoisoned`].
     ///
     pub fn retain_in<'a, KR, F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool>(
         &mut self,
@@ -194,7 +213,10 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        self.tree.retain_in(predicate, range)
+        let mut panic_guard = RetainPanicGuard::new(self.transaction);
+        let result = self.tree.retain_in(predicate, range);
+        panic_guard.disarm();
+        result
     }
 
     /// Insert mapping of the given key to the given value
@@ -426,6 +448,28 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
 
         Ok(removed)
     }
+
+    /// Gets the given key's corresponding entry in the table for in-place manipulation.
+    ///
+    /// This is analogous to [`std::collections::BTreeMap::entry`], and avoids the double
+    /// lookup that a `get` followed by `insert` would require when updating a value.
+    pub fn entry<'a>(&'a mut self, key: K::SelfType<'a>) -> Result<Entry<'a, K, V>> {
+        let key_len = K::as_bytes(&key).as_ref().len();
+        if key_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(key_len));
+        }
+        if self.tree.get(&key)?.is_some() {
+            Ok(Entry::Occupied(OccupiedEntry {
+                tree: &mut self.tree,
+                key,
+            }))
+        } else {
+            Ok(Entry::Vacant(VacantEntry {
+                tree: &mut self.tree,
+                key,
+            }))
+        }
+    }
 }
 
 impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
@@ -596,7 +640,7 @@ pub trait ReadableTable<K: Key + 'static, V: Value + 'static>: ReadableTableMeta
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # use manifold::{Database, TableDefinition, Error};
+    /// # use manifold::{Database, ReadableDatabase, ReadableTable, TableDefinition, Error};
     /// # const TABLE: TableDefinition<u64, &str> = TableDefinition::new("data");
     /// # fn example() -> Result<(), Error> {
     /// # let db = Database::create("example.db")?;
@@ -727,7 +771,7 @@ impl ReadOnlyUntypedTable {
         hint: PageHint,
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
-        mem: Arc<TransactionalMemory>,
+        mem: PageResolver,
     ) -> Self {
         Self {
             tree: RawBtree::new(root_page, fixed_key_size, fixed_value_size, mem, hint),
@@ -754,7 +798,7 @@ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
         root_page: Option<BtreeHeader>,
         hint: PageHint,
         guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
+        mem: PageResolver,
     ) -> Result<ReadOnlyTable<K, V>> {
         Ok(ReadOnlyTable {
             name,
@@ -841,6 +885,7 @@ pub struct ExtractIf<
     F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
 > {
     inner: BtreeExtractIf<'a, K, V, F>,
+    poison_target: Option<&'a WriteTransaction>,
 }
 
 impl<
@@ -850,8 +895,39 @@ impl<
     F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
 > ExtractIf<'a, K, V, F>
 {
-    pub(crate) fn new(inner: BtreeExtractIf<'a, K, V, F>) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: BtreeExtractIf<'a, K, V, F>,
+        poison_target: Option<&'a WriteTransaction>,
+    ) -> Self {
+        Self {
+            inner,
+            poison_target,
+        }
+    }
+
+    /// Closes the iterator.
+    ///
+    /// Entries already returned by the iterator remain removed, and unread
+    /// entries are not tested by the predicate or removed. Dropping the iterator
+    /// also closes it, but this method returns any error encountered while
+    /// finalizing the iterator.
+    pub fn close(mut self) -> Result {
+        self.inner.close()
+    }
+}
+
+impl<
+    K: Key + 'static,
+    V: Value + 'static,
+    F: for<'f> FnMut(K::SelfType<'f>, V::SelfType<'f>) -> bool,
+> Drop for ExtractIf<'_, K, V, F>
+{
+    fn drop(&mut self) {
+        if self.inner.predicate_panicked()
+            && let Some(transaction) = self.poison_target
+        {
+            transaction.poison();
+        }
     }
 }
 
@@ -905,7 +981,7 @@ impl<K: Key + 'static, V: Value + 'static> Range<'_, K, V> {
         Self {
             inner,
             _transaction_guard: guard,
-            _lifetime: Default::default(),
+            _lifetime: PhantomData,
         }
     }
 }
@@ -934,6 +1010,214 @@ impl<K: Key + 'static, V: Value + 'static> DoubleEndedIterator for Range<'_, K, 
                 let value = AccessGuard::with_page(page, value_range);
                 (key, value)
             })
+        })
+    }
+}
+
+/// A view into a single entry in a [`Table`], which may either be vacant or occupied.
+///
+/// This `enum` is constructed from the [`entry`] method on [`Table`], and mirrors
+/// [`std::collections::btree_map::Entry`] as closely as the redb data model allows.
+///
+/// Unlike the in-memory `BTreeMap`, redb values are stored serialized, so methods that
+/// produce a "reference to the value" return an [`AccessGuardMut`] instead of `&mut V`.
+///
+/// [`entry`]: Table::entry
+pub enum Entry<'a, K: Key + 'static, V: Value + 'static> {
+    /// An occupied entry.
+    Occupied(OccupiedEntry<'a, K, V>),
+    /// A vacant entry.
+    Vacant(VacantEntry<'a, K, V>),
+}
+
+impl<'a, K: Key + 'static, V: Value + 'static> Entry<'a, K, V> {
+    /// Returns a view of this entry's key.
+    pub fn key(&self) -> &K::SelfType<'a> {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the provided `default` if empty,
+    /// and returns a mutable accessor to the value in the entry.
+    pub fn or_insert<'v>(
+        self,
+        default: impl Borrow<V::SelfType<'v>>,
+    ) -> Result<AccessGuardMut<'a, V>> {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of `default` if empty,
+    /// and returns a mutable accessor to the value in the entry.
+    ///
+    /// Unlike [`or_insert`](Self::or_insert), the default value is only computed if the
+    /// entry is vacant.
+    pub fn or_insert_with<'v, F, B>(self, default: F) -> Result<AccessGuardMut<'a, V>>
+    where
+        F: FnOnce() -> B,
+        B: Borrow<V::SelfType<'v>>,
+    {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting, if empty, the result of the `default`
+    /// function, which is given a view of the key.
+    pub fn or_insert_with_key<'v, F, B>(self, default: F) -> Result<AccessGuardMut<'a, V>>
+    where
+        F: FnOnce(&K::SelfType<'a>) -> B,
+        B: Borrow<V::SelfType<'v>>,
+    {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = default(&entry.key);
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// Provides in-place mutable access to an occupied entry before any potential inserts
+    /// into the table.
+    ///
+    /// The closure receives an [`AccessGuardMut`] and may replace the stored value via
+    /// [`AccessGuardMut::insert`]. Any errors returned by the closure are propagated.
+    pub fn and_modify<F>(self, f: F) -> Result<Self>
+    where
+        F: FnOnce(&mut AccessGuardMut<'_, V>) -> Result<()>,
+    {
+        match self {
+            Entry::Occupied(mut entry) => {
+                {
+                    let mut guard = entry.get_mut()?;
+                    f(&mut guard)?;
+                }
+                Ok(Entry::Occupied(entry))
+            }
+            Entry::Vacant(entry) => Ok(Entry::Vacant(entry)),
+        }
+    }
+}
+
+/// A view into an occupied entry in a [`Table`]. It is part of the [`Entry`] enum.
+pub struct OccupiedEntry<'a, K: Key + 'static, V: Value + 'static> {
+    tree: &'a mut BtreeMut<K, V>,
+    key: K::SelfType<'a>,
+}
+
+impl<'a, K: Key + 'static, V: Value + 'static> OccupiedEntry<'a, K, V> {
+    /// Returns a view of this entry's key.
+    pub fn key(&self) -> &K::SelfType<'a> {
+        &self.key
+    }
+
+    /// Returns a view of this entry's value.
+    pub fn get(&self) -> Result<AccessGuard<'_, V>> {
+        self.tree.get(&self.key)?.ok_or_else(|| {
+            StorageError::Corrupted(
+                "entry for key disappeared while OccupiedEntry was live".to_string(),
+            )
+        })
+    }
+
+    /// Returns a mutable accessor to the value in the entry.
+    pub fn get_mut(&mut self) -> Result<AccessGuardMut<'_, V>> {
+        self.tree.get_mut(&self.key)?.ok_or_else(|| {
+            StorageError::Corrupted(
+                "entry for key disappeared while OccupiedEntry was live".to_string(),
+            )
+        })
+    }
+
+    /// Converts the entry into a mutable accessor to the value in the entry with a lifetime
+    /// bound to the table itself.
+    pub fn into_mut(self) -> Result<AccessGuardMut<'a, V>> {
+        self.tree.get_mut(&self.key)?.ok_or_else(|| {
+            StorageError::Corrupted(
+                "entry for key disappeared while OccupiedEntry was live".to_string(),
+            )
+        })
+    }
+
+    /// Replaces the value of the entry with the supplied value, and returns the old value.
+    pub fn insert<'v>(
+        &mut self,
+        value: impl Borrow<V::SelfType<'v>>,
+    ) -> Result<AccessGuard<'_, V>> {
+        let value_len = V::as_bytes(value.borrow()).as_ref().len();
+        if value_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_len));
+        }
+        let key_len = K::as_bytes(&self.key).as_ref().len();
+        if value_len + key_len > MAX_PAIR_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_len + key_len));
+        }
+        self.tree.insert(&self.key, value.borrow())?.ok_or_else(|| {
+            StorageError::Corrupted(
+                "entry for key disappeared while OccupiedEntry was live".to_string(),
+            )
+        })
+    }
+
+    /// Takes the value out of the entry, and returns it.
+    pub fn remove(self) -> Result<AccessGuard<'a, V>> {
+        self.tree.remove(&self.key)?.ok_or_else(|| {
+            StorageError::Corrupted(
+                "entry for key disappeared while OccupiedEntry was live".to_string(),
+            )
+        })
+    }
+
+    /// Takes the entry out of the table, returning the key and the value.
+    pub fn remove_entry(self) -> Result<(K::SelfType<'a>, AccessGuard<'a, V>)> {
+        let OccupiedEntry { tree, key } = self;
+        let value = tree.remove(&key)?.ok_or_else(|| {
+            StorageError::Corrupted(
+                "entry for key disappeared while OccupiedEntry was live".to_string(),
+            )
+        })?;
+        Ok((key, value))
+    }
+}
+
+/// A view into a vacant entry in a [`Table`]. It is part of the [`Entry`] enum.
+pub struct VacantEntry<'a, K: Key + 'static, V: Value + 'static> {
+    tree: &'a mut BtreeMut<K, V>,
+    key: K::SelfType<'a>,
+}
+
+impl<'a, K: Key + 'static, V: Value + 'static> VacantEntry<'a, K, V> {
+    /// Returns a view of this entry's key.
+    pub fn key(&self) -> &K::SelfType<'a> {
+        &self.key
+    }
+
+    /// Consumes the entry and returns the key that was used to construct it.
+    pub fn into_key(self) -> K::SelfType<'a> {
+        self.key
+    }
+
+    /// Inserts `value` with the entry's key and returns a mutable accessor to it.
+    pub fn insert<'v>(self, value: impl Borrow<V::SelfType<'v>>) -> Result<AccessGuardMut<'a, V>> {
+        let value_len = V::as_bytes(value.borrow()).as_ref().len();
+        if value_len > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_len));
+        }
+        let key_len = K::as_bytes(&self.key).as_ref().len();
+        if value_len + key_len > MAX_PAIR_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_len + key_len));
+        }
+        self.tree.insert(&self.key, value.borrow())?;
+        self.tree.get_mut(&self.key)?.ok_or_else(|| {
+            StorageError::Corrupted(
+                "inserted entry not found after VacantEntry::insert".to_string(),
+            )
         })
     }
 }

@@ -1,7 +1,5 @@
 #![deny(clippy::all, clippy::pedantic, clippy::disallowed_methods)]
-// TODO: revisit this list and see if we can enable some
 #![allow(
-    clippy::default_trait_access,
     clippy::if_not_else,
     clippy::iter_not_returning_iterator,
     clippy::missing_errors_doc,
@@ -16,5 +14,16 @@
     clippy::unreadable_literal
 )]
 
-mod python;
-pub use crate::python::redb;
+mod database;
+mod error;
+mod transaction;
+
+use pyo3::prelude::*;
+
+#[pymodule]
+pub fn redb(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    database::register(m)?;
+    error::register(m)?;
+    transaction::register(m)?;
+    Ok(())
+}

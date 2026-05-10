@@ -101,12 +101,12 @@ impl TransactionTracker {
         Self {
             state: Mutex::new(State {
                 next_savepoint_id: SavepointId(0),
-                live_read_transactions: Default::default(),
+                live_read_transactions: BTreeMap::default(),
                 next_transaction_id,
                 live_write_transaction: None,
-                valid_savepoints: Default::default(),
-                pending_non_durable_commits: Default::default(),
-                unprocessed_freed_non_durable_commits: Default::default(),
+                valid_savepoints: BTreeMap::default(),
+                pending_non_durable_commits: HashMap::default(),
+                unprocessed_freed_non_durable_commits: BTreeSet::default(),
             }),
             live_write_transaction_available: Condvar::new(),
         }
@@ -153,9 +153,14 @@ impl TransactionTracker {
         state.unprocessed_freed_non_durable_commits.contains(&id)
     }
 
-    pub(crate) fn mark_unprocessed_non_durable_commit(&self, id: TransactionId) {
+    pub(crate) fn mark_non_durable_freed_pages_processed(
+        &self,
+        ids: impl IntoIterator<Item = TransactionId>,
+    ) {
         let mut state = self.state.lock().unwrap();
-        state.unprocessed_freed_non_durable_commits.remove(&id);
+        for id in ids {
+            state.unprocessed_freed_non_durable_commits.remove(&id);
+        }
     }
 
     pub(crate) fn oldest_unprocessed_non_durable_commit(&self) -> Option<TransactionId> {
@@ -167,10 +172,14 @@ impl TransactionTracker {
             .copied()
     }
 
+    // `has_unprocessed_freed_pages` is true when a future non-durable commit should scan
+    // freed-table entries under this transaction id for pages that can be reclaimed before the
+    // id becomes durable.
     pub(crate) fn register_non_durable_commit(
         &self,
         id: TransactionId,
         durable_ancestor: TransactionId,
+        has_unprocessed_freed_pages: bool,
     ) {
         let mut state = self.state.lock().unwrap();
         state
@@ -178,10 +187,28 @@ impl TransactionTracker {
             .entry(durable_ancestor)
             .and_modify(|x| *x += 1)
             .or_insert(1);
-        state
-            .pending_non_durable_commits
-            .insert(id, durable_ancestor);
-        state.unprocessed_freed_non_durable_commits.insert(id);
+        assert!(
+            state
+                .pending_non_durable_commits
+                .insert(id, durable_ancestor)
+                .is_none()
+        );
+        if has_unprocessed_freed_pages {
+            state.unprocessed_freed_non_durable_commits.insert(id);
+        }
+    }
+
+    // Reserve a transaction id that was created without starting a new write transaction.
+    // The caller must still register the resulting root if it is a non-durable commit.
+    pub(crate) fn reserve_transaction_id(
+        &self,
+        id: TransactionId,
+        live_write_transaction: TransactionId,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(state.live_write_transaction, Some(live_write_transaction));
+        assert_eq!(id, state.next_transaction_id.next());
+        state.next_transaction_id = id;
     }
 
     pub(crate) fn restore_savepoint_counter_state(&self, next_savepoint: SavepointId) {
@@ -228,6 +255,23 @@ impl TransactionTracker {
 
     pub(crate) fn any_savepoint_exists(&self) -> bool {
         !self.state.lock().unwrap().valid_savepoints.is_empty()
+    }
+
+    // Excludes internal read refs that only pin durable ancestors of pending
+    // non-durable commits.
+    pub(crate) fn any_user_read_reference_exists(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        for (id, count) in &state.live_read_transactions {
+            let pending_count = state
+                .pending_non_durable_commits
+                .values()
+                .filter(|ancestor| *ancestor == id)
+                .count() as u64;
+            if *count > pending_count {
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn allocate_savepoint(&self, transaction_id: TransactionId) -> SavepointId {
@@ -312,5 +356,24 @@ impl TransactionTracker {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn non_durable_commit_without_freed_pages_is_not_unprocessed() {
+        let tracker = TransactionTracker::new(TransactionId::new(0));
+
+        tracker.register_non_durable_commit(TransactionId::new(1), TransactionId::new(0), false);
+        assert_eq!(None, tracker.oldest_unprocessed_non_durable_commit());
+
+        tracker.register_non_durable_commit(TransactionId::new(2), TransactionId::new(0), true);
+        assert_eq!(
+            Some(TransactionId::new(2)),
+            tracker.oldest_unprocessed_non_durable_commit()
+        );
     }
 }

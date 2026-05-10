@@ -19,9 +19,11 @@ pub(crate) use backends::ReadOnlyBackend;
 pub(crate) use base::{
     Page, PageHint, PageNumber, PageTrackerPolicy, MAX_PAIR_LENGTH, MAX_VALUE_LENGTH,
 };
+pub(crate) use fast_hash::PageNumberHashSet;
 pub(crate) use header::PAGE_SIZE;
 pub(crate) use page_manager::{
-    xxh3_checksum, ShrinkPolicy, TransactionalMemory, FILE_FORMAT_VERSION3,
+    AllocationPolicy, FILE_FORMAT_VERSION3, PageAllocator, PageResolver, ShrinkPolicy,
+    TransactionalMemory, xxh3_checksum,
 };
 pub use savepoint::Savepoint;
 pub(crate) use savepoint::SerializedSavepoint;

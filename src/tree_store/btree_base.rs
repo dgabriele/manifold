@@ -1,5 +1,5 @@
-use crate::tree_store::page_store::{Page, PageImpl, PageMut, TransactionalMemory, xxh3_checksum};
-use crate::tree_store::{PageNumber, PageTrackerPolicy};
+use crate::tree_store::page_store::{Page, PageImpl, PageMut, xxh3_checksum};
+use crate::tree_store::{PageAllocator, PageNumber, PageTrackerPolicy};
 use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{Result, StorageError};
 use std::borrow::Borrow;
@@ -178,7 +178,7 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
             offset: range.start,
             len: range.len(),
             on_drop: OnDrop::None,
-            _value_type: Default::default(),
+            _value_type: PhantomData,
         }
     }
 
@@ -188,7 +188,7 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
             offset: range.start,
             len: range.len(),
             on_drop: OnDrop::None,
-            _value_type: Default::default(),
+            _value_type: PhantomData,
         }
     }
 
@@ -199,7 +199,7 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
             offset: 0,
             len,
             on_drop: OnDrop::None,
-            _value_type: Default::default(),
+            _value_type: PhantomData,
         }
     }
 
@@ -218,13 +218,28 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
                 position,
                 fixed_key_size,
             },
-            _value_type: Default::default(),
+            _value_type: PhantomData,
         }
     }
 
     /// Access the stored value
     pub fn value(&self) -> V::SelfType<'_> {
         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
+    }
+
+    pub(crate) fn arc_view(&self) -> (Arc<[u8]>, Range<usize>) {
+        match &self.page {
+            EitherPage::Immutable(page) => (page.to_arc(), self.offset..(self.offset + self.len)),
+            EitherPage::ArcMemory(arc) => (arc.clone(), self.offset..(self.offset + self.len)),
+            EitherPage::OwnedMemory(vec) => {
+                let bytes = &vec[self.offset..(self.offset + self.len)];
+                (Arc::from(bytes), 0..self.len)
+            }
+            EitherPage::Mutable(page) => {
+                let bytes = &page.memory()[self.offset..(self.offset + self.len)];
+                (Arc::from(bytes), 0..self.len)
+            }
+        }
     }
 }
 
@@ -254,7 +269,7 @@ pub struct AccessGuardMut<'a, V: Value + 'static> {
     len: usize,
     entry_index: usize,
     parent: Option<(PageMut<'a>, usize)>,
-    mem: Arc<TransactionalMemory>,
+    page_allocator: PageAllocator,
     allocated: Arc<Mutex<PageTrackerPolicy>>,
     root_ref: &'a mut BtreeHeader,
     key_width: Option<usize>,
@@ -269,14 +284,14 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
         len: usize,
         entry_index: usize,
         parent: Option<(PageMut<'a>, usize)>,
-        mem: Arc<TransactionalMemory>,
+        page_allocator: PageAllocator,
         allocated: Arc<Mutex<PageTrackerPolicy>>,
         root_ref: &'a mut BtreeHeader,
         key_width: Option<usize>,
     ) -> Self {
-        assert!(mem.uncommitted(page.get_page_number()));
+        assert!(page_allocator.uncommitted(page.get_page_number()));
         if let Some((ref parent_page, _)) = parent {
-            assert!(mem.uncommitted(parent_page.get_page_number()));
+            assert!(page_allocator.uncommitted(parent_page.get_page_number()));
         }
         AccessGuardMut {
             page,
@@ -284,11 +299,11 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
             len,
             entry_index,
             parent,
-            mem,
+            page_allocator,
             allocated,
             root_ref,
             key_width,
-            _value_type: Default::default(),
+            _value_type: PhantomData,
         }
     }
 
@@ -314,7 +329,7 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
         } else {
             let accessor = LeafAccessor::new(self.page.memory(), self.key_width, V::fixed_width());
             let mut builder = LeafBuilder::new(
-                &self.mem,
+                &self.page_allocator,
                 &self.allocated,
                 accessor.num_pairs(),
                 self.key_width,
@@ -345,7 +360,7 @@ impl<'a, V: Value + 'static> AccessGuardMut<'a, V> {
             self.page = new_page;
             let mut allocated = self.allocated.lock().unwrap();
             assert!(
-                self.mem
+                self.page_allocator
                     .free_if_uncommitted(old_page_number, &mut allocated)
             );
         }
@@ -381,7 +396,7 @@ impl<'a, V: Value + 'static> AccessGuardMutInPlace<'a, V> {
             page,
             offset,
             len,
-            _value_type: Default::default(),
+            _value_type: PhantomData,
         }
     }
 }
@@ -624,7 +639,7 @@ pub(super) struct LeafBuilder<'a, 'b> {
     fixed_value_size: Option<usize>,
     total_key_bytes: usize,
     total_value_bytes: usize,
-    mem: &'b TransactionalMemory,
+    page_allocator: &'b PageAllocator,
     allocated_pages: &'b Mutex<PageTrackerPolicy>,
 }
 
@@ -639,7 +654,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
     }
 
     pub(super) fn new(
-        mem: &'b TransactionalMemory,
+        page_allocator: &'b PageAllocator,
         allocated_pages: &'b Mutex<PageTrackerPolicy>,
         capacity: usize,
         fixed_key_size: Option<usize>,
@@ -651,7 +666,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             fixed_value_size,
             total_key_bytes: 0,
             total_value_bytes: 0,
-            mem,
+            page_allocator,
             allocated_pages,
         }
     }
@@ -683,7 +698,7 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.pairs.len(),
             self.total_key_bytes + self.total_value_bytes,
         );
-        required_size > self.mem.get_page_size() && self.pairs.len() > 1
+        required_size > self.page_allocator.get_page_size() && self.pairs.len() > 1
     }
 
     pub(super) fn build_split<'txn>(self) -> Result<(PageMut<'txn>, &'a [u8], PageMut<'txn>)> {
@@ -703,7 +718,9 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
         let required_size =
             self.required_bytes(division, first_split_key_bytes + first_split_value_bytes);
         let mut allocated_pages = self.allocated_pages.lock().unwrap();
-        let mut page1 = self.mem.allocate(required_size, &mut allocated_pages)?;
+        let mut page1 = self
+            .page_allocator
+            .allocate(required_size, &mut allocated_pages)?;
         let mut builder = RawLeafBuilder::new(
             page1.memory_mut(),
             division,
@@ -722,7 +739,9 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
                 - first_split_key_bytes
                 - first_split_value_bytes,
         );
-        let mut page2 = self.mem.allocate(required_size, &mut allocated_pages)?;
+        let mut page2 = self
+            .page_allocator
+            .allocate(required_size, &mut allocated_pages)?;
         let mut builder = RawLeafBuilder::new(
             page2.memory_mut(),
             self.pairs.len() - division,
@@ -744,7 +763,9 @@ impl<'a, 'b> LeafBuilder<'a, 'b> {
             self.total_key_bytes + self.total_value_bytes,
         );
         let mut allocated_pages = self.allocated_pages.lock().unwrap();
-        let mut page = self.mem.allocate(required_size, &mut allocated_pages)?;
+        let mut page = self
+            .page_allocator
+            .allocate(required_size, &mut allocated_pages)?;
         let mut builder = RawLeafBuilder::new(
             page.memory_mut(),
             self.pairs.len(),
@@ -932,14 +953,14 @@ impl Drop for RawLeafBuilder<'_> {
     }
 }
 
-pub(crate) struct LeafMutator<'b> {
+pub(super) struct LeafMutator<'b> {
     page: &'b mut [u8],
     fixed_key_size: Option<usize>,
     fixed_value_size: Option<usize>,
 }
 
 impl<'b> LeafMutator<'b> {
-    pub(crate) fn new(
+    pub(super) fn new(
         page: &'b mut [u8],
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
@@ -1000,7 +1021,7 @@ impl<'b> LeafMutator<'b> {
     }
 
     // Replace the value at index `i` with `value`, leaving the key unchanged.
-    pub(crate) fn replace(&mut self, i: usize, value: &[u8]) {
+    pub(super) fn replace(&mut self, i: usize, value: &[u8]) {
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let num_pairs = accessor.num_pairs();
         let last_value_end = accessor.value_end(num_pairs - 1).unwrap();
@@ -1035,7 +1056,7 @@ impl<'b> LeafMutator<'b> {
     }
 
     // Insert the given key, value pair at index i and shift all following pairs to the right
-    pub(crate) fn insert(&mut self, i: usize, key: &[u8], value: &[u8]) {
+    pub(super) fn insert(&mut self, i: usize, key: &[u8], value: &[u8]) {
         let accessor = LeafAccessor::new(self.page, self.fixed_key_size, self.fixed_value_size);
         let required_delta = {
             let mut delta = key.len() + value.len();
@@ -1253,9 +1274,52 @@ impl<'b> LeafMutator<'b> {
     }
 }
 
+// Encapsulates mutation of a leaf page: owns the PageMut along with the key/value
+// widths needed to interpret it, and exposes only the safe operations that callers
+// outside this module need (read access via `accessor`, in-place value replacement via
+// `replace_value`). This keeps the `LeafMutator` construction details from leaking into
+// callers that operate on dynamic-collection leaf pages (e.g., multimap maintenance).
+pub(super) struct LeafPageMut<'a> {
+    page: PageMut<'a>,
+    fixed_key_size: Option<usize>,
+    fixed_value_size: Option<usize>,
+}
+
+impl<'a> LeafPageMut<'a> {
+    pub(crate) fn new(
+        page: PageMut<'a>,
+        fixed_key_size: Option<usize>,
+        fixed_value_size: Option<usize>,
+    ) -> Self {
+        debug_assert_eq!(page.memory()[0], LEAF);
+        Self {
+            page,
+            fixed_key_size,
+            fixed_value_size,
+        }
+    }
+
+    pub(crate) fn accessor(&self) -> LeafAccessor<'_> {
+        LeafAccessor::new(
+            self.page.memory(),
+            self.fixed_key_size,
+            self.fixed_value_size,
+        )
+    }
+
+    // Replace the value at index `i` in-place, leaving the key unchanged.
+    pub(crate) fn replace_value(&mut self, i: usize, value: &[u8]) {
+        let mut mutator = LeafMutator::new(
+            self.page.memory_mut(),
+            self.fixed_key_size,
+            self.fixed_value_size,
+        );
+        mutator.replace(i, value);
+    }
+}
+
 // Provides a simple zero-copy way to access a branch page
-// TODO: this should be pub(super) and the multimap btree stuff should be moved into this package
-pub(crate) struct BranchAccessor<'a: 'b, 'b, T: Page + 'a> {
+pub(super) struct BranchAccessor<'a: 'b, 'b, T: Page + 'a> {
     page: &'b T,
     num_keys: usize,
     fixed_key_size: Option<usize>,
@@ -1270,7 +1334,7 @@ impl<'a: 'b, 'b, T: Page + 'a> BranchAccessor<'a, 'b, T> {
             page,
             num_keys,
             fixed_key_size,
-            _page_lifetime: Default::default(),
+            _page_lifetime: PhantomData,
         }
     }
 
@@ -1400,13 +1464,13 @@ pub(super) struct BranchBuilder<'a, 'b> {
     keys: Vec<&'a [u8]>,
     total_key_bytes: usize,
     fixed_key_size: Option<usize>,
-    mem: &'b TransactionalMemory,
+    page_allocator: &'b PageAllocator,
     allocated_pages: &'b Mutex<PageTrackerPolicy>,
 }
 
 impl<'a, 'b> BranchBuilder<'a, 'b> {
     pub(super) fn new(
-        mem: &'b TransactionalMemory,
+        page_allocator: &'b PageAllocator,
         allocated_pages: &'b Mutex<PageTrackerPolicy>,
         child_capacity: usize,
         fixed_key_size: Option<usize>,
@@ -1416,7 +1480,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
             keys: Vec::with_capacity(child_capacity - 1),
             total_key_bytes: 0,
             fixed_key_size,
-            mem,
+            page_allocator,
             allocated_pages,
         }
     }
@@ -1470,7 +1534,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
             self.fixed_key_size,
         );
         let mut allocated_pages = self.allocated_pages.lock().unwrap();
-        let mut page = self.mem.allocate(size, &mut allocated_pages)?;
+        let mut page = self.page_allocator.allocate(size, &mut allocated_pages)?;
         let mut builder =
             RawBranchBuilder::new(page.memory_mut(), self.keys.len(), self.fixed_key_size);
         builder.write_first_page(self.children[0].0, self.children[0].1);
@@ -1489,7 +1553,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
             self.total_key_bytes,
             self.fixed_key_size,
         );
-        size > self.mem.get_page_size() && self.keys.len() >= 3
+        size > self.page_allocator.get_page_size() && self.keys.len() >= 3
     }
 
     pub(super) fn build_split<'txn>(self) -> Result<(PageMut<'txn>, &'a [u8], PageMut<'txn>)> {
@@ -1503,7 +1567,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
 
         let size =
             RawBranchBuilder::required_bytes(division, first_split_key_len, self.fixed_key_size);
-        let mut page1 = self.mem.allocate(size, &mut allocated_pages)?;
+        let mut page1 = self.page_allocator.allocate(size, &mut allocated_pages)?;
         let mut builder = RawBranchBuilder::new(page1.memory_mut(), division, self.fixed_key_size);
         builder.write_first_page(self.children[0].0, self.children[0].1);
         for i in 0..division {
@@ -1522,7 +1586,7 @@ impl<'a, 'b> BranchBuilder<'a, 'b> {
             second_split_key_len,
             self.fixed_key_size,
         );
-        let mut page2 = self.mem.allocate(size, &mut allocated_pages)?;
+        let mut page2 = self.page_allocator.allocate(size, &mut allocated_pages)?;
         let mut builder = RawBranchBuilder::new(
             page2.memory_mut(),
             self.keys.len() - division - 1,
@@ -1693,7 +1757,7 @@ impl Drop for RawBranchBuilder<'_> {
     }
 }
 
-pub(crate) struct BranchMutator<'b> {
+pub(super) struct BranchMutator<'b> {
     page: &'b mut [u8],
 }
 

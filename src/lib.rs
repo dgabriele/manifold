@@ -1,7 +1,5 @@
 #![deny(clippy::all, clippy::pedantic, clippy::disallowed_methods)]
-// TODO: revisit this list and see if we can enable some
 #![allow(
-    clippy::default_trait_access,
     clippy::if_not_else,
     clippy::iter_not_returning_iterator,
     clippy::missing_errors_doc,
@@ -76,8 +74,8 @@ pub use multimap_table::{
     ReadOnlyUntypedMultimapTable, ReadableMultimapTable,
 };
 pub use table::{
-    ExtractIf, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable, ReadableTableMetadata,
-    Table, TableStats,
+    Entry, ExtractIf, OccupiedEntry, Range, ReadOnlyTable, ReadOnlyUntypedTable, ReadableTable,
+    ReadableTableMetadata, Table, TableStats, VacantEntry,
 };
 pub use transactions::{DatabaseStats, Durability, ReadTransaction, WriteTransaction};
 pub use tree_store::{AccessGuard, AccessGuardMut, AccessGuardMutInPlace, Savepoint};

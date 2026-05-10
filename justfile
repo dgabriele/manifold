@@ -28,10 +28,11 @@ publish_py: test_py
     MATURIN_PYPI_TOKEN=$(cat ~/.pypi/redb_token) docker run -it --rm -e "MATURIN_PYPI_TOKEN" -v `pwd`:/redb-ro:ro quay.io/pypa/manylinux2014_x86_64 /redb-ro/crates/redb-python/py_publish.sh
 
 test_py: install_py
-    python3 -m unittest discover --start-directory=./crates/redb-python
+    python3 -m pytest ./crates/redb-python/test
 
 install_py: pre
     maturin develop --manifest-path=./crates/redb-python/Cargo.toml
+    python3 -m pip install pytest hypothesis
 
 test: pre
     RUST_BACKTRACE=1 cargo test --all-features
@@ -44,6 +45,13 @@ test_wasi:
     # Uses cargo pkgid because "redb" is ambiguous with the test dependency on an old version of redb
     cargo +nightly-2025-07-26 test -p $(cargo pkgid) --target=wasm32-wasip1-threads -- --nocapture
     cargo +nightly-2025-07-26 test -p redb-derive --target=wasm32-wasip1-threads -- --nocapture
+
+coverage:
+    #!/usr/bin/env bash
+    set -euxo pipefail
+    cargo install --locked cargo-llvm-cov
+    rustup component add llvm-tools-preview
+    RUST_BACKTRACE=1 cargo llvm-cov --all-features
 
 bench bench='redb_benchmark': pre
     cargo bench -p redb-bench --bench {{bench}}

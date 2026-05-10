@@ -1,18 +1,18 @@
 use crate::db::TransactionGuard;
 use crate::error::TableError;
-use crate::multimap_table::{
-    finalize_tree_and_subtree_checksums, multimap_btree_stats, verify_tree_and_subtree_checksums,
-};
-use crate::tree_store::btree::{UntypedBtreeMut, btree_stats};
+use crate::tree_store::btree::{PagePath, UntypedBtreeMut, btree_stats};
 use crate::tree_store::btree_base::BtreeHeader;
+use crate::tree_store::multimap_btree::{
+    finalize_tree_and_subtree_checksums, verify_tree_and_subtree_checksums,
+};
 use crate::tree_store::{
-    Btree, BtreeMut, BtreeRangeIter, InternalTableDefinition, PageHint, PageNumber, PagePath,
-    PageTrackerPolicy, RawBtree, TableType, TransactionalMemory,
+    Btree, BtreeMut, BtreeRangeIter, InternalTableDefinition, PageAllocator, PageHint, PageNumber,
+    PageNumberHashSet, PageResolver, PageTrackerPolicy, RawBtree, TableType, multimap_btree_stats,
 };
 use crate::types::{Key, Value};
 use crate::{DatabaseStats, Result};
 use std::cmp::max;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 use std::ops::RangeFull;
 use std::sync::{Arc, Mutex};
@@ -66,7 +66,7 @@ impl Iterator for TableNameIter {
 
 pub(crate) struct TableTree {
     tree: Btree<&'static str, InternalTableDefinition>,
-    mem: Arc<TransactionalMemory>,
+    mem: PageResolver,
 }
 
 impl TableTree {
@@ -74,7 +74,7 @@ impl TableTree {
         master_root: Option<BtreeHeader>,
         page_hint: PageHint,
         guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
+        mem: PageResolver,
     ) -> Result<Self> {
         Ok(Self {
             tree: Btree::new(master_root, page_hint, guard, mem.clone())?,
@@ -209,10 +209,10 @@ impl TableTree {
     }
 }
 
-pub(crate) struct TableTreeMut<'txn> {
-    tree: BtreeMut<'txn, &'static str, InternalTableDefinition>,
+pub(crate) struct TableTreeMut {
+    tree: BtreeMut<&'static str, InternalTableDefinition>,
     guard: Arc<TransactionGuard>,
-    mem: Arc<TransactionalMemory>,
+    page_allocator: PageAllocator,
     // Cached updates from tables that have been closed. These must be flushed to the btree.
     // The bool indicates whether the root has dirty (DEFERRED) checksums that need finalization.
     pending_table_updates: HashMap<String, (Option<BtreeHeader>, u64, bool)>,
@@ -220,11 +220,11 @@ pub(crate) struct TableTreeMut<'txn> {
     allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
 }
 
-impl TableTreeMut<'_> {
+impl TableTreeMut {
     pub(crate) fn new(
         master_root: Option<BtreeHeader>,
         guard: Arc<TransactionGuard>,
-        mem: Arc<TransactionalMemory>,
+        page_allocator: PageAllocator,
         freed_pages: Arc<Mutex<Vec<PageNumber>>>,
         allocated_pages: Arc<Mutex<PageTrackerPolicy>>,
     ) -> Self {
@@ -232,16 +232,20 @@ impl TableTreeMut<'_> {
             tree: BtreeMut::new(
                 master_root,
                 guard.clone(),
-                mem.clone(),
+                page_allocator.clone(),
                 freed_pages.clone(),
                 allocated_pages.clone(),
             ),
             guard,
-            mem,
-            pending_table_updates: Default::default(),
+            page_allocator,
+            pending_table_updates: HashMap::default(),
             freed_pages,
             allocated_pages,
         }
+    }
+
+    pub(crate) fn page_allocator(&self) -> &PageAllocator {
+        &self.page_allocator
     }
 
     pub(crate) fn set_root(&mut self, root: Option<BtreeHeader>) {
@@ -265,7 +269,9 @@ impl TableTreeMut<'_> {
                 .get_table_untyped(&entry, TableType::Normal)
                 .map_err(|e| e.into_storage_error_or_corrupted("Internal corruption"))?
                 .unwrap();
-            definition.visit_all_pages(self.mem.clone(), PageHint::None, |path| visitor(path))?;
+            definition.visit_all_pages(self.page_allocator.resolver(), PageHint::None, |path| {
+                visitor(path)
+            })?;
         }
 
         for entry in self.list_tables(TableType::Multimap)? {
@@ -273,7 +279,9 @@ impl TableTreeMut<'_> {
                 .get_table_untyped(&entry, TableType::Multimap)
                 .map_err(|e| e.into_storage_error_or_corrupted("Internal corruption"))?
                 .unwrap();
-            definition.visit_all_pages(self.mem.clone(), PageHint::None, |path| visitor(path))?;
+            definition.visit_all_pages(self.page_allocator.resolver(), PageHint::None, |path| {
+                visitor(path)
+            })?;
         }
 
         Ok(())
@@ -288,7 +296,7 @@ impl TableTreeMut<'_> {
     ) {
         let dirty = table_root
             .as_ref()
-            .is_some_and(|header| self.mem.uncommitted(header.root));
+            .is_some_and(|header| self.page_allocator.uncommitted(header.root));
         self.pending_table_updates
             .insert(name.to_string(), (table_root, length, dirty));
     }
@@ -300,7 +308,7 @@ impl TableTreeMut<'_> {
 
     pub(crate) fn flush_and_close(
         &mut self,
-    ) -> Result<(Option<BtreeHeader>, HashSet<PageNumber>, Vec<PageNumber>)> {
+    ) -> Result<(Option<BtreeHeader>, PageNumberHashSet, Vec<PageNumber>)> {
         match self.flush_inner() {
             Ok(header) => {
                 let allocated = self.allocated_pages.lock()?.close();
@@ -348,7 +356,7 @@ impl TableTreeMut<'_> {
                 } => {
                     let mut tree = UntypedBtreeMut::new(
                         new_root,
-                        self.mem.clone(),
+                        self.page_allocator.clone(),
                         self.freed_pages.clone(),
                         fixed_key_size,
                         fixed_value_size,
@@ -367,7 +375,7 @@ impl TableTreeMut<'_> {
                         new_root,
                         fixed_key_size,
                         fixed_value_size,
-                        self.mem.clone(),
+                        self.page_allocator.clone(),
                     )?;
                     *table_length = new_length;
                 }
@@ -387,20 +395,15 @@ impl TableTreeMut<'_> {
     ) -> Result {
         assert!(self.pending_table_updates.is_empty());
 
-        // Reserve space in the table tree
-        // TODO: maybe we should have a more explicit method, like "force_uncommitted()"
-        let existing = self
-            .tree
-            .insert(
-                &name,
-                &InternalTableDefinition::new::<K, V>(TableType::Normal, None, 0),
-            )?
-            .map(|x| x.value());
-        if let Some(existing) = existing {
-            self.tree.insert(&name, &existing)?;
-        }
+        // Reserve space in the table tree, and make sure the path to the entry is
+        // uncommitted, so that the final insert_inplace() below won't allocate or
+        // free any pages.
+        let bytes = self.tree.force_uncommitted(
+            &name,
+            &InternalTableDefinition::new::<K, V>(TableType::Normal, None, 0),
+        )?;
 
-        let table_root = match self.tree.get(&name)?.unwrap().value() {
+        let table_root = match InternalTableDefinition::from_bytes(&bytes) {
             InternalTableDefinition::Normal { table_root, .. } => table_root,
             InternalTableDefinition::Multimap { .. } => {
                 unreachable!()
@@ -411,7 +414,7 @@ impl TableTreeMut<'_> {
         let mut tree: BtreeMut<K, V> = BtreeMut::new(
             table_root,
             self.guard.clone(),
-            self.mem.clone(),
+            self.page_allocator.clone(),
             self.freed_pages.clone(),
             self.allocated_pages.clone(),
         );
@@ -451,7 +454,7 @@ impl TableTreeMut<'_> {
         let mut tree: BtreeMut<K, V> = BtreeMut::new(
             None,
             self.guard.clone(),
-            self.mem.clone(),
+            self.page_allocator.clone(),
             self.freed_pages.clone(),
             self.allocated_pages.clone(),
         );
@@ -480,7 +483,7 @@ impl TableTreeMut<'_> {
             self.tree.get_root(),
             PageHint::None,
             self.guard.clone(),
-            self.mem.clone(),
+            self.page_allocator.resolver(),
         )?;
         tree.list_tables(table_type)
     }
@@ -494,7 +497,7 @@ impl TableTreeMut<'_> {
             self.tree.get_root(),
             PageHint::None,
             self.guard.clone(),
-            self.mem.clone(),
+            self.page_allocator.resolver(),
         )?;
         let mut result = tree.get_table_untyped(name, table_type);
 
@@ -517,7 +520,7 @@ impl TableTreeMut<'_> {
             self.tree.get_root(),
             PageHint::None,
             self.guard.clone(),
-            self.mem.clone(),
+            self.page_allocator.resolver(),
         )?;
         let mut result = tree.get_table::<K, V>(name, table_type);
 
@@ -562,14 +565,17 @@ impl TableTreeMut<'_> {
             // Collect all pages first, then free them. The walk reads each page to discover
             // its children, so we must not invalidate any page before the walk completes.
             let mut pages = vec![];
-            definition.visit_all_pages(self.mem.clone(), PageHint::None, |path| {
+            definition.visit_all_pages(self.page_allocator.resolver(), PageHint::None, |path| {
                 pages.push(path.page_number());
                 Ok(())
             })?;
             let mut freed_pages = self.freed_pages.lock().unwrap();
             let mut allocated_pages = self.allocated_pages.lock().unwrap();
             for page in pages {
-                if !self.mem.free_if_uncommitted(page, &mut allocated_pages) {
+                if !self
+                    .page_allocator
+                    .free_if_uncommitted(page, &mut allocated_pages)
+                {
                     freed_pages.push(page);
                 }
             }
@@ -628,7 +634,7 @@ impl TableTreeMut<'_> {
                 definition.set_header(*updated_root, *updated_length);
             }
 
-            definition.visit_all_pages(self.mem.clone(), PageHint::None, |path| {
+            definition.visit_all_pages(self.page_allocator.resolver(), PageHint::None, |path| {
                 output.insert(path.page_number(), path.clone());
                 while output.len() > n {
                     output.pop_first();
@@ -662,7 +668,7 @@ impl TableTreeMut<'_> {
             }
 
             if let Some(new_root) = definition.relocate_tree(
-                self.mem.clone(),
+                self.page_allocator.clone(),
                 self.freed_pages.clone(),
                 relocation_map,
             )? {
@@ -691,6 +697,7 @@ impl TableTreeMut<'_> {
             master_tree_stats.metadata_bytes + master_tree_stats.stored_leaf_bytes;
         let mut total_fragmented = master_tree_stats.fragmented_bytes;
 
+        let resolver = self.page_allocator.resolver();
         for entry in self.tree.range::<RangeFull, &str>(&(..))? {
             let entry = entry?;
             let mut definition = entry.value();
@@ -706,7 +713,7 @@ impl TableTreeMut<'_> {
                 } => {
                     let subtree_stats = btree_stats(
                         table_root.map(|x| x.root),
-                        &self.mem,
+                        &resolver,
                         fixed_key_size,
                         fixed_value_size,
                         PageHint::None,
@@ -726,7 +733,7 @@ impl TableTreeMut<'_> {
                 } => {
                     let subtree_stats = multimap_btree_stats(
                         table_root.map(|x| x.root),
-                        &self.mem,
+                        &resolver,
                         fixed_key_size,
                         fixed_value_size,
                         PageHint::None,
@@ -742,18 +749,18 @@ impl TableTreeMut<'_> {
         }
         Ok(DatabaseStats {
             tree_height: master_tree_stats.tree_height + max_subtree_height,
-            allocated_pages: self.mem.count_allocated_pages()?,
+            allocated_pages: resolver.count_allocated_pages()?,
             leaf_pages,
             branch_pages,
             stored_leaf_bytes: total_stored_bytes,
             metadata_bytes: total_metadata_bytes,
             fragmented_bytes: total_fragmented,
-            page_size: self.mem.get_page_size(),
+            page_size: self.page_allocator.get_page_size(),
         })
     }
 }
 
-impl Drop for TableTreeMut<'_> {
+impl Drop for TableTreeMut {
     fn drop(&mut self) {
         if thread::panicking() {
             return;

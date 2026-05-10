@@ -1,7 +1,7 @@
 use crate::transaction_tracker::{TransactionId, TransactionTracker};
 use crate::tree_store::{
-    BtreeHeader, InternalTableDefinition, PageHint, PageNumber, ReadOnlyBackend, ShrinkPolicy,
-    TableTree, TableType, TransactionalMemory, PAGE_SIZE,
+    AllocationPolicy, BtreeHeader, InternalTableDefinition, PAGE_SIZE, PageHint, PageNumber,
+    PageResolver, ReadOnlyBackend, ShrinkPolicy, TableTree, TableType, TransactionalMemory,
 };
 use crate::types::{Key, Value};
 use crate::{
@@ -271,10 +271,18 @@ impl CacheStats {
     }
 }
 
-pub(crate) struct TransactionGuard {
-    transaction_tracker: Option<Arc<TransactionTracker>>,
-    transaction_id: Option<TransactionId>,
-    write_transaction: bool,
+pub(crate) enum TransactionGuard {
+    Read {
+        tracker: Arc<TransactionTracker>,
+        transaction_id: TransactionId,
+    },
+    Write {
+        tracker: Arc<TransactionTracker>,
+        transaction_id: TransactionId,
+    },
+    // Used for internal accesses that happen outside of any tracked transaction,
+    // such as opening the database, repairing it, and running integrity checks.
+    Untracked,
 }
 
 impl TransactionGuard {
@@ -282,59 +290,58 @@ impl TransactionGuard {
         transaction_id: TransactionId,
         tracker: Arc<TransactionTracker>,
     ) -> Self {
-        Self {
-            transaction_tracker: Some(tracker),
-            transaction_id: Some(transaction_id),
-            write_transaction: false,
+        Self::Read {
+            tracker,
+            transaction_id,
         }
+    }
+
+    pub(crate) fn allocate_read(
+        tracker: Arc<TransactionTracker>,
+        mem: &TransactionalMemory,
+    ) -> Result<Self> {
+        let id = tracker.register_read_transaction(mem)?;
+        Ok(Self::new_read(id, tracker))
     }
 
     pub(crate) fn new_write(
         transaction_id: TransactionId,
         tracker: Arc<TransactionTracker>,
     ) -> Self {
-        Self {
-            transaction_tracker: Some(tracker),
-            transaction_id: Some(transaction_id),
-            write_transaction: true,
+        Self::Write {
+            tracker,
+            transaction_id,
         }
     }
 
-    // TODO: remove this hack
-    pub(crate) fn fake() -> Self {
-        Self {
-            transaction_tracker: None,
-            transaction_id: None,
-            write_transaction: false,
-        }
+    pub(crate) fn untracked() -> Self {
+        Self::Untracked
     }
 
     pub(crate) fn id(&self) -> TransactionId {
-        self.transaction_id.unwrap()
-    }
-
-    pub(crate) fn leak(mut self) -> TransactionId {
-        self.transaction_id.take().unwrap()
+        match self {
+            Self::Read { transaction_id, .. } | Self::Write { transaction_id, .. } => {
+                *transaction_id
+            }
+            Self::Untracked => {
+                panic!("TransactionGuard::id() called on an untracked guard")
+            }
+        }
     }
 }
 
 impl Drop for TransactionGuard {
     fn drop(&mut self) {
-        if self.transaction_tracker.is_none() {
-            return;
-        }
-        if let Some(transaction_id) = self.transaction_id {
-            if self.write_transaction {
-                self.transaction_tracker
-                    .as_ref()
-                    .unwrap()
-                    .end_write_transaction(transaction_id);
-            } else {
-                self.transaction_tracker
-                    .as_ref()
-                    .unwrap()
-                    .deallocate_read_transaction(transaction_id);
-            }
+        match self {
+            Self::Read {
+                tracker,
+                transaction_id,
+            } => tracker.deallocate_read_transaction(*transaction_id),
+            Self::Write {
+                tracker,
+                transaction_id,
+            } => tracker.end_write_transaction(*transaction_id),
+            Self::Untracked => {}
         }
     }
 }
@@ -506,7 +513,7 @@ pub struct Database {
 
 impl ReadableDatabase for Database {
     fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
-        let guard = self.allocate_read_transaction()?;
+        let guard = TransactionGuard::allocate_read(self.transaction_tracker.clone(), &self.mem)?;
         #[cfg(feature = "logging")]
         debug!("Beginning read transaction id={:?}", guard.id());
         ReadTransaction::new(self.get_memory(), guard)
@@ -536,11 +543,12 @@ impl Database {
     }
 
     pub(crate) fn verify_primary_checksums(mem: Arc<TransactionalMemory>) -> Result<bool> {
+        let resolver = PageResolver::new(mem.clone());
         let table_tree = TableTree::new(
             mem.get_data_root(),
             PageHint::None,
-            Arc::new(TransactionGuard::fake()),
-            mem.clone(),
+            Arc::new(TransactionGuard::untracked()),
+            resolver.clone(),
         )?;
         if !table_tree.verify_checksums()? {
             return Ok(false);
@@ -548,8 +556,8 @@ impl Database {
         let system_table_tree = TableTree::new(
             mem.get_system_root(),
             PageHint::None,
-            Arc::new(TransactionGuard::fake()),
-            mem.clone(),
+            Arc::new(TransactionGuard::untracked()),
+            resolver,
         )?;
         if !system_table_tree.verify_checksums()? {
             return Ok(false);
@@ -607,35 +615,22 @@ impl Database {
     ///
     /// Returns `true` if compaction was performed, and `false` if no futher compaction was possible
     pub fn compact(&mut self) -> Result<bool, CompactionError> {
-        if self
-            .transaction_tracker
-            .oldest_live_read_transaction()
-            .is_some()
-        {
+        if self.transaction_tracker.any_user_read_reference_exists() {
             return Err(CompactionError::TransactionInProgress);
         }
         // Commit to free up any pending free pages
         // Use 2-phase commit to avoid any possible security issues. Plus this compaction is going to be so slow that it doesn't matter.
         // Once https://github.com/cberner/redb/issues/829 is fixed, we should upgrade this to use quick-repair -- that way the user
         // can cancel the compaction without requiring a full repair afterwards
-        let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+        let txn = self.begin_write().map_err(|e| e.into_storage_error())?;
         if txn.list_persistent_savepoints()?.next().is_some() {
             return Err(CompactionError::PersistentSavepointExists);
         }
         if self.transaction_tracker.any_savepoint_exists() {
             return Err(CompactionError::EphemeralSavepointExists);
         }
-        txn.set_two_phase_commit(true);
-        txn.commit().map_err(|e| e.into_storage_error())?;
-        // Repeat, just in case executing list_persistent_savepoints() created a new table
-        let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-        txn.set_two_phase_commit(true);
-        txn.commit().map_err(|e| e.into_storage_error())?;
-        // There can't be any outstanding transactions because we have a `&mut self`, so all pending free pages
-        // should have been cleared out by the above commit()
-        let txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-        assert!(!txn.pending_free_pages()?);
         txn.abort()?;
+        self.drain_pending_free_pages(ShrinkPolicy::Maximum)?;
 
         let mut compacted = false;
         // Iteratively compact until no progress is made
@@ -650,23 +645,9 @@ impl Database {
                 txn.abort()?;
             }
 
-            // Double commit to free up the relocated pages for reuse
-            let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-            txn.set_two_phase_commit(true);
-            // Also shrink the database file by the maximum amount
-            txn.set_shrink_policy(ShrinkPolicy::Maximum);
-            txn.commit().map_err(|e| e.into_storage_error())?;
-            // Triple commit to free up the relocated pages for reuse
-            // TODO: this really shouldn't be necessary, but the data freed tree is a system table
-            // and so free'ing up its pages causes more deletes from the system tree
-            let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-            txn.set_two_phase_commit(true);
-            // Also shrink the database file by the maximum amount
-            txn.set_shrink_policy(ShrinkPolicy::Maximum);
-            txn.commit().map_err(|e| e.into_storage_error())?;
-            let txn = self.begin_write().map_err(|e| e.into_storage_error())?;
-            assert!(!txn.pending_free_pages()?);
-            txn.abort()?;
+            // Drain pages freed by compact_pages(), including system pages queued by any
+            // post-commit cleanup root updates.
+            self.drain_pending_free_pages(ShrinkPolicy::Maximum)?;
 
             if !progress {
                 break;
@@ -678,16 +659,34 @@ impl Database {
         Ok(compacted)
     }
 
+    fn drain_pending_free_pages(&self, shrink_policy: ShrinkPolicy) -> Result {
+        // Preserve compact()'s empty durable commit, which also publishes pending
+        // non-durable roots before checking for pending frees.
+        let mut force_commit = true;
+        loop {
+            let mut txn = self.begin_write().map_err(|e| e.into_storage_error())?;
+            if !force_commit && !txn.pending_free_pages()? {
+                txn.abort()?;
+                return Ok(());
+            }
+            force_commit = false;
+            txn.set_two_phase_commit(true);
+            txn.set_shrink_policy(shrink_policy);
+            txn.commit().map_err(|e| e.into_storage_error())?;
+        }
+    }
+
     #[cfg_attr(not(debug_assertions), expect(dead_code))]
     fn check_repaired_allocated_pages_table(
         system_root: Option<BtreeHeader>,
         mem: Arc<TransactionalMemory>,
     ) -> Result {
+        let resolver = PageResolver::new(mem.clone());
         let table_tree = TableTree::new(
             system_root,
             PageHint::None,
-            Arc::new(TransactionGuard::fake()),
-            mem.clone(),
+            Arc::new(TransactionGuard::untracked()),
+            resolver.clone(),
         )?;
         if let Some(table_def) = table_tree
             .get_table::<TransactionIdWithPagination, PageList>(
@@ -703,8 +702,8 @@ impl Database {
                 DATA_ALLOCATED_TABLE.name().to_string(),
                 table_root,
                 PageHint::None,
-                Arc::new(TransactionGuard::fake()),
-                mem.clone(),
+                Arc::new(TransactionGuard::untracked()),
+                resolver,
             )?;
             for result in table.range::<TransactionIdWithPagination>(..)? {
                 let (_, pages) = result?;
@@ -726,8 +725,14 @@ impl Database {
     where
         F: FnMut(PageNumber) -> Result,
     {
-        let fake_guard = Arc::new(TransactionGuard::fake());
-        let system_tree = TableTree::new(system_root, PageHint::None, fake_guard, mem.clone())?;
+        let untracked_guard = Arc::new(TransactionGuard::untracked());
+        let resolver = PageResolver::new(mem.clone());
+        let system_tree = TableTree::new(
+            system_root,
+            PageHint::None,
+            untracked_guard,
+            resolver.clone(),
+        )?;
         let table_name = table_def.name();
         let result = match system_tree.get_table::<K, V>(table_name, TableType::Normal) {
             Ok(result) => result,
@@ -754,8 +759,8 @@ impl Database {
                     table_name.to_string(),
                     table_root,
                     PageHint::None,
-                    Arc::new(TransactionGuard::fake()),
-                    mem.clone(),
+                    Arc::new(TransactionGuard::untracked()),
+                    resolver,
                 )?;
             for result in table.range::<TransactionIdWithPagination>(..)? {
                 let (_, page_list) = result?;
@@ -775,8 +780,13 @@ impl Database {
         let data_root = mem.get_data_root();
         {
             eprintln!("[MARK_DEBUG] Visiting data tree, root: {data_root:?}");
-            let fake = Arc::new(TransactionGuard::fake());
-            let tables = TableTree::new(data_root, PageHint::None, fake, mem.clone())?;
+            let untracked = Arc::new(TransactionGuard::untracked());
+            let tables = TableTree::new(
+                data_root,
+                PageHint::None,
+                untracked,
+                PageResolver::new(mem.clone()),
+            )?;
             tables.visit_all_pages(|path| {
                 eprintln!(
                     "[MARK_DEBUG] Data tree: marking page {:?}",
@@ -790,8 +800,13 @@ impl Database {
         let system_root = mem.get_system_root();
         {
             eprintln!("[MARK_DEBUG] Visiting system tree, root: {system_root:?}");
-            let fake = Arc::new(TransactionGuard::fake());
-            let system_tables = TableTree::new(system_root, PageHint::None, fake, mem.clone())?;
+            let untracked = Arc::new(TransactionGuard::untracked());
+            let system_tables = TableTree::new(
+                system_root,
+                PageHint::None,
+                untracked,
+                PageResolver::new(mem.clone()),
+            )?;
             system_tables.visit_all_pages(|path| {
                 eprintln!(
                     "[MARK_DEBUG] System tree: marking page {:?}",
@@ -858,8 +873,13 @@ impl Database {
 
         let data_root = mem.get_data_root();
         {
-            let fake = Arc::new(TransactionGuard::fake());
-            let tables = TableTree::new(data_root, PageHint::None, fake, mem.clone())?;
+            let untracked = Arc::new(TransactionGuard::untracked());
+            let tables = TableTree::new(
+                data_root,
+                PageHint::None,
+                untracked,
+                PageResolver::new(mem.clone()),
+            )?;
             tables.visit_all_pages(|path| {
                 mem.mark_page_allocated(path.page_number());
                 Ok(())
@@ -875,8 +895,13 @@ impl Database {
 
         let system_root = mem.get_system_root();
         {
-            let fake = Arc::new(TransactionGuard::fake());
-            let system_tables = TableTree::new(system_root, PageHint::None, fake, mem.clone())?;
+            let untracked = Arc::new(TransactionGuard::untracked());
+            let system_tables = TableTree::new(
+                system_root,
+                PageHint::None,
+                untracked,
+                PageResolver::new(mem.clone()),
+            )?;
             system_tables.visit_all_pages(|path| {
                 mem.mark_page_allocated(path.page_number());
                 Ok(())
@@ -995,11 +1020,12 @@ impl Database {
         }
 
         // See if it's present in the system table tree
+        let resolver = PageResolver::new(mem.clone());
         let system_table_tree = TableTree::new(
             mem.get_system_root(),
             PageHint::None,
-            Arc::new(TransactionGuard::fake()),
-            mem.clone(),
+            Arc::new(TransactionGuard::untracked()),
+            resolver.clone(),
         )?;
         let Some(allocator_state_table) = system_table_tree
             .get_table::<AllocatorStateKey, &[u8]>(ALLOCATOR_STATE_TABLE_NAME, TableType::Normal)
@@ -1015,8 +1041,8 @@ impl Database {
         let tree = AllocatorStateTree::new(
             table_root,
             PageHint::None,
-            Arc::new(TransactionGuard::fake()),
-            mem.clone(),
+            Arc::new(TransactionGuard::untracked()),
+            resolver,
         )?;
 
         // Make sure this isn't stale allocator state left over from a previous transaction
@@ -1025,17 +1051,6 @@ impl Database {
         }
 
         Ok(Some(tree))
-    }
-
-    fn allocate_read_transaction(&self) -> Result<TransactionGuard> {
-        let id = self
-            .transaction_tracker
-            .register_read_transaction(&self.mem)?;
-
-        Ok(TransactionGuard::new_read(
-            id,
-            self.transaction_tracker.clone(),
-        ))
     }
 
     /// Convenience method for [`Builder::new`]
@@ -1049,14 +1064,28 @@ impl Database {
     /// write may be in progress at a time. If a write is in progress, this function will block
     /// until it completes.
     pub fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
+        self.begin_write_with_allocation_policy(AllocationPolicy::Default)
+    }
+
+    // The allocation policy is fixed for the lifetime of the transaction; every page allocation
+    // this transaction makes goes through it.
+    pub(crate) fn begin_write_with_allocation_policy(
+        &self,
+        allocation_policy: AllocationPolicy,
+    ) -> Result<WriteTransaction, TransactionError> {
         // Fail early if there has been an I/O error -- nothing can be committed in that case
         self.mem.check_io_errors()?;
         let guard = TransactionGuard::new_write(
             self.transaction_tracker.start_write_transaction(),
             self.transaction_tracker.clone(),
         );
-        WriteTransaction::new(guard, self.transaction_tracker.clone(), self.mem.clone())
-            .map_err(|e| e.into())
+        WriteTransaction::new(
+            guard,
+            self.transaction_tracker.clone(),
+            self.mem.clone(),
+            allocation_policy,
+        )
+        .map_err(|e| e.into())
     }
 
     fn ensure_allocator_state_table_and_trim(&self) -> Result<(), Error> {
@@ -1064,11 +1093,16 @@ impl Database {
         #[cfg(feature = "logging")]
         debug!("Writing allocator state table");
         eprintln!("[DATABASE_DROP_DEBUG] ensure_allocator_state_table_and_trim: begin_write");
-        let mut tx = self.begin_write()?;
+        // If compact() left no free pages, the default allocator lands this
+        // commit's writes at high page indices (see AllocationPolicy::Lowest)
+        // and try_shrink can't reclaim the growth. See
+        // https://github.com/cberner/redb/issues/1165
+        let mut tx = self.begin_write_with_allocation_policy(AllocationPolicy::Lowest)?;
         eprintln!(
             "[DATABASE_DROP_DEBUG] ensure_allocator_state_table_and_trim: setting quick_repair"
         );
         tx.set_quick_repair(true);
+        tx.disable_post_commit_free();
         tx.set_shrink_policy(ShrinkPolicy::Maximum);
         eprintln!("[DATABASE_DROP_DEBUG] ensure_allocator_state_table_and_trim: about to commit");
         tx.commit()?;
@@ -1146,7 +1180,6 @@ impl Builder {
             // It is part of the file format, so can be enabled in the future.
             page_size: PAGE_SIZE,
             region_size: None,
-            // TODO: Default should probably take into account the total system memory
             cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
         }

@@ -293,6 +293,34 @@ fn delete() {
     assert_eq!(empty, get_vec(&table, "hello"));
 }
 
+// Regression test: remove_all on a key whose values live in an uncommitted subtree must
+// return guards that remain valid after the iterator is dropped (and therefore after the
+// subtree pages have been freed). Previously the subtree iteration handed out AccessGuards
+// that held references to the page bytes; dropping the iterator then freed those pages
+// via free_if_uncommitted while the collected guards were still outstanding, tripping
+// the read_page_ref_counts debug assertion.
+#[test]
+fn remove_all_uncommitted_subtree_collect() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_multimap_table(U64_TABLE).unwrap();
+        // Enough distinct values that the collection is promoted to a subtree of
+        // uncommitted pages before we remove_all in the same transaction.
+        for v in 0..2000u64 {
+            table.insert(&0u64, &v).unwrap();
+        }
+        let iter = table.remove_all(&0u64).unwrap();
+        let values: Vec<_> = iter.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(values.len(), 2000);
+        for (i, guard) in values.iter().enumerate() {
+            assert_eq!(guard.value(), i as u64);
+        }
+    }
+    write_txn.commit().unwrap();
+}
+
 #[test]
 fn wrong_types() {
     let tmpfile = create_tempfile();
@@ -416,4 +444,79 @@ fn multimap_signature_lifetimes() {
         };
     }
     write_txn.commit().unwrap();
+}
+
+// Exercises DoubleEndedIterator::next_back() on MultimapValue when the values for a key
+// are stored in a subtree (rather than inline).
+#[test]
+fn multimap_value_next_back_subtree() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_multimap_table(U64_TABLE).unwrap();
+        // Enough distinct values to promote the collection from inline to a subtree.
+        for v in 0..1000u64 {
+            table.insert(&0u64, &v).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_multimap_table(U64_TABLE).unwrap();
+    let mut iter = table.get(&0u64).unwrap();
+    assert_eq!(iter.len(), 1000);
+    for expected in (0..1000u64).rev() {
+        let guard = iter.next_back().unwrap().unwrap();
+        assert_eq!(guard.value(), expected);
+    }
+    assert!(iter.next_back().is_none());
+    assert!(iter.is_empty());
+}
+
+#[test]
+fn multimap_remove_subtree_backed_key() {
+    // Exercises MultimapTable::remove() when the values for a key are stored in a B-tree
+    // subtree (SubtreeV2), and covers the missing-key and value-not-in-inline cases.
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_multimap_table(U64_TABLE).unwrap();
+        // Enough values for key 0 to be promoted from inline to a subtree.
+        for v in 0..1000u64 {
+            table.insert(&0u64, &v).unwrap();
+        }
+        // Key 1 stays inline (only 2 values).
+        table.insert(&1u64, &100u64).unwrap();
+        table.insert(&1u64, &101u64).unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_multimap_table(U64_TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 1002);
+
+        // Key does not exist; returns false without touching the tree.
+        assert!(!table.remove(&99u64, &0u64).unwrap());
+
+        // Key exists with an inline collection, but the value is absent.
+        assert!(!table.remove(&1u64, &999u64).unwrap());
+
+        // Key exists with a subtree-backed collection; remove a present value.
+        assert!(table.remove(&0u64, &500u64).unwrap());
+        assert_eq!(table.len().unwrap(), 1001);
+
+        // Removing the same value again returns false (no longer in the subtree).
+        assert!(!table.remove(&0u64, &500u64).unwrap());
+        assert_eq!(table.len().unwrap(), 1001);
+    }
+    write_txn.commit().unwrap();
+
+    // Confirm the removal persists and the subtree still has the remaining 999 values.
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_multimap_table(U64_TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), 1001);
+    assert_eq!(table.get(&0u64).unwrap().len(), 999);
 }

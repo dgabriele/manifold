@@ -1,19 +1,22 @@
 use crate::transaction_tracker::TransactionId;
 use crate::transactions::{AllocatorStateKey, AllocatorStateTree, AllocatorStateTreeMut};
 use crate::tree_store::btree_base::{BtreeHeader, Checksum};
-use crate::tree_store::page_store::base::{PageHint, MAX_PAGE_INDEX};
+use crate::tree_store::page_store::base::{MAX_PAGE_INDEX, PageHint};
 use crate::tree_store::page_store::buddy_allocator::BuddyAllocator;
 use crate::tree_store::page_store::cached_file::PagedCachedFile;
-use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
-use crate::tree_store::page_store::header::{DatabaseHeader, DB_HEADER_SIZE, MAGICNUMBER};
+use crate::tree_store::page_store::fast_hash::{PageNumberHashMap, PageNumberHashSet};
+use crate::tree_store::page_store::header::{
+    DB_HEADER_SIZE, DatabaseHeader, MAGICNUMBER, TransactionHeader, UnrepairedDatabaseHeader,
+};
 use crate::tree_store::page_store::layout::DatabaseLayout;
 use crate::tree_store::page_store::region::{Allocators, RegionTracker};
-use crate::tree_store::page_store::{hash128_with_seed, PageImpl, PageMut};
+use crate::tree_store::page_store::{PageImpl, PageMut, hash128_with_seed};
 use crate::tree_store::{Page, PageNumber, PageTrackerPolicy};
 use crate::{CacheStats, StorageBackend};
 use crate::{DatabaseError, Result, StorageError};
 use arc_swap::ArcSwap;
 use std::cmp::{max, min};
+use std::collections::BTreeMap;
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
 #[cfg(debug_assertions)]
@@ -21,8 +24,6 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::io::ErrorKind;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(debug_assertions)]
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -34,8 +35,11 @@ const NO_HEADER: u32 = 0;
 // Regions have a maximum size of 4GiB. A `4GiB - overhead` value is the largest that can be represented,
 // because the leaf node format uses 32bit offsets
 const MAX_USABLE_REGION_SPACE: u64 = 4 * 1024 * 1024 * 1024;
-// TODO: remove this constant?
-pub(crate) const MAX_MAX_PAGE_ORDER: u8 = 20;
+// A region holds at most `MAX_PAGE_INDEX + 1` pages (the page index within a region is 20 bits),
+// so the largest buddy-allocator order any region can have is log2(MAX_PAGE_INDEX + 1).
+// `u32::ilog2` is always <= 31, so the cast to u8 is lossless.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) const MAX_MAX_PAGE_ORDER: u8 = (MAX_PAGE_INDEX + 1).ilog2() as u8;
 pub(super) const MIN_USABLE_PAGES: u32 = 10;
 const MIN_DESIRED_USABLE_BYTES: u64 = 1024 * 1024;
 
@@ -64,6 +68,163 @@ pub(crate) enum ShrinkPolicy {
     Never,
 }
 
+/// Controls how `allocate()` picks a free page.
+#[derive(Copy, Clone)]
+pub(crate) enum AllocationPolicy {
+    /// Find a free block at the requested order, or recursively split from a
+    /// higher order. Cheaper than `Lowest`, but after `grow()` has appended
+    /// buddy-aligned free blocks at high page indices this can allocate at
+    /// high absolute pages.
+    Default,
+    /// Pick the lowest-page-number allocation across all orders. More
+    /// expensive, but keeps trailing pages free so `try_shrink()` can
+    /// reclaim recently-grown space.
+    Lowest,
+}
+
+/// Read-only view over `TransactionalMemory` exposing only the methods that
+/// btree read paths and stats helpers need. Cheap to clone -- a single
+/// `Arc<TransactionalMemory>` bump.
+///
+/// Construct one from `PageAllocator::resolver()` (write-transaction context)
+/// or `PageResolver::new(mem)` (read-transaction context). Read-only btree
+/// types accept `PageResolver` rather than `Arc<TransactionalMemory>` so that
+/// they cannot be used to bypass `PageAllocator`'s allocation tracking.
+#[derive(Clone)]
+pub(crate) struct PageResolver {
+    mem: Arc<TransactionalMemory>,
+}
+
+impl PageResolver {
+    pub(crate) fn new(mem: Arc<TransactionalMemory>) -> Self {
+        Self { mem }
+    }
+
+    pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
+        self.mem.get_page(page_number, hint)
+    }
+
+    pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
+        self.mem.count_allocated_pages()
+    }
+}
+
+/// Per-write-transaction handle through which btree mutation code allocates
+/// and frees pages. Bundles the shared `TransactionalMemory` with the write
+/// transaction's `AllocationPolicy`.
+#[derive(Clone)]
+pub(crate) struct PageAllocator {
+    mem: Arc<TransactionalMemory>,
+    policy: AllocationPolicy,
+    allocated_since_commit: Arc<Mutex<PageTrackerPolicy>>,
+}
+
+impl PageAllocator {
+    pub(crate) fn new(mem: Arc<TransactionalMemory>, policy: AllocationPolicy) -> Self {
+        Self {
+            mem,
+            policy,
+            allocated_since_commit: Arc::new(Mutex::new(PageTrackerPolicy::new_tracking())),
+        }
+    }
+
+    /// Returns a `PageResolver` for constructing read-only views of this transaction's pages.
+    pub(crate) fn resolver(&self) -> PageResolver {
+        PageResolver::new(self.mem.clone())
+    }
+
+    /// Drains the set of pages allocated since the last commit, returning
+    /// them. Used by commit and non-durable commit paths to hand the set over
+    /// to `TransactionalMemory`.
+    pub(crate) fn take_allocated_since_commit(&self) -> PageNumberHashSet {
+        self.allocated_since_commit.lock().unwrap().reset()
+    }
+
+    /// Reverses every allocation made since the last commit: drains the
+    /// allocated-since-commit set and frees each page.
+    pub(crate) fn rollback_all(&self) {
+        self.mem.debug_assert_no_dirty_pages();
+        let drained = self.take_allocated_since_commit();
+        for page in &drained {
+            self.mem.free(*page, &mut PageTrackerPolicy::Ignore);
+        }
+    }
+
+    pub(crate) fn allocate<'a>(
+        &self,
+        size: usize,
+        allocated: &mut PageTrackerPolicy,
+    ) -> Result<PageMut<'a>> {
+        let page = match self.policy {
+            AllocationPolicy::Default => self.mem.allocate(size, allocated)?,
+            AllocationPolicy::Lowest => self.mem.allocate_lowest(size, allocated)?,
+        };
+        self.allocated_since_commit
+            .lock()
+            .unwrap()
+            .insert(page.get_page_number());
+        Ok(page)
+    }
+
+    // Always allocates at the lowest free page, ignoring `self.policy`. Used
+    // by compaction's probe loop where the point is specifically to test
+    // whether a page can land below its current position.
+    pub(crate) fn allocate_lowest<'a>(
+        &self,
+        size: usize,
+        allocated: &mut PageTrackerPolicy,
+    ) -> Result<PageMut<'a>> {
+        let page = self.mem.allocate_lowest(size, allocated)?;
+        self.allocated_since_commit
+            .lock()
+            .unwrap()
+            .insert(page.get_page_number());
+        Ok(page)
+    }
+
+    pub(crate) fn free(&self, page: PageNumber, allocated: &mut PageTrackerPolicy) {
+        self.allocated_since_commit
+            .lock()
+            .unwrap()
+            .remove_if_present(page);
+        self.mem.free(page, allocated);
+    }
+
+    pub(crate) fn free_if_uncommitted(
+        &self,
+        page: PageNumber,
+        allocated: &mut PageTrackerPolicy,
+    ) -> bool {
+        if self
+            .allocated_since_commit
+            .lock()
+            .unwrap()
+            .remove_if_present(page)
+        {
+            self.mem.free(page, allocated);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn uncommitted(&self, page: PageNumber) -> bool {
+        self.allocated_since_commit.lock().unwrap().contains(page)
+    }
+
+    pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
+        self.mem.get_page(page_number, hint)
+    }
+
+    pub(crate) fn get_page_mut<'a>(&self, page_number: PageNumber) -> Result<PageMut<'a>> {
+        self.mem.get_page_mut(page_number)
+    }
+
+    pub(crate) fn get_page_size(&self) -> usize {
+        self.mem.get_page_size()
+    }
+}
+
 fn ceil_log2(x: usize) -> u8 {
     if x.is_power_of_two() {
         x.trailing_zeros().try_into().unwrap()
@@ -78,37 +239,75 @@ pub(crate) fn xxh3_checksum(data: &[u8]) -> Checksum {
 
 struct InMemoryState {
     header: DatabaseHeader,
-    // TODO: we should make this an Option because it is only valid after the Database initializes it
-    allocators: Allocators,
+    // None until the Database finishes loading allocator state from disk or rebuilding it via
+    // repair.
+    allocators: Option<Allocators>,
+    // True if a non-durable commit has updated the secondary slot and that data should be served
+    // to readers until a durable commit promotes it to the primary slot on disk. Protected by the
+    // enclosing Mutex so updates happen atomically with the header changes they describe.
+    read_from_secondary: bool,
 }
 
 impl InMemoryState {
     fn new(header: DatabaseHeader) -> Self {
-        let allocators = Allocators::new(header.layout());
-        Self { header, allocators }
+        Self {
+            header,
+            allocators: None,
+            read_from_secondary: false,
+        }
+    }
+
+    fn allocators(&self) -> &Allocators {
+        self.allocators
+            .as_ref()
+            .expect("allocators have not been loaded yet")
+    }
+
+    fn allocators_mut(&mut self) -> &mut Allocators {
+        self.allocators
+            .as_mut()
+            .expect("allocators have not been loaded yet")
     }
 
     fn get_region(&self, region: u32) -> &BuddyAllocator {
-        &self.allocators.region_allocators[region as usize]
+        &self.allocators().region_allocators[region as usize]
     }
 
     fn get_region_mut(&mut self, region: u32) -> &mut BuddyAllocator {
-        &mut self.allocators.region_allocators[region as usize]
+        &mut self.allocators_mut().region_allocators[region as usize]
     }
 
     fn get_region_tracker_mut(&mut self) -> &mut RegionTracker {
-        &mut self.allocators.region_tracker
+        &mut self.allocators_mut().region_tracker
+    }
+
+    // Slot that reads should be served from: the secondary when a non-durable commit is pending,
+    // otherwise the primary.
+    fn latest_slot(&self) -> &TransactionHeader {
+        if self.read_from_secondary {
+            self.header.secondary_slot()
+        } else {
+            self.header.primary_slot()
+        }
     }
 }
 
 pub(crate) struct TransactionalMemory {
-    // Pages allocated since the last commit
-    // TODO: maybe this should be moved to WriteTransaction?
-    allocated_since_commit: Mutex<PageNumberHashSet>,
+    // TODO: Maybe we should move all this unpersisted stuff to another transaction layer.
+    // There are durable commits which support persistent and ephemeral savepoints.
+    // And then non-durable commits which support only ephemeral savepoints, and basically
+    // accumulate in unpersisted memory/file space until a durable commit is made.
+    // Maybe the non-durable commit layer should be separate, and build on top of the durable commit layer.
     unpersisted: Mutex<PageNumberHashSet>,
-    // True if the allocator state was corrupted when the file was opened
-    // TODO: maybe we can remove this flag now that CheckedBackend exists?
-    needs_recovery: AtomicBool,
+    // Data-tree pages allocated by non-durable commits that have not yet been durably persisted.
+    // This is the in-memory replacement for entries
+    // in DATA_ALLOCATED_TABLE for non-durable transactions: by keeping the list in-memory we can
+    // efficiently remove entries when `free_if_unpersisted` reclaims pages.
+    // Flushed to DATA_ALLOCATED_TABLE during durable_commit, and cleared (along with
+    // `unpersisted`) once the commit succeeds.
+    unpersisted_allocations: Mutex<BTreeMap<TransactionId, PageNumberHashSet>>,
+    // Reverse index into `unpersisted_allocations`
+    unpersisted_allocation_txn: Mutex<PageNumberHashMap<TransactionId>>,
     storage: PagedCachedFile,
     state: Mutex<InMemoryState>,
     // Lock-free header for fast read access during commits
@@ -123,8 +322,6 @@ pub(crate) struct TransactionalMemory {
     // Set of all allocated pages for debugging assertions
     #[cfg(debug_assertions)]
     allocated_pages: Arc<Mutex<PageNumberHashSet>>,
-    // Indicates that a non-durable commit has been made, so reads should be served from the secondary meta page
-    read_from_secondary: AtomicBool,
     page_size: u32,
     // We store these separately from the layout because they're static, and accessed on the get_page()
     // code path where there is no locking
@@ -238,25 +435,15 @@ impl TransactionalMemory {
             storage.flush()?;
         }
         let header_bytes = storage.read_direct(0, DB_HEADER_SIZE)?;
-        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
+        let unrepaired = UnrepairedDatabaseHeader::from_bytes(&header_bytes)?;
 
-        let needs_recovery =
-            header.recovery_required || header.layout().len() != storage.raw_file_len()?;
+        let file_len = storage.raw_file_len()?;
+        let needs_recovery = unrepaired.recovery_required(file_len);
+        if needs_recovery && read_only {
+            return Err(DatabaseError::RepairAborted);
+        }
+        let (header, _) = unrepaired.finalize(file_len)?;
         if needs_recovery {
-            if read_only {
-                return Err(DatabaseError::RepairAborted);
-            }
-            let layout = header.layout();
-            let region_max_pages = layout.full_region_layout().num_pages();
-            let region_header_pages = layout.full_region_layout().get_header_pages();
-            header.set_layout(DatabaseLayout::recalculate(
-                storage.raw_file_len()?,
-                region_header_pages,
-                region_max_pages,
-                page_size.try_into().unwrap(),
-            ));
-            let _swapped = header.pick_primary_for_repair(repair_info)?;
-            assert!(!repair_info.invalid_magic_number);
             storage
                 .write(0, DB_HEADER_SIZE, true)?
                 .mem_mut()
@@ -274,9 +461,9 @@ impl TransactionalMemory {
         assert!(page_size >= DB_HEADER_SIZE);
 
         Ok(Self {
-            allocated_since_commit: Mutex::new(Default::default()),
-            unpersisted: Mutex::new(Default::default()),
-            needs_recovery: AtomicBool::new(needs_recovery),
+            unpersisted: Mutex::new(PageNumberHashSet::default()),
+            unpersisted_allocations: Mutex::new(BTreeMap::new()),
+            unpersisted_allocation_txn: Mutex::new(PageNumberHashMap::default()),
             storage,
             state: Mutex::new(state),
             header_snapshot: ArcSwap::new(header_snapshot),
@@ -285,8 +472,7 @@ impl TransactionalMemory {
             #[cfg(debug_assertions)]
             read_page_ref_counts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(debug_assertions)]
-            allocated_pages: Arc::new(Mutex::new(Default::default())),
-            read_from_secondary: AtomicBool::new(false),
+            allocated_pages: Arc::new(Mutex::new(PageNumberHashSet::default())),
             page_size: page_size.try_into().unwrap(),
             region_size,
             region_header_with_padding_size: region_header_size,
@@ -299,6 +485,20 @@ impl TransactionalMemory {
 
     pub(crate) fn check_io_errors(&self) -> Result {
         self.storage.check_io_errors()
+    }
+
+    // Panics in debug builds if any `PageMut` handed out by `get_page_mut` or
+    // `allocate*` has not yet been dropped. Intended as a precondition for
+    // commit/abort paths, which assume no mutable page references remain.
+    pub(crate) fn debug_assert_no_dirty_pages(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let dirty_pages = self.open_dirty_pages.lock().unwrap();
+            debug_assert!(
+                dirty_pages.is_empty(),
+                "Dirty pages outstanding: {dirty_pages:?}"
+            );
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -323,11 +523,12 @@ impl TransactionalMemory {
     #[cfg(debug_assertions)]
     pub(crate) fn debug_check_allocator_consistency(&self) {
         let state = self.state.lock().unwrap();
-        let mut region_pages = vec![vec![]; state.allocators.region_allocators.len()];
+        let allocators = state.allocators();
+        let mut region_pages = vec![vec![]; allocators.region_allocators.len()];
         for p in self.allocated_pages.lock().unwrap().iter() {
             region_pages[p.region as usize].push(*p);
         }
-        for (i, allocator) in state.allocators.region_allocators.iter().enumerate() {
+        for (i, allocator) in allocators.region_allocators.iter().enumerate() {
             allocator.check_allocated_pages(i.try_into().unwrap(), &region_pages[i]);
         }
     }
@@ -337,23 +538,13 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn clear_cache_and_reload(&mut self) -> Result<bool, DatabaseError> {
-        assert!(self.allocated_since_commit.lock().unwrap().is_empty());
-
         self.storage.flush()?;
         self.storage.invalidate_cache_all();
 
         let header_bytes = self.storage.read_direct(0, DB_HEADER_SIZE)?;
-        let (mut header, repair_info) = DatabaseHeader::from_bytes(&header_bytes)?;
-        // TODO: This ends up always being true because this is called from check_integrity() once the db is already open
-        // TODO: Also we should recheck the layout
-        let mut was_clean = true;
-        if header.recovery_required {
-            if !header.pick_primary_for_repair(repair_info)? {
-                was_clean = false;
-            }
-            if repair_info.invalid_magic_number {
-                return Err(StorageError::Corrupted("Invalid magic number".to_string()).into());
-            }
+        let unrepaired = UnrepairedDatabaseHeader::from_bytes(&header_bytes)?;
+        let (header, was_clean) = unrepaired.finalize(self.storage.raw_file_len()?)?;
+        if !was_clean {
             self.storage
                 .write(0, DB_HEADER_SIZE, true)?
                 .mem_mut()
@@ -361,10 +552,21 @@ impl TransactionalMemory {
             self.storage.flush()?;
         }
 
-        self.needs_recovery
-            .store(header.recovery_required, Ordering::Release);
-        self.state.lock().unwrap().header = header.clone();
+        {
+            let mut state = self.state.lock().unwrap();
+            state.header = header.clone();
+            state.read_from_secondary = false;
+            // Drop the previous allocator state -- it described the layout that was in memory
+            // before the reload. The caller is required to repopulate it (via begin_repair or
+            // load_allocator_state) before any allocation/free path runs.
+            state.allocators = None;
+        }
         self.header_snapshot.store(Arc::new(header));
+        // Reloading from disk discards in-memory roots, so drop volatile allocation state
+        // that belonged only to those roots.
+        self.unpersisted.lock().unwrap().clear();
+        self.unpersisted_allocations.lock().unwrap().clear();
+        self.unpersisted_allocation_txn.lock().unwrap().clear();
 
         Ok(was_clean)
     }
@@ -383,12 +585,14 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn allocator_hash(&self) -> u128 {
-        self.state.lock().unwrap().allocators.xxh3_hash()
+        self.state.lock().unwrap().allocators().xxh3_hash()
     }
 
-    // TODO: need a clearer distinction between this and needs_repair()
+    // Reports whether the backend has seen an I/O failure in this process.
+    // Callers use this to skip cleanup that would do further I/O after a
+    // previous storage error (e.g. WriteTransaction::drop).
     pub(crate) fn storage_failure(&self) -> bool {
-        self.needs_recovery.load(Ordering::Acquire)
+        self.storage.check_io_errors().is_err()
     }
 
     pub(crate) fn repair_primary_corrupted(&self) {
@@ -399,7 +603,7 @@ impl TransactionalMemory {
 
     pub(crate) fn begin_repair(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        state.allocators = Allocators::new(state.header.layout());
+        state.allocators = Some(Allocators::new(state.header.layout()));
         self.header_snapshot.store(Arc::new(state.header.clone()));
         #[cfg(debug_assertions)]
         self.allocated_pages.lock().unwrap().clear();
@@ -420,8 +624,8 @@ impl TransactionalMemory {
         let header_bytes = header.to_bytes(true);
 
         // Verify what was serialized by deserializing it back
-        let (_verified_header, _) =
-            crate::tree_store::page_store::header::DatabaseHeader::from_bytes(&header_bytes)
+        let _verified_header =
+            crate::tree_store::page_store::header::UnrepairedDatabaseHeader::from_bytes(&header_bytes)
                 .map_err(|e| {
                     StorageError::Corrupted(format!("Failed to verify serialized header: {e}"))
                 })?;
@@ -439,10 +643,8 @@ impl TransactionalMemory {
         state.header.recovery_required = false;
         self.write_header(&state.header)?;
         self.header_snapshot.store(Arc::new(state.header.clone()));
-        let result = self.storage.flush();
-        self.needs_recovery.store(false, Ordering::Release);
-
-        result
+        self.storage.flush()?;
+        Ok(())
     }
 
     pub(crate) fn reserve_allocator_state(
@@ -453,9 +655,9 @@ impl TransactionalMemory {
         let state = self.state.lock().unwrap();
         let layout = state.header.layout();
         let num_regions = layout.num_regions();
-        let region_tracker_len = state.allocators.region_tracker.to_vec().len();
-        let region_lens: Vec<usize> = state
-            .allocators
+        let allocators = state.allocators();
+        let region_tracker_len = allocators.region_tracker.to_vec().len();
+        let region_lens: Vec<usize> = allocators
             .region_allocators
             .iter()
             .map(|x| x.to_vec().len())
@@ -495,8 +697,9 @@ impl TransactionalMemory {
             return Ok(false);
         }
 
+        let allocators = state.allocators();
         for i in 0..num_regions {
-            let region_bytes = &state.allocators.region_allocators[i as usize].to_vec();
+            let region_bytes = &allocators.region_allocators[i as usize].to_vec();
             if tree
                 .get(&AllocatorStateKey::Region(i))?
                 .unwrap()
@@ -510,7 +713,7 @@ impl TransactionalMemory {
             tree.insert_inplace(&AllocatorStateKey::Region(i), &region_bytes.as_ref())?;
         }
 
-        let region_tracker_bytes = state.allocators.region_tracker.to_vec();
+        let region_tracker_bytes = allocators.region_tracker.to_vec();
         if tree
             .get(&AllocatorStateKey::RegionTracker)?
             .unwrap()
@@ -565,21 +768,19 @@ impl TransactionalMemory {
         );
 
         let mut state = self.state.lock().unwrap();
-        state.allocators = Allocators {
+        state.allocators = Some(Allocators {
             region_tracker,
             region_allocators,
-        };
+        });
 
         // Resize the allocators to match the current file size
         let layout = state.header.layout();
-        state.allocators.resize_to(layout);
+        state.allocators_mut().resize_to(layout);
 
         state.header.recovery_required = false;
         self.header_snapshot.store(Arc::new(state.header.clone()));
 
         drop(state);
-
-        self.needs_recovery.store(false, Ordering::Release);
 
         Ok(())
     }
@@ -598,30 +799,7 @@ impl TransactionalMemory {
     }
 
     // Commit all outstanding changes and make them visible as the primary
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit(
-        &self,
-        data_root: Option<BtreeHeader>,
-        system_root: Option<BtreeHeader>,
-        transaction_id: TransactionId,
-        two_phase: bool,
-        shrink_policy: ShrinkPolicy,
-    ) -> Result {
-        let result = self.commit_inner(
-            data_root,
-            system_root,
-            transaction_id,
-            two_phase,
-            shrink_policy,
-        );
-        if result.is_err() {
-            self.needs_recovery.store(true, Ordering::Release);
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn commit_inner(
         &self,
         data_root: Option<BtreeHeader>,
         system_root: Option<BtreeHeader>,
@@ -632,9 +810,8 @@ impl TransactionalMemory {
         // All mutable pages must be dropped, this ensures that when a transaction completes
         // no more writes can happen to the pages it allocated. Thus it is safe to make them visible
         // to future read transactions
-        #[cfg(debug_assertions)]
-        debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
-        assert!(!self.needs_recovery.load(Ordering::Acquire));
+        self.debug_assert_no_dirty_pages();
+        self.storage.check_io_errors()?;
 
         let mut state = self.state.lock().unwrap();
         // Trim surplus file space, before finalizing the commit
@@ -670,20 +847,15 @@ impl TransactionalMemory {
         self.storage.flush()?;
 
         if shrunk {
-            let result = self.storage.resize(header.layout().len());
-            if result.is_err() {
-                // TODO: it would be nice to have a more cohesive approach to setting this.
-                // we do it in commit() & rollback() on failure, but there are probably other places that need it
-                self.needs_recovery.store(true, Ordering::Release);
-                return result;
-            }
+            self.storage.resize(header.layout().len())?;
         }
-        let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-        allocated_since_commit.clear();
-        allocated_since_commit.shrink_to_fit();
         let mut unpersisted = self.unpersisted.lock().unwrap();
         unpersisted.clear();
         unpersisted.shrink_to_fit();
+        // Any remaining unpersisted allocations are now durable. Their records have already been
+        // flushed to DATA_ALLOCATED_TABLE (see WriteTransaction::durable_commit).
+        self.unpersisted_allocations.lock().unwrap().clear();
+        self.unpersisted_allocation_txn.lock().unwrap().clear();
 
         let mut state = self.state.lock().unwrap();
         assert_eq!(
@@ -691,59 +863,33 @@ impl TransactionalMemory {
             old_transaction_id
         );
         state.header = header.clone();
+        state.read_from_secondary = false;
 
         // Update lock-free snapshot BEFORE releasing the lock
         self.header_snapshot.store(Arc::new(header));
-        self.read_from_secondary.store(false, Ordering::Release);
-        // Hold lock until read_from_secondary is set to false, so that the new primary state is read.
-        // TODO: maybe we can remove the whole read_from_secondary flag?
         drop(state);
 
         Ok(())
     }
 
-    // Make changes visible, without a durability guarantee
+    // Make changes visible, without a durability guarantee. `newly_unpersisted` is the set of
+    // pages allocated by this transaction; they become part of the unpersisted-page tracking so
+    // they can be reclaimed if a subsequent durable commit fails.
     pub(crate) fn non_durable_commit(
         &self,
         data_root: Option<BtreeHeader>,
         system_root: Option<BtreeHeader>,
         transaction_id: TransactionId,
+        newly_unpersisted: PageNumberHashSet,
     ) -> Result {
         // All mutable pages must be dropped, this ensures that when a transaction completes
         // no more writes can happen to the pages it allocated. Thus it is safe to make them visible
         // to future read transactions
-        #[cfg(debug_assertions)]
-        debug_assert!(self.open_dirty_pages.lock().unwrap().is_empty());
-        assert!(!self.needs_recovery.load(Ordering::Acquire));
+        self.debug_assert_no_dirty_pages();
+        self.storage.check_io_errors()?;
 
-        let mut unpersisted = self.unpersisted.lock().unwrap();
-        let mut allocated_since_commit = self.allocated_since_commit.lock().unwrap();
-        unpersisted.extend(allocated_since_commit.drain());
-        allocated_since_commit.shrink_to_fit();
-        drop(unpersisted);
-        drop(allocated_since_commit);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let commit_start = std::time::Instant::now();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let barrier_start = std::time::Instant::now();
-
-        // Always call write_barrier - it writes pages to disk without fsync
-        // This provides visibility and persistence
-        // The WAL fsync provides crash durability; write_barrier provides efficient page writes
-        // Note: write_barrier does NOT fsync - only writes to OS page cache
+        self.unpersisted.lock().unwrap().extend(newly_unpersisted);
         self.storage.write_barrier()?;
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _barrier_time = barrier_start.elapsed();
-        }
-
-        // CRITICAL OPTIMIZATION: Minimize lock hold time by using lock-free header snapshot
-        // This is the key bottleneck fix for concurrent column family writes
-        #[cfg(not(target_arch = "wasm32"))]
-        let header_lock_start = std::time::Instant::now();
 
         let header_update = {
             let mut state = self.state.lock().unwrap();
@@ -751,30 +897,18 @@ impl TransactionalMemory {
             secondary.transaction_id = transaction_id;
             secondary.user_root = data_root;
             secondary.system_root = system_root;
+            state.read_from_secondary = true;
             state.header.clone()
-        }; // Lock released here - much faster!
+        };
 
         // Update lock-free snapshot outside the lock
         self.header_snapshot.store(Arc::new(header_update));
 
-        // TODO: maybe we can remove this flag and just update the in-memory DatabaseHeader state?
-        self.read_from_secondary.store(true, Ordering::Release);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _total_commit_time = commit_start.elapsed();
-            let _barrier_time = barrier_start.elapsed();
-            let _header_lock_time = header_lock_start.elapsed();
-        }
-
         Ok(())
     }
 
-    /// Flushes all pending writes and performs a durable commit.
-    ///
-    /// This is used during WAL checkpoint to persist all accumulated dirty pages
-    /// and make the checkpoint durable. Unlike `non_durable_commit`, this explicitly
-    /// flushes the write buffer and performs a full durable commit with fsync.
+    /// Performs a checkpoint commit: flushes all dirty pages and does a full durable commit.
+    /// Used by WAL checkpoint to persist all pending writes.
     pub(crate) fn checkpoint_commit(
         &self,
         data_root: Option<BtreeHeader>,
@@ -798,13 +932,6 @@ impl TransactionalMemory {
     ///
     /// This is used during WAL recovery and checkpointing to restore transaction state
     /// without going through the full `WriteTransaction` path.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that:
-    /// - The roots point to valid B-tree structures
-    /// - The freed/allocated pages are consistent with the actual storage state
-    /// - This is called during recovery or checkpoint, not during normal operation
     pub(crate) fn apply_wal_transaction(
         &self,
         data_root: Option<BtreeHeader>,
@@ -813,54 +940,8 @@ impl TransactionalMemory {
     ) -> Result {
         // Use non_durable_commit to apply the transaction state
         // This updates the secondary slot with the new roots
-        self.non_durable_commit(data_root, system_root, transaction_id)
-    }
-
-    pub(crate) fn rollback_uncommitted_writes(&self) -> Result {
-        let result = self.rollback_uncommitted_writes_inner();
-        if result.is_err() {
-            self.needs_recovery.store(true, Ordering::Release);
-        }
-        result
-    }
-
-    fn rollback_uncommitted_writes_inner(&self) -> Result {
-        #[cfg(debug_assertions)]
-        {
-            let dirty_pages = self.open_dirty_pages.lock().unwrap();
-            debug_assert!(
-                dirty_pages.is_empty(),
-                "Dirty pages outstanding: {dirty_pages:?}"
-            );
-        }
-        assert!(!self.needs_recovery.load(Ordering::Acquire));
-        let mut state = self.state.lock().unwrap();
-        let mut guard = self.allocated_since_commit.lock().unwrap();
-        for page_number in guard.iter() {
-            let region_index = page_number.region;
-            state
-                .get_region_tracker_mut()
-                .mark_free(page_number.page_order, region_index);
-            state
-                .get_region_mut(region_index)
-                .free(page_number.page_index, page_number.page_order);
-            #[cfg(debug_assertions)]
-            assert!(self.allocated_pages.lock().unwrap().remove(page_number));
-
-            let address = page_number.address_range(
-                self.page_size.into(),
-                self.region_size,
-                self.region_header_with_padding_size,
-                self.page_size,
-            );
-            let len: usize = (address.end - address.start).try_into().unwrap();
-            self.storage.invalidate_cache(address.start, len);
-            self.storage.cancel_pending_write(address.start, len);
-        }
-        guard.clear();
-        guard.shrink_to_fit();
-
-        Ok(())
+        use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
+        self.non_durable_commit(data_root, system_root, transaction_id, PageNumberHashSet::default())
     }
 
     pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
@@ -899,11 +980,13 @@ impl TransactionalMemory {
     pub(crate) fn get_page_mut<'txn>(&self, page_number: PageNumber) -> Result<PageMut<'txn>> {
         #[cfg(debug_assertions)]
         {
-            assert!(!self
-                .read_page_ref_counts
-                .lock()
-                .unwrap()
-                .contains_key(&page_number));
+            assert!(
+                !self
+                    .read_page_ref_counts
+                    .lock()
+                    .unwrap()
+                    .contains_key(&page_number)
+            );
             assert!(!self.open_dirty_pages.lock().unwrap().contains(&page_number));
         }
 
@@ -933,45 +1016,28 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn get_version(&self) -> u8 {
-        let header = self.header_snapshot.load();
-        if self.read_from_secondary.load(Ordering::Acquire) {
-            header.secondary_slot().version
-        } else {
-            header.primary_slot().version
-        }
+        let state = self.state.lock().unwrap();
+        state.latest_slot().version
     }
 
     pub(crate) fn get_data_root(&self) -> Option<BtreeHeader> {
-        let header = self.header_snapshot.load();
-        if self.read_from_secondary.load(Ordering::Acquire) {
-            header.secondary_slot().user_root
-        } else {
-            header.primary_slot().user_root
-        }
+        let state = self.state.lock().unwrap();
+        state.latest_slot().user_root
     }
 
     pub(crate) fn get_system_root(&self) -> Option<BtreeHeader> {
-        let header = self.header_snapshot.load();
-        let read_from_secondary = self.read_from_secondary.load(Ordering::Acquire);
-        if read_from_secondary {
-            header.secondary_slot().system_root
-        } else {
-            header.primary_slot().system_root
-        }
+        let state = self.state.lock().unwrap();
+        state.latest_slot().system_root
     }
 
     pub(crate) fn get_last_committed_transaction_id(&self) -> Result<TransactionId> {
-        let header = self.header_snapshot.load();
-        if self.read_from_secondary.load(Ordering::Acquire) {
-            Ok(header.secondary_slot().transaction_id)
-        } else {
-            Ok(header.primary_slot().transaction_id)
-        }
+        let state = self.state.lock()?;
+        Ok(state.latest_slot().transaction_id)
     }
 
     pub(crate) fn get_last_durable_transaction_id(&self) -> Result<TransactionId> {
-        let header = self.header_snapshot.load();
-        Ok(header.primary_slot().transaction_id)
+        let state = self.state.lock()?;
+        Ok(state.header.primary_slot().transaction_id)
     }
 
     /// Gets the current secondary slot state for checkpoint.
@@ -992,18 +1058,42 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn free(&self, page: PageNumber, allocated: &mut PageTrackerPolicy) {
-        self.allocated_since_commit.lock().unwrap().remove(&page);
         self.free_helper(page, allocated);
+    }
+
+    fn remove_unpersisted_allocation(&self, page: PageNumber) {
+        let Some(txn) = self
+            .unpersisted_allocation_txn
+            .lock()
+            .unwrap()
+            .remove(&page)
+        else {
+            return;
+        };
+        let mut allocations = self.unpersisted_allocations.lock().unwrap();
+        let empty = {
+            let pages = allocations
+                .get_mut(&txn)
+                .expect("unpersisted_allocation_txn points to a missing entry");
+            let removed = pages.remove(&page);
+            debug_assert!(removed);
+            pages.is_empty()
+        };
+        if empty {
+            allocations.remove(&txn);
+        }
     }
 
     fn free_helper(&self, page: PageNumber, allocated: &mut PageTrackerPolicy) {
         #[cfg(debug_assertions)]
         {
-            assert!(!self
-                .read_page_ref_counts
-                .lock()
-                .unwrap()
-                .contains_key(&page));
+            assert!(
+                !self
+                    .read_page_ref_counts
+                    .lock()
+                    .unwrap()
+                    .contains_key(&page)
+            );
             assert!(self.allocated_pages.lock().unwrap().remove(&page));
             assert!(!self.open_dirty_pages.lock().unwrap().contains(&page));
         }
@@ -1039,6 +1129,7 @@ impl TransactionalMemory {
         allocated: &mut PageTrackerPolicy,
     ) -> bool {
         if self.unpersisted.lock().unwrap().remove(&page) {
+            self.remove_unpersisted_allocation(page);
             self.free_helper(page, allocated);
             true
         } else {
@@ -1046,23 +1137,48 @@ impl TransactionalMemory {
         }
     }
 
-    // Frees the page if it was allocated since the last commit. Returns true, if the page was freed
-    pub(crate) fn free_if_uncommitted(
+    // Record pages allocated in the data tree by a non-durable transaction. These are tracked in
+    // memory instead of being written to DATA_ALLOCATED_TABLE so that `free_if_unpersisted` can
+    // efficiently update the allocation list when it reclaims pages.
+    pub(crate) fn record_unpersisted_allocations(
         &self,
-        page: PageNumber,
-        allocated: &mut PageTrackerPolicy,
-    ) -> bool {
-        if self.allocated_since_commit.lock().unwrap().remove(&page) {
-            self.free_helper(page, allocated);
-            true
-        } else {
-            false
+        transaction_id: TransactionId,
+        pages: impl IntoIterator<Item = PageNumber>,
+    ) {
+        let mut iter = pages.into_iter().peekable();
+        if iter.peek().is_none() {
+            return;
+        }
+        let mut allocations = self.unpersisted_allocations.lock().unwrap();
+        let mut reverse = self.unpersisted_allocation_txn.lock().unwrap();
+        let entry = allocations.entry(transaction_id).or_default();
+        for page in iter {
+            if entry.insert(page) {
+                let prev = reverse.insert(page, transaction_id);
+                debug_assert!(prev.is_none(), "page {page:?} already tracked");
+            }
         }
     }
 
-    // Page has not been committed
-    pub(crate) fn uncommitted(&self, page: PageNumber) -> bool {
-        self.allocated_since_commit.lock().unwrap().contains(&page)
+    pub(crate) fn take_unpersisted_allocations(
+        &self,
+    ) -> BTreeMap<TransactionId, PageNumberHashSet> {
+        self.unpersisted_allocation_txn.lock().unwrap().clear();
+        std::mem::take(&mut *self.unpersisted_allocations.lock().unwrap())
+    }
+
+    // Returns all unpersisted data-tree pages allocated strictly after `transaction_id`. Used
+    // during savepoint restore to queue pages that need to be freed.
+    pub(crate) fn unpersisted_allocations_after(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Vec<PageNumber> {
+        let allocations = self.unpersisted_allocations.lock().unwrap();
+        let mut result = vec![];
+        for pages in allocations.range(transaction_id.next()..).map(|(_, v)| v) {
+            result.extend(pages.iter().copied());
+        }
+        result
     }
 
     pub(crate) fn unpersisted(&self, page: PageNumber) -> bool {
@@ -1073,18 +1189,11 @@ impl TransactionalMemory {
         &self,
         allocation_size: usize,
         lowest: bool,
-        transactional: bool,
     ) -> Result<PageMut<'txn>> {
         let required_pages = allocation_size.div_ceil(self.get_page_size());
         let required_order = ceil_log2(required_pages);
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let lock_start = std::time::Instant::now();
         let mut state = self.state.lock().unwrap();
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _lock_wait = lock_start.elapsed();
-        }
 
         let page_number = if let Some(page_number) =
             Self::allocate_helper_retry(&mut state, required_order, lowest)?
@@ -1107,13 +1216,6 @@ impl TransactionalMemory {
                 "Allocated a page that is still referenced! {page_number:?}"
             );
             assert!(!self.open_dirty_pages.lock().unwrap().contains(&page_number));
-        }
-
-        if transactional {
-            self.allocated_since_commit
-                .lock()
-                .unwrap()
-                .insert(page_number);
         }
 
         let address_range = page_number.address_range(
@@ -1200,7 +1302,7 @@ impl TransactionalMemory {
 
         let mut new_layout = layout;
         new_layout.reduce_last_region(reduce_by);
-        state.allocators.resize_to(new_layout);
+        state.allocators_mut().resize_to(new_layout);
         assert!(new_layout.len() <= layout.len());
         state.header.set_layout(new_layout);
 
@@ -1244,33 +1346,35 @@ impl TransactionalMemory {
         );
         assert!(new_layout.len() >= layout.len());
 
-        let result = self.storage.resize(new_layout.len());
-        if result.is_err() {
-            // TODO: it would be nice to have a more cohesive approach to setting this.
-            // we do it in commit() & rollback() on failure, but there are probably other places that need it
-            self.needs_recovery.store(true, Ordering::Release);
-            return result;
-        }
+        self.storage.resize(new_layout.len())?;
 
-        state.allocators.resize_to(new_layout);
+        state.allocators_mut().resize_to(new_layout);
         state.header.set_layout(new_layout);
         Ok(())
     }
 
-    pub(crate) fn allocate<'txn>(
+    fn allocate<'txn>(
         &self,
         allocation_size: usize,
         allocated: &mut PageTrackerPolicy,
     ) -> Result<PageMut<'txn>> {
-        let result = self.allocate_helper(allocation_size, false, true);
+        let result = self.allocate_helper(allocation_size, false);
         if let Ok(ref page) = result {
             allocated.insert(page.get_page_number());
         }
         result
     }
 
-    pub(crate) fn allocate_lowest<'txn>(&self, allocation_size: usize) -> Result<PageMut<'txn>> {
-        self.allocate_helper(allocation_size, true, true)
+    fn allocate_lowest<'txn>(
+        &self,
+        allocation_size: usize,
+        allocated: &mut PageTrackerPolicy,
+    ) -> Result<PageMut<'txn>> {
+        let result = self.allocate_helper(allocation_size, true);
+        if let Ok(ref page) = result {
+            allocated.insert(page.get_page_number());
+        }
+        result
     }
 
     pub(crate) fn count_allocated_pages(&self) -> Result<u64> {
@@ -1298,7 +1402,7 @@ impl TransactionalMemory {
     }
 
     pub(crate) fn close(&self) -> Result {
-        if !self.needs_recovery.load(Ordering::Acquire) && !thread::panicking() {
+        if self.storage.check_io_errors().is_ok() && !thread::panicking() {
             let mut state = self.state.lock()?;
             if self.storage.flush().is_ok() {
                 state.header.recovery_required = false;
