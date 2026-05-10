@@ -2079,7 +2079,7 @@ fn bulk_insert_large_unsorted() {
         let mut table = txn.open_table(U64_TABLE).unwrap();
 
         // Generate large unsorted dataset that will require multiple chunks
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rng();
         let data: Vec<(u64, u64)> = (0..25000)
             .map(|_| {
