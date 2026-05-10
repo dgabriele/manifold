@@ -434,6 +434,10 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
     /// If key is already present it is replaced
     ///
     /// The returned reference will have length equal to `value_length`
+    #[deprecated(
+        since = "3.1.3",
+        note = "The returned guard must be dropped before the transaction commits, otherwise data loss may occur. This is fixed in the 4.0 release."
+    )]
     pub fn insert_reserve<'a>(
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
