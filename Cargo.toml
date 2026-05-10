@@ -2,7 +2,7 @@
 name = "manifold-db"
 description = "Manifold Embedded Database"
 readme = "README.md"
-version = "4.0.0"
+version = "4.1.0"
 exclude = ["fuzz/"]
 edition.workspace = true
 rust-version.workspace = true
@@ -63,7 +63,7 @@ web-sys = { version = "0.3.81", features = [
 
 # Common test/bench dependencies
 [dev-dependencies]
-rand = "0.10.0"
+rand = "0.10.1"
 tempfile = "3.5.0"
 # for backwards compatibility testing - pin at 2.6.0
 redb2_6 = { version = "=2.6.0", package = "redb" }

@@ -38,8 +38,6 @@ pub(crate) struct PageNumber {
 
 impl Hash for PageNumber {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // TODO: maybe we should store these fields as a single u64 in PageNumber. The field access
-        // will be a little more expensive, but I think it's less frequent than these hashes
         let mut temp = 0x000F_FFFF & u64::from(self.page_index);
         temp |= (0x000F_FFFF & u64::from(self.region)) << 20;
         temp |= (0b0001_1111 & u64::from(self.page_order)) << 59;
@@ -323,6 +321,20 @@ impl PageTrackerPolicy {
 
     pub(crate) fn close(&mut self) -> HashSet<PageNumber> {
         let old = mem::replace(self, PageTrackerPolicy::Closed);
+        match old {
+            PageTrackerPolicy::Ignore => HashSet::new(),
+            PageTrackerPolicy::Track(x) => x,
+            PageTrackerPolicy::Closed => {
+                panic!("Page tracker is closed");
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self) -> HashSet<PageNumber> {
+        if matches!(self, PageTrackerPolicy::Ignore) {
+            return HashSet::new();
+        }
+        let old = mem::replace(self, PageTrackerPolicy::Track(HashSet::new()));
         match old {
             PageTrackerPolicy::Ignore => HashSet::new(),
             PageTrackerPolicy::Track(x) => x,

@@ -3,7 +3,7 @@ use crate::tree_store::btree_base::{BRANCH, LEAF};
 use crate::tree_store::btree_base::{BranchAccessor, LeafAccessor};
 use crate::tree_store::btree_iters::RangeIterState::{Internal, Leaf};
 use crate::tree_store::btree_mutator::MutateHelper;
-use crate::tree_store::page_store::{Page, PageImpl, TransactionalMemory};
+use crate::tree_store::page_store::{Page, PageHint, PageImpl, TransactionalMemory};
 use crate::tree_store::{BtreeHeader, PageNumber, PageTrackerPolicy};
 use crate::types::{Key, Value};
 use Bound::{Excluded, Included, Unbounded};
@@ -38,7 +38,12 @@ impl RangeIterState {
         }
     }
 
-    fn next(self, reverse: bool, manager: &TransactionalMemory) -> Result<Option<RangeIterState>> {
+    fn next(
+        self,
+        reverse: bool,
+        manager: &TransactionalMemory,
+        hint: PageHint,
+    ) -> Result<Option<RangeIterState>> {
         match self {
             Leaf {
                 page,
@@ -71,7 +76,7 @@ impl RangeIterState {
             } => {
                 let accessor = BranchAccessor::new(&page, fixed_key_size);
                 let child_page = accessor.child_page(child).unwrap();
-                let child_page = manager.get_page(child_page)?;
+                let child_page = manager.get_page(child_page, hint)?;
                 let direction = if reverse { -1 } else { 1 };
                 let next_child = isize::try_from(child).unwrap() + direction;
                 if 0 <= next_child && next_child < accessor.count_children().try_into().unwrap() {
@@ -182,6 +187,7 @@ impl<K: Key, V: Value> EntryGuard<K, V> {
 pub(crate) struct AllPageNumbersBtreeIter {
     next: Option<RangeIterState>,
     manager: Arc<TransactionalMemory>,
+    hint: PageHint,
 }
 
 impl AllPageNumbersBtreeIter {
@@ -190,8 +196,9 @@ impl AllPageNumbersBtreeIter {
         fixed_key_size: Option<usize>,
         fixed_value_size: Option<usize>,
         manager: Arc<TransactionalMemory>,
+        hint: PageHint,
     ) -> Result<Self> {
-        let root_page = manager.get_page(root)?;
+        let root_page = manager.get_page(root, hint)?;
         let node_mem = root_page.memory();
         let start = match node_mem[0] {
             LEAF => Leaf {
@@ -213,6 +220,7 @@ impl AllPageNumbersBtreeIter {
         Ok(Self {
             next: Some(start),
             manager,
+            hint,
         })
     }
 }
@@ -229,7 +237,7 @@ impl Iterator for AllPageNumbersBtreeIter {
                 Leaf { entry, .. } => entry == 0,
                 Internal { child, .. } => child == 0,
             };
-            match state.next(false, &self.manager) {
+            match state.next(false, &self.manager, self.hint) {
                 Ok(next) => {
                     self.next = next;
                 }
@@ -364,6 +372,10 @@ pub(crate) struct BtreeRangeIter<K: Key + 'static, V: Value + 'static> {
     include_left: bool,           // left is inclusive, instead of exclusive
     include_right: bool,          // right is inclusive, instead of exclusive
     manager: Arc<TransactionalMemory>,
+    hint: PageHint,
+    // When Some, the right boundary is Unbounded and not yet computed.
+    // Stores the tree root for lazy initialization on first next_back() call.
+    uninit_right_root: Option<PageNumber>,
     _key_type: PhantomData<K>,
     _value_type: PhantomData<V>,
 }
@@ -395,6 +407,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         query_range: &'_ T,
         table_root: Option<PageNumber>,
         manager: Arc<TransactionalMemory>,
+        hint: PageHint,
     ) -> Result<Self> {
         if range_is_empty::<K, KR, T>(query_range) {
             return Ok(Self {
@@ -403,6 +416,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                 include_left: false,
                 include_right: false,
                 manager,
+                hint,
+                uninit_right_root: None,
                 _key_type: Default::default(),
                 _value_type: Default::default(),
             });
@@ -410,49 +425,59 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
         if let Some(root) = table_root {
             let (include_left, left) = match query_range.start_bound() {
                 Included(k) => find_iter_left::<K, V>(
-                    manager.get_page(root)?,
+                    manager.get_page(root, hint)?,
                     None,
                     K::as_bytes(k.borrow()).as_ref(),
                     true,
                     &manager,
+                    hint,
                 )?,
                 Excluded(k) => find_iter_left::<K, V>(
-                    manager.get_page(root)?,
+                    manager.get_page(root, hint)?,
                     None,
                     K::as_bytes(k.borrow()).as_ref(),
                     false,
                     &manager,
+                    hint,
                 )?,
                 Unbounded => {
                     let state = find_iter_unbounded::<K, V>(
-                        manager.get_page(root)?,
+                        manager.get_page(root, hint)?,
                         None,
                         false,
                         &manager,
+                        hint,
                     )?;
                     (true, state)
                 }
             };
-            let (include_right, right) = match query_range.end_bound() {
-                Included(k) => find_iter_right::<K, V>(
-                    manager.get_page(root)?,
-                    None,
-                    K::as_bytes(k.borrow()).as_ref(),
-                    true,
-                    &manager,
-                )?,
-                Excluded(k) => find_iter_right::<K, V>(
-                    manager.get_page(root)?,
-                    None,
-                    K::as_bytes(k.borrow()).as_ref(),
-                    false,
-                    &manager,
-                )?,
-                Unbounded => {
-                    let state =
-                        find_iter_unbounded::<K, V>(manager.get_page(root)?, None, true, &manager)?;
-                    (true, state)
+            // For an unbounded right end, skip the expensive tree traversal to the rightmost
+            // leaf. The right boundary will be lazily computed on the first next_back() call.
+            // For forward iteration (next()), right=None correctly means "no upper bound".
+            let (include_right, right, uninit_right_root) = match query_range.end_bound() {
+                Included(k) => {
+                    let (inc, state) = find_iter_right::<K, V>(
+                        manager.get_page(root, hint)?,
+                        None,
+                        K::as_bytes(k.borrow()).as_ref(),
+                        true,
+                        &manager,
+                        hint,
+                    )?;
+                    (inc, state, None)
                 }
+                Excluded(k) => {
+                    let (inc, state) = find_iter_right::<K, V>(
+                        manager.get_page(root, hint)?,
+                        None,
+                        K::as_bytes(k.borrow()).as_ref(),
+                        false,
+                        &manager,
+                        hint,
+                    )?;
+                    (inc, state, None)
+                }
+                Unbounded => (true, None, Some(root)),
             };
             Ok(Self {
                 left,
@@ -460,6 +485,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                 include_left,
                 include_right,
                 manager,
+                hint,
+                uninit_right_root,
                 _key_type: Default::default(),
                 _value_type: Default::default(),
             })
@@ -470,6 +497,8 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
                 include_left: false,
                 include_right: false,
                 manager,
+                hint,
+                uninit_right_root: None,
                 _key_type: Default::default(),
                 _value_type: Default::default(),
             })
@@ -479,6 +508,7 @@ impl<K: Key + 'static, V: Value + 'static> BtreeRangeIter<K, V> {
     fn close(&mut self) {
         self.left = None;
         self.right = None;
+        self.uninit_right_root = None;
     }
 }
 
@@ -502,12 +532,17 @@ impl<K: Key, V: Value> Iterator for BtreeRangeIter<K, V> {
             && (left_entry > right_entry
                 || (left_entry == right_entry && (!self.include_left || !self.include_right)))
         {
+            self.close();
             return None;
         }
 
         loop {
             if !self.include_left {
-                match self.left.take()?.next(false, &self.manager) {
+                let Some(current) = self.left.take() else {
+                    self.close();
+                    return None;
+                };
+                match current.next(false, &self.manager, self.hint) {
                     Ok(left) => {
                         self.left = left;
                     }
@@ -517,7 +552,10 @@ impl<K: Key, V: Value> Iterator for BtreeRangeIter<K, V> {
                 }
             }
             // Return None if the next state is None
-            self.left.as_ref()?;
+            if self.left.is_none() {
+                self.close();
+                return None;
+            }
 
             if let (
                 Some(Leaf {
@@ -534,6 +572,7 @@ impl<K: Key, V: Value> Iterator for BtreeRangeIter<K, V> {
                 && left_page.get_page_number() == right_page.get_page_number()
                 && (left_entry > right_entry || (left_entry == right_entry && !self.include_right))
             {
+                self.close();
                 return None;
             }
 
@@ -547,6 +586,17 @@ impl<K: Key, V: Value> Iterator for BtreeRangeIter<K, V> {
 
 impl<K: Key, V: Value> DoubleEndedIterator for BtreeRangeIter<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
+        // Lazily initialize the unbounded right boundary on first next_back() call.
+        if let Some(root) = self.uninit_right_root.take() {
+            let page = match self.manager.get_page(root, self.hint) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+            match find_iter_unbounded::<K, V>(page, None, true, &self.manager, self.hint) {
+                Ok(state) => self.right = state,
+                Err(e) => return Some(Err(e)),
+            }
+        }
         if let (
             Some(Leaf {
                 page: left_page,
@@ -563,12 +613,17 @@ impl<K: Key, V: Value> DoubleEndedIterator for BtreeRangeIter<K, V> {
             && (left_entry > right_entry
                 || (left_entry == right_entry && (!self.include_left || !self.include_right)))
         {
+            self.close();
             return None;
         }
 
         loop {
             if !self.include_right {
-                match self.right.take()?.next(true, &self.manager) {
+                let Some(current) = self.right.take() else {
+                    self.close();
+                    return None;
+                };
+                match current.next(true, &self.manager, self.hint) {
                     Ok(right) => {
                         self.right = right;
                     }
@@ -578,7 +633,10 @@ impl<K: Key, V: Value> DoubleEndedIterator for BtreeRangeIter<K, V> {
                 }
             }
             // Return None if the next state is None
-            self.right.as_ref()?;
+            if self.right.is_none() {
+                self.close();
+                return None;
+            }
 
             if let (
                 Some(Leaf {
@@ -595,6 +653,7 @@ impl<K: Key, V: Value> DoubleEndedIterator for BtreeRangeIter<K, V> {
                 && left_page.get_page_number() == right_page.get_page_number()
                 && (left_entry > right_entry || (left_entry == right_entry && !self.include_left))
             {
+                self.close();
                 return None;
             }
 
@@ -611,6 +670,7 @@ fn find_iter_unbounded<K: Key, V: Value>(
     mut parent: Option<Box<RangeIterState>>,
     reverse: bool,
     manager: &TransactionalMemory,
+    hint: PageHint,
 ) -> Result<Option<RangeIterState>> {
     let node_mem = page.memory();
     match node_mem[0] {
@@ -633,7 +693,7 @@ fn find_iter_unbounded<K: Key, V: Value>(
                 0
             };
             let child_page_number = accessor.child_page(child_index).unwrap();
-            let child_page = manager.get_page(child_page_number)?;
+            let child_page = manager.get_page(child_page_number, hint)?;
             let direction = if reverse { -1isize } else { 1 };
             parent = Some(Box::new(Internal {
                 page,
@@ -644,7 +704,7 @@ fn find_iter_unbounded<K: Key, V: Value>(
                     .unwrap(),
                 parent,
             }));
-            find_iter_unbounded::<K, V>(child_page, parent, reverse, manager)
+            find_iter_unbounded::<K, V>(child_page, parent, reverse, manager, hint)
         }
         _ => unreachable!(),
     }
@@ -658,6 +718,7 @@ fn find_iter_left<K: Key, V: Value>(
     query: &[u8],
     include_query: bool,
     manager: &TransactionalMemory,
+    hint: PageHint,
 ) -> Result<(bool, Option<RangeIterState>)> {
     let node_mem = page.memory();
     match node_mem[0] {
@@ -684,7 +745,7 @@ fn find_iter_left<K: Key, V: Value>(
         BRANCH => {
             let accessor = BranchAccessor::new(&page, K::fixed_width());
             let (child_index, child_page_number) = accessor.child_for_key::<K>(query);
-            let child_page = manager.get_page(child_page_number)?;
+            let child_page = manager.get_page(child_page_number, hint)?;
             if child_index < accessor.count_children() - 1 {
                 parent = Some(Box::new(Internal {
                     page,
@@ -694,7 +755,7 @@ fn find_iter_left<K: Key, V: Value>(
                     parent,
                 }));
             }
-            find_iter_left::<K, V>(child_page, parent, query, include_query, manager)
+            find_iter_left::<K, V>(child_page, parent, query, include_query, manager, hint)
         }
         _ => unreachable!(),
     }
@@ -706,6 +767,7 @@ fn find_iter_right<K: Key, V: Value>(
     query: &[u8],
     include_query: bool,
     manager: &TransactionalMemory,
+    hint: PageHint,
 ) -> Result<(bool, Option<RangeIterState>)> {
     let node_mem = page.memory();
     match node_mem[0] {
@@ -732,7 +794,7 @@ fn find_iter_right<K: Key, V: Value>(
         BRANCH => {
             let accessor = BranchAccessor::new(&page, K::fixed_width());
             let (child_index, child_page_number) = accessor.child_for_key::<K>(query);
-            let child_page = manager.get_page(child_page_number)?;
+            let child_page = manager.get_page(child_page_number, hint)?;
             if child_index > 0 && accessor.child_page(child_index - 1).is_some() {
                 parent = Some(Box::new(Internal {
                     page,
@@ -742,7 +804,7 @@ fn find_iter_right<K: Key, V: Value>(
                     parent,
                 }));
             }
-            find_iter_right::<K, V>(child_page, parent, query, include_query, manager)
+            find_iter_right::<K, V>(child_page, parent, query, include_query, manager, hint)
         }
         _ => unreachable!(),
     }

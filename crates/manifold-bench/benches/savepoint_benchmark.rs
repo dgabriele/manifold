@@ -4,7 +4,7 @@ use std::env::current_dir;
 use tempfile::NamedTempFile;
 
 use manifold::{Database, TableDefinition};
-use rand::Rng;
+use rand::RngExt;
 use std::time::{Duration, Instant};
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");

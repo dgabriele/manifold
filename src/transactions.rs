@@ -21,7 +21,7 @@ use crate::{
 use log::{debug, warn};
 use std::borrow::Borrow;
 use std::cmp::min;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -604,8 +604,6 @@ impl TableNamespace<'_> {
 
     fn set_root(&mut self, root: Option<BtreeHeader>) {
         assert!(self.open_tables.is_empty());
-        self.table_tree.clear_pending_table_updates();
-        self.freed_pages.lock().unwrap().clear();
         self.table_tree.set_root(root);
     }
 
@@ -756,6 +754,68 @@ impl TableNamespace<'_> {
     }
 }
 
+// Transaction-local savepoint lifecycle state.
+#[derive(Default)]
+struct SavepointTransactionState {
+    created_persistent: HashSet<(SavepointId, TransactionId)>,
+    deleted_persistent: Vec<(SavepointId, TransactionId)>,
+    invalidated: BTreeSet<SavepointId>,
+}
+
+impl SavepointTransactionState {
+    fn record_created(&mut self, id: SavepointId, transaction_id: TransactionId) {
+        self.created_persistent.insert((id, transaction_id));
+    }
+
+    fn record_deleted(&mut self, id: SavepointId, transaction_id: TransactionId) {
+        self.deleted_persistent.push((id, transaction_id));
+    }
+
+    fn record_invalidated(&mut self, ids: impl IntoIterator<Item = SavepointId>) {
+        self.invalidated.extend(ids);
+    }
+
+    fn is_invalidated(&self, id: SavepointId) -> bool {
+        self.invalidated.contains(&id)
+    }
+
+    fn has_created_or_deleted(&self) -> bool {
+        !self.created_persistent.is_empty() || !self.deleted_persistent.is_empty()
+    }
+
+    fn apply_on_commit(&mut self, tracker: &TransactionTracker) {
+        // Persistent savepoints whose on-disk entry was deleted: release their
+        // tracker refcount now that the deletion is durable.
+        for (savepoint, transaction) in self.deleted_persistent.drain(..) {
+            tracker.deallocate_savepoint(savepoint, transaction);
+        }
+        // Savepoints that restore_savepoint() invalidated: remove them from the
+        // shared valid_savepoints map. For persistent savepoints,
+        // deallocate_savepoint above has already removed them; for ephemeral,
+        // the user's Savepoint handle still owns the live_read_transactions
+        // refcount and will release it on drop.
+        tracker.invalidate_savepoints(std::mem::take(&mut self.invalidated));
+        // Persistent savepoints created during this transaction stay live:
+        // drop them from our bookkeeping without releasing tracker state.
+        self.created_persistent.clear();
+    }
+
+    fn apply_on_abort(&mut self, tracker: &TransactionTracker) {
+        // Persistent savepoints created during this transaction: their
+        // on-disk entries will be rolled back by rollback_uncommitted_writes(),
+        // but the shared tracker registration must be released explicitly.
+        for (savepoint, transaction) in self.created_persistent.drain() {
+            tracker.deallocate_savepoint(savepoint, transaction);
+        }
+        // Deleted-persistent entries will be rolled back on disk, so the
+        // tracker state must NOT be released (it is still valid).
+        self.deleted_persistent.clear();
+        // Invalidations were only staged in this struct and never touched the
+        // shared tracker, so dropping them is sufficient.
+        self.invalidated.clear();
+    }
+}
+
 /// A read/write transaction
 ///
 /// Only a single [`WriteTransaction`] may exist at a time
@@ -772,9 +832,9 @@ pub struct WriteTransaction {
     two_phase_commit: bool,
     shrink_policy: ShrinkPolicy,
     quick_repair: bool,
-    // Persistent savepoints created during this transaction
-    created_persistent_savepoints: Mutex<HashSet<SavepointId>>,
-    deleted_persistent_savepoints: Mutex<Vec<(SavepointId, TransactionId)>>,
+    // All transaction-local savepoint lifecycle state. See
+    // `SavepointTransactionState` for the commit/abort contract.
+    savepoint_state: Mutex<SavepointTransactionState>,
     // WAL integration for column families
     wal_journal: Option<Arc<crate::column_family::wal::journal::WALJournal>>,
     cf_name: Option<String>,
@@ -809,8 +869,7 @@ impl WriteTransaction {
             two_phase_commit: false,
             quick_repair: false,
             shrink_policy: ShrinkPolicy::Default,
-            created_persistent_savepoints: Mutex::new(Default::default()),
-            deleted_persistent_savepoints: Mutex::new(vec![]),
+            savepoint_state: Mutex::new(SavepointTransactionState::default()),
             wal_journal: None,
             cf_name: None,
             checkpoint_manager: None,
@@ -977,11 +1036,12 @@ impl WriteTransaction {
     /// Note that while a savepoint exists, pages that become unused after it was created are not freed.
     /// Therefore, the lifetime of a savepoint should be minimized.
     ///
-    /// Returns `[SavepointError::InvalidSavepoint`], if the transaction is "dirty" (any tables have been opened)
-    /// or if the transaction's durability is less than `[Durability::Immediate]`
+    /// Returns `[SavepointError::InvalidSavepoint`], if the transaction is "dirty" (any tables have been opened),
+    /// or `[SavepointError::ImmediateDurabilityRequired]` if the transaction's durability is less than
+    /// `[Durability::Immediate]`
     pub fn persistent_savepoint(&self) -> Result<u64, SavepointError> {
         if self.durability != InternalDurability::Immediate {
-            return Err(SavepointError::InvalidSavepoint);
+            return Err(SavepointError::ImmediateDurabilityRequired);
         }
 
         let mut savepoint = self.ephemeral_savepoint()?;
@@ -1000,10 +1060,10 @@ impl WriteTransaction {
 
         savepoint.set_persistent();
 
-        self.created_persistent_savepoints
+        self.savepoint_state
             .lock()
             .unwrap()
-            .insert(savepoint.get_id());
+            .record_created(savepoint.get_id(), savepoint.get_transaction_id());
 
         Ok(savepoint.get_id().0)
     }
@@ -1039,10 +1099,11 @@ impl WriteTransaction {
     /// Note that if the transaction is `abort()`'ed this deletion will be rolled back.
     ///
     /// Returns `true` if the savepoint existed
-    /// Returns `[SavepointError::InvalidSavepoint`] if the transaction's durability is less than `[Durability::Immediate]`
+    /// Returns `[SavepointError::ImmediateDurabilityRequired]` if the transaction's durability
+    /// is less than `[Durability::Immediate]`
     pub fn delete_persistent_savepoint(&self, id: u64) -> Result<bool, SavepointError> {
         if self.durability != InternalDurability::Immediate {
-            return Err(SavepointError::InvalidSavepoint);
+            return Err(SavepointError::ImmediateDurabilityRequired);
         }
         let mut system_tables = self.system_tables.lock().unwrap();
         let mut table = system_tables.open_system_table(self, SAVEPOINT_TABLE)?;
@@ -1051,10 +1112,10 @@ impl WriteTransaction {
             let savepoint = serialized
                 .value()
                 .to_savepoint(self.transaction_tracker.clone());
-            self.deleted_persistent_savepoints
+            self.savepoint_state
                 .lock()
                 .unwrap()
-                .push((savepoint.get_id(), savepoint.get_transaction_id()));
+                .record_deleted(savepoint.get_id(), savepoint.get_transaction_id());
             Ok(true)
         } else {
             Ok(false)
@@ -1120,17 +1181,29 @@ impl WriteTransaction {
     ///
     /// Calling this method invalidates all [`Savepoint`]s created after savepoint
     pub fn restore_savepoint(&mut self, savepoint: &Savepoint) -> Result<(), SavepointError> {
-        // Ensure that user does not try to restore a Savepoint that is from a different Database
-        assert_eq!(
-            std::ptr::from_ref(self.transaction_tracker.as_ref()),
-            savepoint.db_address()
-        );
+        // Reject a Savepoint that is from a different Database
+        if std::ptr::from_ref(self.transaction_tracker.as_ref()) != savepoint.db_address() {
+            return Err(SavepointError::InvalidSavepoint);
+        }
 
         if !self
             .transaction_tracker
             .is_valid_savepoint(savepoint.get_id())
+            || self
+                .savepoint_state
+                .lock()
+                .unwrap()
+                .is_invalidated(savepoint.get_id())
         {
             return Err(SavepointError::InvalidSavepoint);
+        }
+
+        if self.durability != InternalDurability::Immediate
+            && self
+                .list_persistent_savepoints()?
+                .any(|id| id > savepoint.get_id().0)
+        {
+            return Err(SavepointError::ImmediateDurabilityRequired);
         }
         #[cfg(feature = "logging")]
         debug!(
@@ -1177,7 +1250,13 @@ impl WriteTransaction {
         // 2) queue all pages that became unreachable
         {
             let tables = self.tables.lock().unwrap();
+            for page in tables.allocated_pages.lock().unwrap().reset() {
+                debug_assert!(self.mem.uncommitted(page));
+                debug_assert!(self.mem.is_allocated(page));
+                self.mem.free(page, &mut PageTrackerPolicy::Ignore);
+            }
             let mut data_freed_pages = tables.freed_pages.lock().unwrap();
+            data_freed_pages.clear();
             let mut system_tables = self.system_tables.lock().unwrap();
             let data_allocated = system_tables.open_system_table(self, DATA_ALLOCATED_TABLE)?;
             let lower = TransactionIdWithPagination {
@@ -1192,10 +1271,18 @@ impl WriteTransaction {
             }
         }
 
-        // 3) Invalidate all savepoints that are newer than the one being applied to prevent the user
-        // from later trying to restore a savepoint "on another timeline"
-        self.transaction_tracker
-            .invalidate_savepoints_after(savepoint.get_id());
+        // 3) Mark all savepoints newer than the restored one as invalidated for this
+        // transaction, to prevent the user from later trying to restore a savepoint
+        // "on another timeline". The invalidation is purely per-transaction state -
+        // the shared `valid_savepoints` map is only updated if/when commit_inner()
+        // runs, so an abort implicitly reverts the invalidation by dropping this set.
+        let invalidated = self
+            .transaction_tracker
+            .list_savepoints_after(savepoint.get_id());
+        self.savepoint_state
+            .lock()
+            .unwrap()
+            .record_invalidated(invalidated);
         for persistent_savepoint in self.list_persistent_savepoints()? {
             if persistent_savepoint > savepoint.get_id().0 {
                 self.delete_persistent_savepoint(persistent_savepoint)?;
@@ -1211,17 +1298,12 @@ impl WriteTransaction {
     /// If a persistent savepoint has been created or deleted, in this transaction, the durability may not
     /// be reduced below [`Durability::Immediate`]
     pub fn set_durability(&mut self, durability: Durability) -> Result<(), SetDurabilityError> {
-        let created = !self
-            .created_persistent_savepoints
+        let persistent_modified = self
+            .savepoint_state
             .lock()
             .unwrap()
-            .is_empty();
-        let deleted = !self
-            .deleted_persistent_savepoints
-            .lock()
-            .unwrap()
-            .is_empty();
-        if (created || deleted) && !matches!(durability, Durability::Immediate) {
+            .has_created_or_deleted();
+        if persistent_modified && !matches!(durability, Durability::Immediate) {
             return Err(SetDurabilityError::PersistentSavepointModified);
         }
 
@@ -1538,10 +1620,10 @@ impl WriteTransaction {
             }
         }
 
-        for (savepoint, transaction) in self.deleted_persistent_savepoints.lock().unwrap().iter() {
-            self.transaction_tracker
-                .deallocate_savepoint(*savepoint, *transaction);
-        }
+        self.savepoint_state
+            .lock()
+            .unwrap()
+            .apply_on_commit(&self.transaction_tracker);
 
         assert!(
             self.system_tables
@@ -1665,19 +1747,14 @@ impl WriteTransaction {
             .unwrap()
             .table_tree
             .clear_root_updates_and_close();
-        for savepoint in self.created_persistent_savepoints.lock().unwrap().iter() {
-            match self.delete_persistent_savepoint(savepoint.0) {
-                Ok(_) => {}
-                Err(err) => match err {
-                    SavepointError::InvalidSavepoint => {
-                        unreachable!();
-                    }
-                    SavepointError::Storage(storage_err) => {
-                        return Err(storage_err);
-                    }
-                },
-            }
-        }
+        // Release all transaction-local savepoint state. The on-disk mutations
+        // (SAVEPOINT_TABLE / NEXT_SAVEPOINT_TABLE) are reverted by
+        // rollback_uncommitted_writes() below; apply_on_abort handles the
+        // in-memory TransactionTracker state that rollback cannot see.
+        self.savepoint_state
+            .lock()
+            .unwrap()
+            .apply_on_abort(&self.transaction_tracker);
         self.mem.rollback_uncommitted_writes()?;
         #[cfg(feature = "logging")]
         debug!("Finished abort of transaction id={:?}", self.transaction_id);
@@ -1817,7 +1894,7 @@ impl WriteTransaction {
             if relocation_map.contains_key(&path.page_number()) {
                 continue;
             }
-            let old_page = self.mem.get_page(path.page_number())?;
+            let old_page = self.mem.get_page(path.page_number(), PageHint::None)?;
             let mut new_page = self.mem.allocate_lowest(old_page.memory().len())?;
             let new_page_number = new_page.get_page_number();
             // We have to copy at least the page type into the new page.
@@ -1831,7 +1908,7 @@ impl WriteTransaction {
                     if relocation_map.contains_key(parent) {
                         continue;
                     }
-                    let old_parent = self.mem.get_page(*parent)?;
+                    let old_parent = self.mem.get_page(*parent, PageHint::None)?;
                     let mut new_page = self.mem.allocate_lowest(old_parent.memory().len())?;
                     let new_page_number = new_page.get_page_number();
                     // We have to copy at least the page type into the new page.
@@ -2195,6 +2272,7 @@ impl ReadTransaction {
                 ..
             } => Ok(ReadOnlyUntypedTable::new(
                 table_root,
+                PageHint::Clean,
                 fixed_key_size,
                 fixed_value_size,
                 self.mem.clone(),
@@ -2250,6 +2328,7 @@ impl ReadTransaction {
             } => Ok(ReadOnlyUntypedMultimapTable::new(
                 table_root,
                 table_length,
+                PageHint::Clean,
                 fixed_key_size,
                 fixed_value_size,
                 self.mem.clone(),

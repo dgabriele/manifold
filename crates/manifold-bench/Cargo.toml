@@ -15,7 +15,7 @@ manifold = { path = "../..", package = "manifold-db" }
 manifold-vectors = { path = "../manifold-vectors" }
 manifold-graph = { path = "../manifold-graph" }
 manifold-timeseries = { path = "../manifold-timeseries" }
-rand = "0.9"
+rand = "0.10.1"
 tempfile = "3.5.0"
 walkdir = "2.5.0"
 byte-unit = "5.1.6"

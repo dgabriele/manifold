@@ -1823,7 +1823,7 @@ fn tree_balance() {
     assert!(height <= expected, "height={height} expected={expected}",);
 }
 
-#[cfg(not(target_os = "wasi"))] // TODO remove this line once WASI gets flock
+#[cfg(not(target_os = "wasi"))]
 #[test]
 fn database_lock() {
     let tmpfile = create_tempfile();
@@ -1919,6 +1919,80 @@ fn savepoint() {
     let mut txn = db.begin_write().unwrap();
     txn.restore_savepoint(&savepoint).unwrap();
     txn.commit().unwrap();
+}
+
+// Regression test: restore_savepoint() does not clear pending_table_updates in the
+// TableTreeMut. When a table is opened, modified, and closed (dropped) before
+// restore_savepoint(), the modification is staged in pending_table_updates. On commit,
+// flush_table_root_updates() re-applies these stale updates, effectively undoing the
+// savepoint restore and causing data loss.
+#[test]
+fn savepoint_restore_data_loss_pending_table_updates() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let definition: TableDefinition<u64, &str> = TableDefinition::new("data_loss_test");
+
+    // Step 1: Insert initial data and commit durably
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(&1, "original").unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Step 2: In a new write transaction, create a savepoint BEFORE any modifications
+    let txn = db.begin_write().unwrap();
+    let savepoint = txn.ephemeral_savepoint().unwrap();
+
+    // Step 3: Open table, insert new data, then close (drop) the table handle.
+    // Dropping the table handle calls close_table() which stages the modified root
+    // into pending_table_updates via stage_update_table_root().
+    {
+        let mut table = txn.open_table(definition).unwrap();
+        table.insert(&2, "should_be_rolled_back").unwrap();
+        table.insert(&3, "also_should_be_rolled_back").unwrap();
+    }
+
+    // Step 4: Restore the savepoint. This restores the table tree root to the
+    // pre-modification state, BUT does not clear pending_table_updates.
+    let mut txn = txn;
+    txn.restore_savepoint(&savepoint).unwrap();
+
+    // Step 5: Commit. During commit, flush_table_root_updates() drains
+    // pending_table_updates and re-applies the stale modification from Step 3,
+    // effectively undoing the savepoint restore.
+    txn.commit().unwrap();
+
+    // Step 6: Verify. After restoring the savepoint, keys 2 and 3 should NOT exist.
+    // Only key 1 ("original") should be present.
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(definition).unwrap();
+
+    // Key 1 should still exist (it was committed before the savepoint)
+    assert_eq!(table.get(&1).unwrap().unwrap().value(), "original");
+
+    // BUG: Keys 2 and 3 should NOT exist after savepoint restore, but they do
+    // because pending_table_updates re-applied the stale modification during commit.
+    // When the bug is fixed, these assertions will hold:
+    assert!(
+        table.get(&2).unwrap().is_none(),
+        "DATA LOSS BUG: key 2 should not exist after savepoint restore, \
+         but pending_table_updates re-applied stale modifications"
+    );
+    assert!(
+        table.get(&3).unwrap().is_none(),
+        "DATA LOSS BUG: key 3 should not exist after savepoint restore, \
+         but pending_table_updates re-applied stale modifications"
+    );
+
+    // Also verify the table length: should be 1, not 3
+    assert_eq!(
+        table.len().unwrap(),
+        1,
+        "DATA LOSS BUG: table should have 1 entry after savepoint restore, \
+         but has {} due to stale pending_table_updates",
+        table.len().unwrap()
+    );
 }
 
 #[test]
@@ -2117,4 +2191,726 @@ fn custom_table_type() {
         "world",
         table.get(1).unwrap().next().unwrap().unwrap().value()
     );
+}
+
+// Regression test for a bug where renaming a table with pending (dirty) modifications
+// caused database corruption due to unfinalized checksums.
+//
+// Previously, `rename_table` wrote the table definition (with a DEFERRED placeholder
+// checksum) into the master btree AND kept the identical root in `pending_table_updates`.
+// During commit, `flush_table_root_updates()` compared the btree entry's root with the
+// pending update's root, found them equal, and skipped checksum finalization. The fix
+// adds an explicit dirty flag to pending updates so that checksum finalization is never
+// skipped for tables with uncommitted pages.
+#[test]
+fn rename_table_with_modifications_data_loss() {
+    let tmpfile = create_tempfile();
+
+    const ORIGINAL_TABLE: TableDefinition<u64, &str> = TableDefinition::new("original");
+    const RENAMED_TABLE: TableDefinition<u64, &str> = TableDefinition::new("renamed");
+
+    // Step 1: Create initial data in the "original" table and commit.
+    {
+        let db = Database::create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(ORIGINAL_TABLE).unwrap();
+            table.insert(0, "initial_value_0").unwrap();
+            table.insert(1, "initial_value_1").unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    // Step 2: Modify the table and rename it in the same transaction.
+    {
+        let db = Database::create(tmpfile.path()).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(ORIGINAL_TABLE).unwrap();
+            table.insert(2, "new_value_2").unwrap();
+            table.insert(3, "new_value_3").unwrap();
+            txn.rename_table(table, RENAMED_TABLE).unwrap();
+        }
+        txn.commit().unwrap();
+
+        // Verify data is accessible within the same session.
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(RENAMED_TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), "initial_value_0");
+        assert_eq!(table.get(1).unwrap().unwrap().value(), "initial_value_1");
+        assert_eq!(table.get(2).unwrap().unwrap().value(), "new_value_2");
+        assert_eq!(table.get(3).unwrap().unwrap().value(), "new_value_3");
+        assert_eq!(table.len().unwrap(), 4);
+    }
+
+    // Step 3: Reopen and verify data survives and integrity check passes.
+    {
+        let mut db = Database::builder().create(tmpfile.path()).unwrap();
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(RENAMED_TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), "initial_value_0");
+        assert_eq!(table.get(1).unwrap().unwrap().value(), "initial_value_1");
+        assert_eq!(table.get(2).unwrap().unwrap().value(), "new_value_2");
+        assert_eq!(table.get(3).unwrap().unwrap().value(), "new_value_3");
+        assert_eq!(table.len().unwrap(), 4);
+        drop(table);
+        drop(read_txn);
+        assert!(db.check_integrity().unwrap());
+    }
+}
+
+// Regression test: restore_savepoint() does not clear the freed_pages list in the
+// TableNamespace. When a table is modified (triggering copy-on-write B-tree operations)
+// and then the savepoint is restored, the old pages that were replaced during the
+// modification remain in freed_pages even though the restored tree root still references
+// them. On commit, these stale entries are stored in DATA_FREED_TABLE. In a subsequent
+// transaction, process_freed_pages() frees these pages from the allocator, even though
+// the committed tree still points to them. When those freed pages are reallocated and
+// overwritten by new data, the original table's B-tree becomes corrupted, causing data
+// loss.
+#[test]
+fn savepoint_restore_data_loss_stale_freed_pages() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let table_a: TableDefinition<u64, &[u8]> = TableDefinition::new("table_a");
+    let table_b: TableDefinition<u64, &[u8]> = TableDefinition::new("table_b");
+
+    // Step 1: Insert initial data into table_a and commit durably.
+    // This creates committed B-tree pages (leaves + branches) for table_a.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            let value = vec![0u8; 200];
+            table.insert(&i, value.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Verify initial data is correct
+    {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            let val = table.get(&i).unwrap().unwrap();
+            assert!(val.value().iter().all(|x| *x == 0));
+        }
+    }
+
+    // Step 2: In a new write transaction, create a savepoint, then modify all of
+    // table_a's data (triggering copy-on-write which adds old pages to freed_pages),
+    // then restore the savepoint and commit.
+    //
+    // BUG: restore_savepoint() resets the tree root but does NOT clear freed_pages.
+    // The old pages (which the restored root still references) remain in freed_pages.
+    // commit() stores them in DATA_FREED_TABLE, marking live pages for future freeing.
+    let txn = db.begin_write().unwrap();
+    let savepoint = txn.ephemeral_savepoint().unwrap();
+
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        // Modify every entry to force copy-on-write on all leaf pages.
+        // The old leaf pages go into freed_pages; new pages are allocated.
+        for i in 0..100u64 {
+            let overwrite = vec![0xFFu8; 200];
+            table.insert(&i, overwrite.as_slice()).unwrap();
+        }
+    }
+
+    // Restore the savepoint: resets the tree root to its pre-modification state,
+    // frees the newly allocated pages, but leaves freed_pages untouched.
+    let mut txn = txn;
+    txn.restore_savepoint(&savepoint).unwrap();
+    drop(savepoint);
+
+    // Commit: flush_and_close() drains freed_pages (which still contains the stale old
+    // pages) and stores them in DATA_FREED_TABLE[current_txn]. The committed user root
+    // still references those pages.
+    txn.commit().unwrap();
+
+    // Step 3: Commit an empty transaction. During durable_commit(),
+    // process_freed_pages() processes DATA_FREED_TABLE entries from Step 2 and frees the
+    // stale pages from the allocator. The committed tree root still points to them.
+    let txn = db.begin_write().unwrap();
+    txn.commit().unwrap();
+
+    // Step 4: Insert data into a DIFFERENT table (table_b) so that the allocator reuses
+    // the freed pages. This overwrites the old B-tree nodes of table_a with table_b data.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_b).unwrap();
+        for i in 0..300u64 {
+            let filler = vec![0xBBu8; 200];
+            table.insert(&i, filler.as_slice()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Step 5: Read table_a. If the bug is present, the original pages have been freed
+    // and overwritten by table_b's data. Reading table_a's B-tree will encounter
+    // corrupted nodes, leading to wrong values, missing keys, or read errors.
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(table_a).unwrap();
+
+    let mut data_loss_detected = false;
+    for i in 0..100u64 {
+        match table.get(&i) {
+            Ok(Some(val)) => {
+                let v = val.value();
+                if v.len() != 200 || v.iter().any(|x| *x != 0) {
+                    // Value is present but corrupted
+                    data_loss_detected = true;
+                    break;
+                }
+            }
+            Ok(None) => {
+                // Key is missing entirely
+                data_loss_detected = true;
+                break;
+            }
+            Err(_) => {
+                // Storage error due to corrupted B-tree pages
+                data_loss_detected = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        !data_loss_detected,
+        "DATA LOSS: table_a data is corrupted after savepoint restore. \
+         restore_savepoint() did not clear freed_pages, causing the old pages \
+         (still referenced by the committed tree root) to be stored in DATA_FREED_TABLE \
+         and later freed by process_freed_pages(). When those pages were reused by table_b, \
+         table_a's B-tree became corrupted."
+    );
+}
+
+#[test]
+fn restore_savepoint_from_foreign_database_panics() {
+    let tmpfile1 = create_tempfile();
+    let tmpfile2 = create_tempfile();
+    let db1 = Database::create(tmpfile1.path()).unwrap();
+    let db2 = Database::create(tmpfile2.path()).unwrap();
+
+    let txn1 = db1.begin_write().unwrap();
+    let foreign_savepoint = txn1.ephemeral_savepoint().unwrap();
+    txn1.commit().unwrap();
+
+    let mut txn2 = db2.begin_write().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        txn2.restore_savepoint(&foreign_savepoint)
+    }));
+    assert!(result.is_ok());
+    assert!(matches!(
+        result.unwrap(),
+        Err(SavepointError::InvalidSavepoint)
+    ));
+}
+
+#[test]
+fn delete_table_panic_after_modification() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table_a: TableDefinition<u64, &[u8]> = TableDefinition::new("table_a");
+
+    // Step 1: Insert several pages worth of committed data into table_a.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            table.insert(&i, &vec![0u8; 200][..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Verify the data is present and durable before we attempt the destructive operation.
+    {
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(table_a).unwrap();
+        assert_eq!(table.len().unwrap(), 100);
+    }
+
+    // Step 2: In a single transaction, create an ephemeral savepoint (which enables allocation
+    // tracking via DATA_ALLOCATED_TABLE), modify entries in table_a to force copy-on-write
+    // (allocating new uncommitted pages), and then delete the table.
+    let txn = db.begin_write().unwrap();
+    let _savepoint = txn.ephemeral_savepoint().unwrap();
+    {
+        let mut table = txn.open_table(table_a).unwrap();
+        for i in 0..100u64 {
+            table.insert(&i, &vec![0xFFu8; 200][..]).unwrap();
+        }
+    }
+    let deleted = txn.delete_table(table_a).unwrap();
+    assert!(deleted);
+
+    let commit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| txn.commit()));
+    assert!(commit_result.is_ok() && commit_result.as_ref().unwrap().is_ok());
+}
+
+// Regression test for an unbounded page leak when a persistent savepoint is created in
+// a write transaction and then the transaction is aborted.
+#[test]
+fn persistent_savepoint_abort_unbounded_leak() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+    // Warm up the persistent-savepoint system tables so that later measurements
+    // reflect only the effect of the aborted savepoint, not one-time initialization.
+    {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(id).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Populate some data so that subsequent updates have something to copy-on-write.
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            for i in 0..20u64 {
+                t.insert(i, i).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    // Drain any pending freed pages so the baseline is stable.
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+    let txn = db.begin_write().unwrap();
+    let baseline = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    // Repeat: create persistent savepoint, abort, do one modifying write, drain.
+    // Each iteration permanently leaks pages because the aborted savepoint's
+    // TransactionTracker state is never cleaned up.
+    const ITERATIONS: u64 = 20;
+    for round in 0..ITERATIONS {
+        // Create a persistent savepoint and abort the transaction.
+        {
+            let txn = db.begin_write().unwrap();
+            let _id = txn.persistent_savepoint().unwrap();
+            txn.abort().unwrap();
+        }
+
+        // Perform a modification. Its freed pages cannot be reclaimed because the
+        // ghost savepoint from the aborted transaction still pins an old
+        // oldest_live_read_transaction value.
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(table).unwrap();
+                t.insert(0, round).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        for _ in 0..3 {
+            db.begin_write().unwrap().commit().unwrap();
+        }
+    }
+
+    let txn = db.begin_write().unwrap();
+    let after = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    assert_eq!(
+        baseline,
+        after,
+        "After {} iterations of persistent_savepoint+abort+modify, page usage grew \
+         from {} to {} ({} pages leaked). Because the leak per iteration is \
+         independent of N, running N iterations leaks O(N) pages.",
+        ITERATIONS,
+        baseline,
+        after,
+        after.saturating_sub(baseline),
+    );
+}
+
+#[test]
+fn check_integrity_with_live_read_transaction() {
+    let tmpfile = create_tempfile();
+    let mut db = Database::create(tmpfile.path()).unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(U64_TABLE).unwrap();
+        for i in 0..10u64 {
+            table.insert(&i, &i).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    // Hold a ReadTransaction, which keeps an Arc<TransactionalMemory> alive.
+    // Note: ReadTransaction does not borrow the Database, so we can still call
+    // `&mut self` methods on `db` while `read_txn` is alive.
+    let read_txn = db.begin_read().unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.check_integrity()));
+    assert!(result.is_ok(), "check_integrity() should not panic");
+    assert!(matches!(
+        result.unwrap(),
+        Err(DatabaseError::TransactionInProgress)
+    ));
+
+    // After the transaction is dropped, check_integrity() should succeed.
+    drop(read_txn);
+    assert!(db.check_integrity().unwrap());
+}
+
+// Regression test: restore_savepoint() must not partially revert in-memory state
+// when it cannot complete.
+#[test]
+fn restore_savepoint_partial_revert_commits_as_data_loss() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let tab: TableDefinition<u64, u64> = TableDefinition::new("t");
+
+    // k1 at the state we will restore to later.
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(tab).unwrap();
+        t.insert(1u64, 1u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Persistent savepoint PS1 captures the {k1} state.
+    let txn = db.begin_write().unwrap();
+    let ps1 = txn.persistent_savepoint().unwrap();
+    txn.commit().unwrap();
+
+    // k2 (durably committed).
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(tab).unwrap();
+        t.insert(2u64, 2u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Persistent savepoint PS2 with id > PS1. Its existence is what makes the
+    // failed-restore path trigger.
+    let txn = db.begin_write().unwrap();
+    let _ps2 = txn.persistent_savepoint().unwrap();
+    txn.commit().unwrap();
+
+    // k3 (durably committed).
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(tab).unwrap();
+        t.insert(3u64, 3u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    // Sanity: all three keys are durable before we start.
+    {
+        let rt = db.begin_read().unwrap();
+        let t = rt.open_table(tab).unwrap();
+        assert_eq!(t.get(1u64).unwrap().unwrap().value(), 1);
+        assert_eq!(t.get(2u64).unwrap().unwrap().value(), 2);
+        assert_eq!(t.get(3u64).unwrap().unwrap().value(), 3);
+    }
+
+    let mut txn = db.begin_write().unwrap();
+    txn.set_durability(Durability::None).unwrap();
+    let sp = txn.get_persistent_savepoint(ps1).unwrap();
+
+    let restore_result = txn.restore_savepoint(&sp);
+    assert!(
+        matches!(
+            restore_result,
+            Err(SavepointError::ImmediateDurabilityRequired)
+        ),
+        "restore_savepoint() should fail with ImmediateDurabilityRequired when \
+         durability != Immediate and newer persistent savepoints exist, got: {restore_result:?}"
+    );
+
+    // A caller that ignores the restore error and commits anyway durably
+    // persists the partially-reverted state.
+    txn.commit().unwrap();
+
+    // If restore_savepoint() were transactional on failure, k2 and k3 would
+    // still be present. With the bug, the in-memory tree root was reverted by
+    // the failing restore_savepoint() call and then durably committed, so k2
+    // and k3 are gone.
+    let rt = db.begin_read().unwrap();
+    let t = rt.open_table(tab).unwrap();
+    let k1 = t.get(1u64).unwrap().map(|v| v.value());
+    let k2 = t.get(2u64).unwrap().map(|v| v.value());
+    let k3 = t.get(3u64).unwrap().map(|v| v.value());
+    assert_eq!(k1, Some(1));
+    assert_eq!(k2, Some(2));
+    assert_eq!(k3, Some(3));
+}
+
+// Regression test for a page leak when a transaction that attempts to
+// restore_savepoint() an older savepoint is aborted instead of committed.
+#[test]
+fn restore_savepoint_abort_unbounded_leak() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+    // Warm up the persistent-savepoint system tables so the baseline is stable.
+    {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(id).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Populate some data so that later writes have something to copy-on-write.
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            for i in 0..50u64 {
+                t.insert(i, i).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    // Drain pending freed pages so the baseline is stable.
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+    let txn = db.begin_write().unwrap();
+    let baseline = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    // Create an older persistent savepoint that will be restored (then aborted).
+    let older = {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        id
+    };
+
+    // One modifying write between the two savepoints, so the newer savepoint
+    // references a different tree root than the older one.
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            t.insert(0, u64::MAX).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    // The newer persistent savepoint: restore_savepoint(older) tries to
+    // invalidate this one, and the abort leaves it as a ghost.
+    let newer = {
+        let txn = db.begin_write().unwrap();
+        let id = txn.persistent_savepoint().unwrap();
+        txn.commit().unwrap();
+        id
+    };
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        let sp = txn.get_persistent_savepoint(older).unwrap();
+        txn.restore_savepoint(&sp).unwrap();
+        drop(sp);
+        txn.abort().unwrap();
+    }
+
+    {
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(older).unwrap();
+        txn.commit().unwrap();
+    }
+
+    const ITERATIONS: u64 = 100;
+    for round in 0..ITERATIONS {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            t.insert(0, round).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    drop(db);
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        let sp = txn.get_persistent_savepoint(newer).unwrap();
+        txn.restore_savepoint(&sp).unwrap();
+        drop(sp);
+        txn.commit().unwrap();
+    }
+    {
+        let txn = db.begin_write().unwrap();
+        txn.delete_persistent_savepoint(newer).unwrap();
+        txn.commit().unwrap();
+    }
+
+    // Drain pending freed pages so the final measurement is stable.
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+    let txn = db.begin_write().unwrap();
+    let after = txn.stats().unwrap().allocated_pages();
+    txn.abort().unwrap();
+
+    assert_eq!(
+        baseline,
+        after,
+        "After {} iterations of insert+commit between an aborted \
+         restore_savepoint and the next restore_savepoint, page usage grew \
+         from {} to {} ({} pages leaked). The leak per iteration is independent \
+         of N, so running N iterations leaks O(N) pages.",
+        ITERATIONS,
+        baseline,
+        after,
+        after.saturating_sub(baseline),
+    );
+}
+
+#[test]
+fn restore_savepoint_abort_after_ephemeral_drop() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+    {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(table).unwrap();
+            for i in 0..20u64 {
+                t.insert(i, i).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    let older = {
+        let txn = db.begin_write().unwrap();
+        let sp = txn.ephemeral_savepoint().unwrap();
+        txn.commit().unwrap();
+        sp
+    };
+
+    let newer = {
+        let txn = db.begin_write().unwrap();
+        let sp = txn.ephemeral_savepoint().unwrap();
+        txn.commit().unwrap();
+        sp
+    };
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        txn.restore_savepoint(&older).unwrap();
+        drop(newer);
+        txn.abort().unwrap();
+    }
+
+    {
+        let mut txn = db.begin_write().unwrap();
+        txn.restore_savepoint(&older).unwrap();
+        txn.commit().unwrap();
+    }
+    drop(older);
+    for _ in 0..3 {
+        db.begin_write().unwrap().commit().unwrap();
+    }
+
+    assert!(
+        db.begin_read()
+            .unwrap()
+            .open_table(table)
+            .unwrap()
+            .get(&0u64)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn extract_if_next_then_next_back_panic() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+    let table_def: TableDefinition<u64, u64> = TableDefinition::new("t");
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_def).unwrap();
+        table.insert(&1u64, &10u64).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_table(table_def).unwrap();
+        let mut iter = table.extract_if(|_, _| true).unwrap();
+
+        let first = iter.next();
+        assert!(first.is_some());
+        let first = first.unwrap();
+        assert!(first.is_ok());
+
+        assert!(iter.next().is_none());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next_back()));
+        assert!(result.is_ok());
+    }
+    txn.abort().unwrap();
+}
+
+#[test]
+fn multimap_value_next_back_does_not_update_len() {
+    const TABLE: MultimapTableDefinition<u32, u32> = MultimapTableDefinition::new("m");
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        let mut table = txn.open_multimap_table(TABLE).unwrap();
+        for i in 0..5u32 {
+            table.insert(&1u32, &i).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_multimap_table(TABLE).unwrap();
+    let mut iter = table.get(&1u32).unwrap();
+    assert_eq!(iter.len(), 5);
+    assert!(!iter.is_empty());
+
+    let _ = iter.next_back().unwrap().unwrap();
+    assert_eq!(iter.len(), 4);
+
+    for expected_remaining in (0..4).rev() {
+        iter.next_back().unwrap().unwrap();
+        assert_eq!(iter.len(), expected_remaining as u64);
+    }
+    assert!(iter.is_empty());
+    assert!(iter.next_back().is_none());
+}
+
+#[test]
+#[should_panic(expected = "assertion failed: !name.is_empty()")]
+fn table_definition_new_panics_on_empty_name() {
+    let name = String::new();
+    let _def: TableDefinition<u64, u64> = TableDefinition::new(&name);
+}
+
+#[test]
+#[should_panic(expected = "assertion failed: !name.is_empty()")]
+fn multimap_table_definition_new_panics_on_empty_name() {
+    let name = String::new();
+    let _def: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new(&name);
 }

@@ -4,7 +4,7 @@ use tempfile::NamedTempFile;
 
 use manifold::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
 const ELEMENTS: u64 = 1_000_000;

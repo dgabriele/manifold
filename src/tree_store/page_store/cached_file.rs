@@ -6,7 +6,14 @@ use std::slice::SliceIndex;
 #[cfg(feature = "cache_metrics")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+
+// Allocates an `Arc<[u8]>` in one step. `Arc::<[u8]>::from(vec![0; len])` would
+// allocate the Vec and then allocate a new Arc and memcpy into it.
+fn zero_filled_arc(len: usize) -> Arc<[u8]> {
+    // This is documented to do a single allocation: https://doc.rust-lang.org/std/sync/struct.Arc.html#iterators-of-known-length
+    std::iter::repeat_n(0u8, len).collect()
+}
 
 /// Helper structure for coalescing contiguous writes into a single buffer.
 /// This dramatically reduces syscall overhead when flushing the write buffer.
@@ -217,10 +224,29 @@ impl CheckedBackend {
 pub(super) struct PagedCachedFile {
     file: CheckedBackend,
     page_size: u64,
-    max_read_cache_bytes: usize,
+    // Dynamic cache partitioning.  Three invariants:
+    //
+    // 1. The write buffer NEVER exceeds 50% of max_cache_size.
+    //    Pages beyond this limit are flushed to disk immediately.
+    // 2. The write buffer evicts from the read cache only when
+    //    write < 50% AND read > 50% (fairness).
+    // 3. write + read never exceeds max_cache_size.
+    //
+    // Together these guarantee that the read cache can grow up to 100% when no
+    // writes are in progress, while write-heavy workloads never starve readers
+    // below 50%.
+    //
+    // We track usage with two atomic counters and compute the total on the fly.
+    // The resulting read is not perfectly atomic (between loading the two
+    // counters a concurrent operation could change one), but the budget is a
+    // soft limit and momentary over-/under-counting by one page is harmless.
+    // A third "total" counter would add contention on every insert/remove for
+    // negligible accuracy gain.
     read_cache_bytes: AtomicUsize,
-    max_write_buffer_bytes: usize,
     write_buffer_bytes: AtomicUsize,
+    max_cache_size: usize,
+    // Rotates the starting stripe for read-cache eviction
+    next_eviction_stripe: AtomicUsize,
     #[cfg(feature = "cache_metrics")]
     reads_total: AtomicU64,
     #[cfg(feature = "cache_metrics")]
@@ -240,8 +266,7 @@ impl PagedCachedFile {
     pub(super) fn new(
         file: Box<dyn StorageBackend>,
         page_size: u64,
-        max_read_cache_bytes: usize,
-        max_write_buffer_bytes: usize,
+        max_cache_size: usize,
     ) -> Result<Self, DatabaseError> {
         let read_cache = (0..Self::lock_stripes())
             .map(|_| RwLock::new(LRUCache::new()))
@@ -250,10 +275,10 @@ impl PagedCachedFile {
         Ok(Self {
             file: CheckedBackend::new(file),
             page_size,
-            max_read_cache_bytes,
             read_cache_bytes: AtomicUsize::new(0),
-            max_write_buffer_bytes,
             write_buffer_bytes: AtomicUsize::new(0),
+            max_cache_size,
+            next_eviction_stripe: AtomicUsize::new(0),
             #[cfg(feature = "cache_metrics")]
             reads_total: Default::default(),
             #[cfg(feature = "cache_metrics")]
@@ -318,6 +343,40 @@ impl PagedCachedFile {
         131
     }
 
+    // Evict entries from the read cache to free at least `bytes_needed` bytes.
+    // Iterates through cache stripes and pops lowest-priority entries.
+    //
+    // Caller must hold the write_buffer mutex to maintain the lock ordering
+    // invariant (write_buffer lock is always acquired before read_cache locks).
+    fn evict_from_read_cache(
+        &self,
+        bytes_needed: usize,
+        _write_lock: &MutexGuard<'_, LRUWriteCache>,
+    ) {
+        let num_stripes = self.read_cache.len();
+        let start = self.next_eviction_stripe.fetch_add(1, Ordering::Relaxed) % num_stripes;
+        let mut freed = 0;
+        for i in 0..num_stripes {
+            if freed >= bytes_needed {
+                break;
+            }
+            let stripe = (start + i) % num_stripes;
+            let mut lock = self.read_cache[stripe].write().unwrap();
+            while freed < bytes_needed {
+                if let Some((_, v)) = lock.pop_lowest_priority() {
+                    #[cfg(feature = "cache_metrics")]
+                    {
+                        self.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                    freed += v.len();
+                    self.read_cache_bytes.fetch_sub(v.len(), Ordering::AcqRel);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     fn flush_write_buffer(&self) -> Result {
         // CRITICAL: Don't hold the write_buffer lock during I/O!
         // This was the bottleneck causing 10x slowdown with 4+ threads.
@@ -372,13 +431,15 @@ impl PagedCachedFile {
             self.file.write(write.offset, &write.data)?;
         }
 
-        // Move original buffers to read cache (this locks each cache slot individually)
+        // Transfer flushed pages into the read cache so they are available
+        // for subsequent reads without a file I/O.  The write buffer is being
+        // drained, so the total check only considers the read cache size.
         for (offset, buffer) in sorted_buffers {
             let cache_size = self
                 .read_cache_bytes
                 .fetch_add(buffer.len(), Ordering::AcqRel);
 
-            if cache_size + buffer.len() <= self.max_read_cache_bytes {
+            if cache_size + buffer.len() <= self.max_cache_size {
                 let cache_slot: usize = (offset % Self::lock_stripes()).try_into().unwrap();
                 let mut lock = self.read_cache[cache_slot].write().unwrap();
                 if let Some(replaced) = lock.insert(offset, buffer) {
@@ -424,6 +485,15 @@ impl PagedCachedFile {
         Ok(buffer)
     }
 
+    // Like `read_direct`, but writes directly into an `Arc<[u8]>` instead of a
+    // `Vec<u8>` that is then copied into an `Arc`. The buffer is zero-filled
+    // because `StorageBackend::read` takes `&mut [u8]`.
+    fn read_direct_into_arc(&self, offset: u64, len: usize) -> Result<Arc<[u8]>> {
+        let mut arc = zero_filled_arc(len);
+        self.file.read(offset, Arc::get_mut(&mut arc).unwrap())?;
+        Ok(arc)
+    }
+
     // Read with caching. Caller must not read overlapping ranges without first calling invalidate_cache().
     // Doing so will not cause UB, but is a logic error.
     pub(super) fn read(&self, offset: u64, len: usize, hint: PageHint) -> Result<Arc<[u8]>> {
@@ -452,7 +522,7 @@ impl PagedCachedFile {
             }
         }
 
-        let buffer: Arc<[u8]> = self.read_direct(offset, len)?.into();
+        let buffer = self.read_direct_into_arc(offset, len)?;
         let cache_size = self.read_cache_bytes.fetch_add(len, Ordering::AcqRel);
         let mut write_lock = self.read_cache[cache_slot].write().unwrap();
         let cache_size = if let Some(replaced) = write_lock.insert(offset, buffer.clone()) {
@@ -462,8 +532,14 @@ impl PagedCachedFile {
         } else {
             cache_size
         };
+
+        // Rule 3: evict from this read-cache slot if the total exceeds the
+        // budget.  We evict exactly `len` bytes (one page) per miss to avoid
+        // over-eviction spikes.
+        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+        let over_total = cache_size + len + write_bytes > self.max_cache_size;
         let mut removed = 0;
-        if cache_size + len > self.max_read_cache_bytes {
+        if over_total {
             while removed < len {
                 if let Some((_, v)) = write_lock.pop_lowest_priority() {
                     #[cfg(feature = "cache_metrics")]
@@ -546,9 +622,14 @@ impl PagedCachedFile {
             removed
         } else {
             let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
-            if previous + len > self.max_write_buffer_bytes {
-                let mut removed_bytes = 0;
-                while removed_bytes < len {
+            let mut write_bytes = previous + len;
+            let half = self.max_cache_size / 2;
+
+            // Rule 1: write buffer NEVER exceeds 50%.  Flush excess to disk.
+            if write_bytes > half {
+                let excess = write_bytes - half;
+                let mut flushed = 0;
+                while flushed < excess {
                     if let Some((offset, buffer)) = lock.pop_lowest_priority() {
                         let removed_len = buffer.len();
                         let result = self.file.write(offset, &buffer);
@@ -562,11 +643,20 @@ impl PagedCachedFile {
                         {
                             self.evictions.fetch_add(1, Ordering::Relaxed);
                         }
-                        removed_bytes += removed_len;
+                        flushed += removed_len;
                     } else {
                         break;
                     }
                 }
+                write_bytes -= flushed;
+            }
+
+            // Rules 2 + 3: after rule 1, write <= 50%.  If the total still
+            // exceeds the budget then read must be > 50%, so evict from the
+            // read cache (fairness: we only take from read when read > 50%).
+            let read_bytes = self.read_cache_bytes.load(Ordering::Acquire);
+            if write_bytes + read_bytes > self.max_cache_size {
+                self.evict_from_read_cache(write_bytes + read_bytes - self.max_cache_size, &lock);
             }
             let result = if let Some(data) = existing {
                 #[cfg(feature = "cache_metrics")]
@@ -575,9 +665,9 @@ impl PagedCachedFile {
             } else if overwrite {
                 #[cfg(feature = "cache_metrics")]
                 self.writes_hits.fetch_add(1, Ordering::AcqRel);
-                vec![0; len].into()
+                zero_filled_arc(len)
             } else {
-                self.read_direct(offset, len)?.into()
+                self.read_direct_into_arc(offset, len)?
             };
             lock.insert(offset, result);
             lock.take_value(offset).unwrap()
@@ -605,7 +695,7 @@ mod test {
     fn cache_leak() {
         let backend = InMemoryBackend::new();
         backend.set_len(1024).unwrap();
-        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024, 128).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 1024).unwrap();
         let cached_file = Arc::new(cached_file);
 
         let t1 = {

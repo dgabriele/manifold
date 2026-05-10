@@ -133,15 +133,13 @@ pub(crate) struct TransactionalMemory {
 }
 
 impl TransactionalMemory {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file: Box<dyn StorageBackend>,
         // Allow initializing a new database in an empty file
         allow_initialize: bool,
         page_size: usize,
         requested_region_size: Option<u64>,
-        read_cache_size_bytes: usize,
-        write_cache_size_bytes: usize,
+        cache_size: usize,
         read_only: bool,
     ) -> Result<Self, DatabaseError> {
         assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
@@ -153,12 +151,7 @@ impl TransactionalMemory {
         );
         assert!(region_size.is_power_of_two());
 
-        let storage = PagedCachedFile::new(
-            file,
-            page_size as u64,
-            read_cache_size_bytes,
-            write_cache_size_bytes,
-        )?;
+        let storage = PagedCachedFile::new(file, page_size as u64, cache_size)?;
 
         let initial_storage_len = storage.raw_file_len()?;
 
@@ -870,16 +863,7 @@ impl TransactionalMemory {
         Ok(())
     }
 
-    // TODO: make all callers explicitly provide a hint
-    pub(crate) fn get_page(&self, page_number: PageNumber) -> Result<PageImpl> {
-        self.get_page_extended(page_number, PageHint::None)
-    }
-
-    pub(crate) fn get_page_extended(
-        &self,
-        page_number: PageNumber,
-        hint: PageHint,
-    ) -> Result<PageImpl> {
+    pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
         let range = page_number.address_range(
             self.page_size.into(),
             self.region_size,

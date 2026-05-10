@@ -41,7 +41,14 @@ impl BuddyAllocator {
         let mut pages_for_order = num_pages;
         let mut free = vec![];
         for _ in 0..=max_order {
-            free.push(BtreeBitmap::new(pages_for_order, capacity_for_order));
+            // Lazily size each bitmap for the actual current pages, but pad the tree
+            // height so resize() can grow to the full region capacity without needing
+            // to insert new tree levels.
+            free.push(BtreeBitmap::new_padded(
+                pages_for_order,
+                pages_for_order,
+                capacity_for_order,
+            ));
 
             pages_for_order = next_higher_order(pages_for_order);
             capacity_for_order = next_higher_order(capacity_for_order);
@@ -82,21 +89,25 @@ impl BuddyAllocator {
     // free_ends: array of u32, with ending offset for BtreeBitmap structure for the given order
     // ... BtreeBitmap structures
     pub(crate) fn to_vec(&self) -> Vec<u8> {
-        let mut result = vec![];
+        let serialized: Vec<Vec<u8>> = self.free.iter().map(BtreeBitmap::to_vec).collect();
+
+        let header_bytes = 1 + 3 + size_of::<u32>();
+        let offsets_bytes = (self.max_order as usize + 1) * size_of::<u32>();
+        let data_bytes: usize = serialized.iter().map(Vec::len).sum();
+
+        let mut result = Vec::with_capacity(header_bytes + offsets_bytes + data_bytes);
         result.push(self.max_order);
         result.extend([0u8; 3]);
         result.extend(self.len.to_le_bytes());
 
-        let mut data_offset = result.len() + (self.max_order as usize + 1) * size_of::<u32>();
-        let end_metadata = data_offset;
-        for order in &self.free {
-            data_offset += order.to_vec().len();
+        let mut data_offset = header_bytes + offsets_bytes;
+        for bitmap in &serialized {
+            data_offset += bitmap.len();
             let offset_u32: u32 = data_offset.try_into().unwrap();
             result.extend(offset_u32.to_le_bytes());
         }
-        assert_eq!(end_metadata, result.len());
-        for order in &self.free {
-            result.extend(&order.to_vec());
+        for bitmap in &serialized {
+            result.extend_from_slice(bitmap);
         }
 
         result

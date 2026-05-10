@@ -121,9 +121,11 @@ pub struct TableDefinition<'a, K: Key + 'static, V: Value + 'static> {
 impl<'a, K: Key + 'static, V: Value + 'static> TableDefinition<'a, K, V> {
     /// Construct a new table with given `name`
     ///
-    /// ## Invariant
+    /// # Panics
     ///
-    /// `name` must not be empty.
+    /// Panics if `name` is empty. When `name` is a non-empty string literal
+    /// this is checked at compile time, but callers that build the name at
+    /// runtime are responsible for ensuring it is non-empty.
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -177,6 +179,13 @@ pub struct MultimapTableDefinition<'a, K: Key + 'static, V: Key + 'static> {
 }
 
 impl<'a, K: Key + 'static, V: Key + 'static> MultimapTableDefinition<'a, K, V> {
+    /// Construct a new multimap table with given `name`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty. When `name` is a non-empty string literal
+    /// this is checked at compile time, but callers that build the name at
+    /// runtime are responsible for ensuring it is non-empty.
     pub const fn new(name: &'a str) -> Self {
         assert!(!name.is_empty());
         Self {
@@ -419,7 +428,7 @@ impl ReadOnlyDatabase {
         file: Box<dyn StorageBackend>,
         page_size: usize,
         region_size: Option<u64>,
-        read_cache_size_bytes: usize,
+        cache_size: usize,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -430,8 +439,7 @@ impl ReadOnlyDatabase {
             false,
             page_size,
             region_size,
-            read_cache_size_bytes,
-            0,
+            cache_size,
             true,
         )?;
         let mem = Arc::new(mem);
@@ -558,12 +566,14 @@ impl Database {
     /// externally to redb, or that a redb bug may have left the database in a corrupted state.
     ///
     /// Returns `Ok(true)` if the database passed integrity checks; `Ok(false)` if it failed but was repaired,
-    /// and `Err(Corrupted)` if the check failed and the file could not be repaired
+    /// and `Err(Corrupted)` if the check failed and the file could not be repaired.
+    ///
+    /// Returns [`DatabaseError::TransactionInProgress`] if any read or write transaction is still
+    /// alive when this method is called.
     pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
         let allocator_hash = self.mem.allocator_hash();
-        let mut was_clean = Arc::get_mut(&mut self.mem)
-            .unwrap()
-            .clear_cache_and_reload()?;
+        let mem = Arc::get_mut(&mut self.mem).ok_or(DatabaseError::TransactionInProgress)?;
+        let mut was_clean = mem.clear_cache_and_reload()?;
 
         let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
 
@@ -895,14 +905,12 @@ impl Database {
         Ok([data_root, system_root])
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new(
         file: Box<dyn StorageBackend>,
         allow_initialize: bool,
         page_size: usize,
         region_size: Option<u64>,
-        read_cache_size_bytes: usize,
-        write_cache_size_bytes: usize,
+        cache_size: usize,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
@@ -914,8 +922,7 @@ impl Database {
             allow_initialize,
             page_size,
             region_size,
-            read_cache_size_bytes,
-            write_cache_size_bytes,
+            cache_size,
             false,
         )?;
         let mut mem = Arc::new(mem);
@@ -964,7 +971,8 @@ impl Database {
             let savepoint = match txn.get_persistent_savepoint(id) {
                 Ok(savepoint) => savepoint,
                 Err(err) => match err {
-                    SavepointError::InvalidSavepoint => unreachable!(),
+                    SavepointError::InvalidSavepoint
+                    | SavepointError::ImmediateDurabilityRequired => unreachable!(),
                     SavepointError::Storage(storage) => {
                         return Err(storage.into());
                     }
@@ -1120,8 +1128,7 @@ impl RepairSession {
 pub struct Builder {
     page_size: usize,
     region_size: Option<u64>,
-    read_cache_size_bytes: usize,
-    write_cache_size_bytes: usize,
+    cache_size: usize,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
 }
 
@@ -1133,21 +1140,16 @@ impl Builder {
     /// - `cache_size_bytes`: 1GiB
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        let mut result = Self {
+        Self {
             // Default to 4k pages. Benchmarking showed that this was a good default on all platforms,
             // including MacOS with 16k pages. Therefore, users are not allowed to configure it at the moment.
             // It is part of the file format, so can be enabled in the future.
             page_size: PAGE_SIZE,
             region_size: None,
             // TODO: Default should probably take into account the total system memory
-            read_cache_size_bytes: 0,
-            // TODO: Default should probably take into account the total system memory
-            write_cache_size_bytes: 0,
+            cache_size: 1024 * 1024 * 1024,
             repair_callback: Box::new(|_| {}),
-        };
-
-        result.set_cache_size(1024 * 1024 * 1024);
-        result
+        }
     }
 
     /// Set a callback which will be invoked periodically in the event that the database file needs
@@ -1181,9 +1183,7 @@ impl Builder {
 
     /// Set the amount of memory (in bytes) used for caching data
     pub fn set_cache_size(&mut self, bytes: usize) -> &mut Self {
-        // TODO: allow dynamic expansion of the read/write cache
-        self.read_cache_size_bytes = bytes / 10 * 9;
-        self.write_cache_size_bytes = bytes / 10;
+        self.cache_size = bytes;
         self
     }
 
@@ -1211,8 +1211,7 @@ impl Builder {
             true,
             self.page_size,
             self.region_size,
-            self.read_cache_size_bytes,
-            self.write_cache_size_bytes,
+            self.cache_size,
             &self.repair_callback,
         )
     }
@@ -1226,8 +1225,7 @@ impl Builder {
             false,
             self.page_size,
             None,
-            self.read_cache_size_bytes,
-            self.write_cache_size_bytes,
+            self.cache_size,
             &self.repair_callback,
         )
     }
@@ -1247,7 +1245,7 @@ impl Builder {
             Box::new(FileBackend::new_internal(file, true)?),
             self.page_size,
             None,
-            self.read_cache_size_bytes,
+            self.cache_size,
         )
     }
 
@@ -1260,8 +1258,7 @@ impl Builder {
             true,
             self.page_size,
             self.region_size,
-            self.read_cache_size_bytes,
-            self.write_cache_size_bytes,
+            self.cache_size,
             &self.repair_callback,
         )
     }
@@ -1276,8 +1273,7 @@ impl Builder {
             true,
             self.page_size,
             self.region_size,
-            self.read_cache_size_bytes,
-            self.write_cache_size_bytes,
+            self.cache_size,
             &self.repair_callback,
         )
     }
@@ -1546,9 +1542,14 @@ mod test {
 
         let mut tx = db.begin_write().unwrap();
         tx.set_two_phase_commit(true);
-        let savepoint5 = tx.ephemeral_savepoint().unwrap();
+        let _savepoint5 = tx.ephemeral_savepoint().unwrap();
         drop(savepoint3);
-        assert!(tx.restore_savepoint(&savepoint4).is_err());
+        // savepoint4 was invalidated by the restore_savepoint(savepoint3) call
+        // above, but that transaction was aborted, so the invalidation is
+        // reversed and savepoint4 is valid again. Restoring it here invalidates
+        // savepoint5 (which is newer), so the next transaction restores
+        // savepoint4 again rather than savepoint5.
+        tx.restore_savepoint(&savepoint4).unwrap();
         {
             tx.open_table(table_def).unwrap();
         }
@@ -1556,7 +1557,7 @@ mod test {
 
         let mut tx = db.begin_write().unwrap();
         tx.set_two_phase_commit(true);
-        tx.restore_savepoint(&savepoint5).unwrap();
+        tx.restore_savepoint(&savepoint4).unwrap();
         tx.set_durability(Durability::None).unwrap();
         {
             tx.open_table(table_def).unwrap();
