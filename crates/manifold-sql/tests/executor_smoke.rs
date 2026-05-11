@@ -568,3 +568,115 @@ fn analyze_command() {
     db.execute("ANALYZE t", &[]).unwrap();
     // After ANALYZE, the optimizer should have stats. Just verify it doesn't error.
 }
+
+// ---------------------------------------------------------------------------
+// SQL-level transaction tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sql_begin_commit() {
+    let (db, _dir) = setup();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", &[]).unwrap();
+    db.execute("COMMIT", &[]).unwrap();
+    let result = db.query("SELECT v FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "a");
+}
+
+#[test]
+fn sql_rollback() {
+    let (db, _dir) = setup();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'before')", &[]).unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (2, 'rollback_me')", &[]).unwrap();
+    db.execute("ROLLBACK", &[]).unwrap();
+    let result = db.query("SELECT v FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 1); // only 'before' remains
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "before");
+}
+
+#[test]
+fn sql_begin_double_begin_errors() {
+    let (db, _dir) = setup();
+    db.execute("BEGIN", &[]).unwrap();
+    let err = db.execute("BEGIN", &[]).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("transaction") || msg.contains("active"),
+        "expected transaction error, got: {err}"
+    );
+    // Clean up
+    db.execute("ROLLBACK", &[]).unwrap();
+}
+
+#[test]
+fn sql_commit_without_begin_errors() {
+    let (db, _dir) = setup();
+    let err = db.execute("COMMIT", &[]).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("transaction") || msg.contains("active"),
+        "expected transaction error, got: {err}"
+    );
+}
+
+#[test]
+fn sql_rollback_without_begin_errors() {
+    let (db, _dir) = setup();
+    let err = db.execute("ROLLBACK", &[]).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("transaction") || msg.contains("active"),
+        "expected transaction error, got: {err}"
+    );
+}
+
+#[test]
+fn sql_query_within_transaction_sees_uncommitted() {
+    let (db, _dir) = setup();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'pending')", &[]).unwrap();
+    // Query within the same transaction should see the uncommitted row.
+    let result = db.query("SELECT v FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "pending");
+    db.execute("ROLLBACK", &[]).unwrap();
+    // After rollback, row is gone.
+    let result = db.query("SELECT v FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 0);
+}
+
+#[test]
+fn sql_savepoint_rollback_to() {
+    let (db, _dir) = setup();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'base')", &[]).unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    db.execute("SAVEPOINT sp1", &[]).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (2, 'after_sp')", &[]).unwrap();
+    db.execute("ROLLBACK TO SAVEPOINT sp1", &[]).unwrap();
+    // The insert after the savepoint is undone.
+    let result = db.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 1);
+    db.execute("COMMIT", &[]).unwrap();
+    let result = db.query("SELECT v FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "base");
+}
+
+#[test]
+fn sql_savepoint_release() {
+    let (db, _dir) = setup();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    db.execute("SAVEPOINT sp1", &[]).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (1, 'a')", &[]).unwrap();
+    db.execute("RELEASE SAVEPOINT sp1", &[]).unwrap();
+    db.execute("COMMIT", &[]).unwrap();
+    let result = db.query("SELECT v FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 1);
+}

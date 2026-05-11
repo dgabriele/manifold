@@ -111,6 +111,17 @@ pub fn plan(catalog: &Catalog, stmt: &BoundStatement) -> Result<LogicalPlan> {
         BoundStatement::Analyze { table_name } => Ok(LogicalPlan::Analyze {
             table_name: table_name.clone(),
         }),
+
+        BoundStatement::BeginTransaction => Ok(LogicalPlan::BeginTransaction),
+        BoundStatement::CommitTransaction => Ok(LogicalPlan::CommitTransaction),
+        BoundStatement::RollbackTransaction => Ok(LogicalPlan::RollbackTransaction),
+        BoundStatement::Savepoint { name } => Ok(LogicalPlan::Savepoint { name: name.clone() }),
+        BoundStatement::ReleaseSavepoint { name } => {
+            Ok(LogicalPlan::ReleaseSavepoint { name: name.clone() })
+        }
+        BoundStatement::RollbackToSavepoint { name } => {
+            Ok(LogicalPlan::RollbackToSavepoint { name: name.clone() })
+        }
     }
 }
 

@@ -12,6 +12,7 @@ pub mod types;
 pub use error::{Result, SqlError};
 pub use types::{SqlType, Value};
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -179,10 +180,18 @@ impl ResultSet {
 // Database
 // ---------------------------------------------------------------------------
 
+/// State held during an active SQL-level explicit transaction (BEGIN...COMMIT/ROLLBACK).
+struct ActiveTransaction {
+    write_txn: manifold::WriteTransaction,
+    savepoints: HashMap<String, manifold::Savepoint>,
+}
+
 /// The main entry point for the SQL engine.
 pub struct Database {
     db: manifold::Database,
     catalog: Arc<Mutex<Catalog>>,
+    /// Active SQL-level transaction started via BEGIN.
+    active_txn: Mutex<Option<ActiveTransaction>>,
 }
 
 impl Database {
@@ -216,11 +225,14 @@ impl Database {
         Ok(Self {
             db,
             catalog: Arc::new(Mutex::new(catalog)),
+            active_txn: Mutex::new(None),
         })
     }
 
     /// Execute a mutating SQL statement. Returns the number of rows affected.
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        use planner::plan::LogicalPlan;
+
         let stmts = parser::parse(sql)?;
         let stmt = stmts
             .first()
@@ -230,7 +242,89 @@ impl Database {
         let bound = binder::bind(&catalog, stmt, params)?;
         let plan = planner::plan(&catalog, &bound)?;
         let optimized = optimizer::optimize(plan, &catalog)?;
-        executor::execute_mut(&self.db, &mut catalog, optimized, params)
+
+        // Handle transaction-control plans at the Database level.
+        match &optimized {
+            LogicalPlan::BeginTransaction => {
+                let mut active = self.active_txn.lock().unwrap();
+                if active.is_some() {
+                    return Err(SqlError::Transaction(
+                        "transaction already active".into(),
+                    ));
+                }
+                let write_txn = self.db.begin_write()?;
+                *active = Some(ActiveTransaction {
+                    write_txn,
+                    savepoints: HashMap::new(),
+                });
+                return Ok(0);
+            }
+            LogicalPlan::CommitTransaction => {
+                let mut active = self.active_txn.lock().unwrap();
+                let state = active.take().ok_or_else(|| {
+                    SqlError::Transaction("no active transaction".into())
+                })?;
+                state.write_txn.commit()?;
+                return Ok(0);
+            }
+            LogicalPlan::RollbackTransaction => {
+                let mut active = self.active_txn.lock().unwrap();
+                let state = active.take().ok_or_else(|| {
+                    SqlError::Transaction("no active transaction".into())
+                })?;
+                let _ = state.write_txn.abort();
+                return Ok(0);
+            }
+            LogicalPlan::Savepoint { name } => {
+                let mut active = self.active_txn.lock().unwrap();
+                let state = active.as_mut().ok_or_else(|| {
+                    SqlError::Transaction("SAVEPOINT requires an active transaction".into())
+                })?;
+                let sp = state.write_txn.ephemeral_savepoint().map_err(|e| {
+                    SqlError::Transaction(format!("savepoint error: {e}"))
+                })?;
+                state.savepoints.insert(name.clone(), sp);
+                return Ok(0);
+            }
+            LogicalPlan::ReleaseSavepoint { name } => {
+                let mut active = self.active_txn.lock().unwrap();
+                let state = active.as_mut().ok_or_else(|| {
+                    SqlError::Transaction("RELEASE SAVEPOINT requires an active transaction".into())
+                })?;
+                if state.savepoints.remove(name).is_none() {
+                    return Err(SqlError::Transaction(format!(
+                        "savepoint '{}' does not exist",
+                        name
+                    )));
+                }
+                return Ok(0);
+            }
+            LogicalPlan::RollbackToSavepoint { name } => {
+                let mut active = self.active_txn.lock().unwrap();
+                let state = active.as_mut().ok_or_else(|| {
+                    SqlError::Transaction(
+                        "ROLLBACK TO SAVEPOINT requires an active transaction".into(),
+                    )
+                })?;
+                let sp = state.savepoints.get(name).ok_or_else(|| {
+                    SqlError::Transaction(format!("savepoint '{}' does not exist", name))
+                })?;
+                state.write_txn.restore_savepoint(sp).map_err(|e| {
+                    SqlError::Transaction(format!("restore savepoint error: {e}"))
+                })?;
+                return Ok(0);
+            }
+            _ => {}
+        }
+
+        // If there's an active explicit transaction, use it.
+        let mut active = self.active_txn.lock().unwrap();
+        if let Some(state) = active.as_mut() {
+            executor::execute_in_txn(&state.write_txn, &mut catalog, optimized, params)
+        } else {
+            drop(active);
+            executor::execute_mut(&self.db, &mut catalog, optimized, params)
+        }
     }
 
     /// Execute a query and return the result set.
@@ -244,7 +338,15 @@ impl Database {
         let bound = binder::bind(&catalog, stmt, params)?;
         let plan = planner::plan(&catalog, &bound)?;
         let optimized = optimizer::optimize(plan, &catalog)?;
-        executor::execute_query(&self.db, &catalog, optimized, params)
+
+        // If there's an active explicit transaction, query through it.
+        let active = self.active_txn.lock().unwrap();
+        if let Some(state) = active.as_ref() {
+            executor::query_in_txn(&state.write_txn, &catalog, optimized, params)
+        } else {
+            drop(active);
+            executor::execute_query(&self.db, &catalog, optimized, params)
+        }
     }
 
     /// Begin an explicit transaction.

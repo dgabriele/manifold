@@ -65,6 +65,28 @@ pub fn bind_statement(
             Ok(BoundStatement::Analyze { table_name })
         }
 
+        ast::Statement::StartTransaction { .. } => Ok(BoundStatement::BeginTransaction),
+
+        ast::Statement::Commit { .. } => Ok(BoundStatement::CommitTransaction),
+
+        ast::Statement::Rollback { savepoint, .. } => {
+            if let Some(sp_name) = savepoint {
+                Ok(BoundStatement::RollbackToSavepoint {
+                    name: sp_name.value.clone(),
+                })
+            } else {
+                Ok(BoundStatement::RollbackTransaction)
+            }
+        }
+
+        ast::Statement::Savepoint { name } => Ok(BoundStatement::Savepoint {
+            name: name.value.clone(),
+        }),
+
+        ast::Statement::ReleaseSavepoint { name } => Ok(BoundStatement::ReleaseSavepoint {
+            name: name.value.clone(),
+        }),
+
         other => Err(SqlError::Bind(format!(
             "unsupported statement: {}",
             other.to_string().chars().take(80).collect::<String>()

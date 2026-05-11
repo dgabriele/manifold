@@ -317,6 +317,12 @@ pub enum BoundStatement {
     Analyze {
         table_name: Option<String>,
     },
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
+    Savepoint { name: String },
+    ReleaseSavepoint { name: String },
+    RollbackToSavepoint { name: String },
 }
 
 // ---------------------------------------------------------------------------

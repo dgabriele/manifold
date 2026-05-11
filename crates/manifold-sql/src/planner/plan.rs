@@ -257,6 +257,18 @@ pub enum LogicalPlan {
     },
     /// An empty plan (no rows, no schema).
     Empty,
+    /// BEGIN TRANSACTION.
+    BeginTransaction,
+    /// COMMIT.
+    CommitTransaction,
+    /// ROLLBACK.
+    RollbackTransaction,
+    /// SAVEPOINT <name>.
+    Savepoint { name: String },
+    /// RELEASE SAVEPOINT <name>.
+    ReleaseSavepoint { name: String },
+    /// ROLLBACK TO SAVEPOINT <name>.
+    RollbackToSavepoint { name: String },
 }
 
 impl LogicalPlan {
@@ -283,7 +295,13 @@ impl LogicalPlan {
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::Analyze { .. }
-            | LogicalPlan::Empty => None,
+            | LogicalPlan::Empty
+            | LogicalPlan::BeginTransaction
+            | LogicalPlan::CommitTransaction
+            | LogicalPlan::RollbackTransaction
+            | LogicalPlan::Savepoint { .. }
+            | LogicalPlan::ReleaseSavepoint { .. }
+            | LogicalPlan::RollbackToSavepoint { .. } => None,
             LogicalPlan::Explain { input } => input.schema(),
         }
     }

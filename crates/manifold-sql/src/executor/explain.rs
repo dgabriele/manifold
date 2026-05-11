@@ -187,6 +187,24 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
         LogicalPlan::Empty => {
             out.push_str(&format!("{pfx}Empty\n"));
         }
+        LogicalPlan::BeginTransaction => {
+            out.push_str(&format!("{pfx}BeginTransaction\n"));
+        }
+        LogicalPlan::CommitTransaction => {
+            out.push_str(&format!("{pfx}CommitTransaction\n"));
+        }
+        LogicalPlan::RollbackTransaction => {
+            out.push_str(&format!("{pfx}RollbackTransaction\n"));
+        }
+        LogicalPlan::Savepoint { name } => {
+            out.push_str(&format!("{pfx}Savepoint {name}\n"));
+        }
+        LogicalPlan::ReleaseSavepoint { name } => {
+            out.push_str(&format!("{pfx}ReleaseSavepoint {name}\n"));
+        }
+        LogicalPlan::RollbackToSavepoint { name } => {
+            out.push_str(&format!("{pfx}RollbackToSavepoint {name}\n"));
+        }
     }
 }
 
