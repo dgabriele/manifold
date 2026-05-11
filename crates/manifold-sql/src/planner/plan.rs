@@ -268,6 +268,8 @@ pub enum LogicalPlan {
         table_id: TableId,
         table_name: String,
         index_name: String,
+        /// The values to look up in the index (equality predicate).
+        lookup_values: Vec<ScalarExpr>,
         schema: PlanSchema,
     },
     /// An empty plan (no rows, no schema).

@@ -555,8 +555,12 @@ fn explain_basic() {
     let (db, _dir) = setup();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", &[]).unwrap();
     let plan = db.explain("SELECT name FROM t WHERE id = 1").unwrap();
-    assert!(plan.contains("Scan") || plan.contains("scan"), "expected Scan in plan, got: {plan}");
-    assert!(plan.contains("Filter") || plan.contains("filter"), "expected Filter in plan, got: {plan}");
+    // With index-based lookups, an equality predicate on a PK column produces
+    // an IndexScan instead of Filter(Scan).
+    assert!(
+        plan.contains("IndexScan") || plan.contains("Scan"),
+        "expected Scan or IndexScan in plan, got: {plan}"
+    );
 }
 
 #[test]

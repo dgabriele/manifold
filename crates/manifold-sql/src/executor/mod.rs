@@ -136,12 +136,15 @@ fn build_read_query_executor(
             let scan = scan::TableScan::from_read_txn(txn, catalog, table_name, schema.clone())?;
             Ok(Box::new(scan))
         }
-        // IndexScan falls back to a full table scan until the executor has
-        // native index-scan support.
         LogicalPlan::IndexScan {
-            table_name, schema, ..
+            table_name,
+            index_name,
+            lookup_values,
+            ..
         } => {
-            let scan = scan::TableScan::from_read_txn(txn, catalog, table_name, schema.clone())?;
+            let scan = scan::IndexPointScan::from_read_txn(
+                txn, catalog, table_name, index_name, lookup_values, params,
+            )?;
             Ok(Box::new(scan))
         }
         LogicalPlan::Filter { predicate, input } => {
@@ -293,12 +296,15 @@ fn build_write_query_executor(
             let scan = scan::TableScan::from_write_txn(txn, catalog, table_name, schema.clone())?;
             Ok(Box::new(scan))
         }
-        // IndexScan falls back to a full table scan until the executor has
-        // native index-scan support.
         LogicalPlan::IndexScan {
-            table_name, schema, ..
+            table_name,
+            index_name,
+            lookup_values,
+            ..
         } => {
-            let scan = scan::TableScan::from_write_txn(txn, catalog, table_name, schema.clone())?;
+            let scan = scan::IndexPointScan::from_write_txn(
+                txn, catalog, table_name, index_name, lookup_values, params,
+            )?;
             Ok(Box::new(scan))
         }
         LogicalPlan::Filter { predicate, input } => {

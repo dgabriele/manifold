@@ -641,3 +641,125 @@ fn union_removes_duplicates() {
         .unwrap();
     assert_eq!(result.row_count(), 3); // x, y, z
 }
+
+// ===========================================================================
+// Index scan point lookups
+// ===========================================================================
+
+#[test]
+fn index_scan_point_lookup() {
+    let (db, _dir) = test_db();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .unwrap();
+    for i in 0..1000 {
+        db.execute(
+            "INSERT INTO t (id, name) VALUES ($1, $2)",
+            &[Value::Integer(i), Value::Text(format!("name_{i}"))],
+        )
+        .unwrap();
+    }
+    // This should use the PK index, not full scan
+    let result = db
+        .query("SELECT name FROM t WHERE id = 500", &[])
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "name_500");
+}
+
+#[test]
+fn index_scan_point_lookup_with_param() {
+    let (db, _dir) = test_db();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .unwrap();
+    for i in 0..100 {
+        db.execute(
+            "INSERT INTO t (id, name) VALUES ($1, $2)",
+            &[Value::Integer(i), Value::Text(format!("name_{i}"))],
+        )
+        .unwrap();
+    }
+    let result = db
+        .query("SELECT name FROM t WHERE id = $1", &[Value::Integer(42)])
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "name_42");
+}
+
+#[test]
+fn index_scan_point_lookup_not_found() {
+    let (db, _dir) = test_db();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .unwrap();
+    for i in 0..10 {
+        db.execute(
+            "INSERT INTO t (id, name) VALUES ($1, $2)",
+            &[Value::Integer(i), Value::Text(format!("name_{i}"))],
+        )
+        .unwrap();
+    }
+    let result = db
+        .query("SELECT name FROM t WHERE id = 999", &[])
+        .unwrap();
+    assert_eq!(result.row_count(), 0);
+}
+
+#[test]
+fn index_scan_nonunique_index() {
+    let (db, _dir) = test_db();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, name TEXT)",
+        &[],
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_category ON t (category)", &[])
+        .unwrap();
+    for i in 0..50 {
+        db.execute(
+            "INSERT INTO t (id, category, name) VALUES ($1, $2, $3)",
+            &[
+                Value::Integer(i),
+                Value::Text(format!("cat_{}", i % 5)),
+                Value::Text(format!("name_{i}")),
+            ],
+        )
+        .unwrap();
+    }
+    // Should find 10 rows for cat_0
+    let result = db
+        .query(
+            "SELECT name FROM t WHERE category = 'cat_0' ORDER BY name",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 10);
+}
+
+#[test]
+fn index_scan_explain_shows_index() {
+    let (db, _dir) = test_db();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t (id, name) VALUES (1, 'a')",
+        &[],
+    )
+    .unwrap();
+    // Use the explain() API which returns the formatted plan directly
+    let plan_text = db.explain("SELECT name FROM t WHERE id = 1").unwrap();
+    assert!(
+        plan_text.contains("IndexScan"),
+        "EXPLAIN should show IndexScan, got: {plan_text}"
+    );
+}

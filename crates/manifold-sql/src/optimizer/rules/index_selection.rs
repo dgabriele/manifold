@@ -15,27 +15,25 @@ fn select_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
         LogicalPlan::Filter { predicate, input } => {
             let input = select_plan(*input, catalog)?;
             // Check for Filter(col = literal, Scan) pattern.
-            // Replace the Scan with IndexScan but keep the Filter so the
-            // predicate is still evaluated (the executor falls back to a
-            // full scan until native index-scan support is added).
+            // Replace with IndexScan that carries the lookup value.
+            // For simple equality predicates, the Filter is removed since
+            // the index enforces it.
             if let LogicalPlan::Scan {
                 table_id,
                 ref table_name,
                 ref schema,
             } = input
-                && let Some(index_name) =
+                && let Some((index_name, lookup_value)) =
                     find_index_for_predicate(&predicate, table_id, table_name, catalog)
             {
                 let index_scan = LogicalPlan::IndexScan {
                     table_id,
                     table_name: table_name.clone(),
                     index_name,
+                    lookup_values: vec![lookup_value],
                     schema: schema.clone(),
                 };
-                return Ok(LogicalPlan::Filter {
-                    predicate,
-                    input: Box::new(index_scan),
-                });
+                return Ok(index_scan);
             }
             Ok(LogicalPlan::Filter {
                 predicate,
@@ -177,33 +175,43 @@ fn select_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
     }
 }
 
-/// Check if the predicate is an equality comparison `col = literal` and if there
-/// is an index on that column. Returns the index name if found.
+/// Check if the predicate is an equality comparison `col = literal` (or `col = $param`)
+/// and if there is an index on that column. Returns the index name and the lookup
+/// expression if found.
 fn find_index_for_predicate(
     predicate: &ScalarExpr,
-    table_id: u32,
-    _table_name: &str,
+    _plan_table_id: u32,
+    table_name: &str,
     catalog: &Catalog,
-) -> Option<String> {
-    // Match: col = literal (either order)
+) -> Option<(String, ScalarExpr)> {
+    // Resolve the real catalog table ID from the table name, since the plan's
+    // table_id may be a scope-level ID assigned by the binder (starting at
+    // 1_000_000) rather than the catalog's own table ID.
+    let catalog_table_id = catalog.get_table(table_name)?.id;
+
+    // Match: col = literal/param (either order)
     if let ScalarExpr::BinaryOp {
         op: BinaryOp::Eq,
         left,
         right,
     } = predicate
     {
-        let col_index = match (left.as_ref(), right.as_ref()) {
-            (ScalarExpr::ColumnRef { index }, ScalarExpr::Literal(_)) => Some(*index),
-            (ScalarExpr::Literal(_), ScalarExpr::ColumnRef { index }) => Some(*index),
-            _ => None,
+        let (col_index, value_expr) = match (left.as_ref(), right.as_ref()) {
+            (ScalarExpr::ColumnRef { index }, val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_))) => {
+                (Some(*index), Some(val.clone()))
+            }
+            (val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)), ScalarExpr::ColumnRef { index }) => {
+                (Some(*index), Some(val.clone()))
+            }
+            _ => (None, None),
         };
 
-        if let Some(col_idx) = col_index {
-            let indexes = catalog.indexes_for_table(table_id);
+        if let (Some(col_idx), Some(val)) = (col_index, value_expr) {
+            let indexes = catalog.indexes_for_table(catalog_table_id);
             for idx_def in indexes {
                 // Match if the column is the first (or only) column of the index
                 if !idx_def.columns.is_empty() && idx_def.columns[0] == col_idx {
-                    return Some(idx_def.name.clone());
+                    return Some((idx_def.name.clone(), val));
                 }
             }
         }
@@ -284,21 +292,19 @@ mod tests {
         };
 
         let result = select_indexes(filter, &catalog).unwrap();
-        // Should be Filter(IndexScan) -- the filter is preserved
-        if let LogicalPlan::Filter { input, .. } = &result {
-            if let LogicalPlan::IndexScan {
-                index_name,
-                table_name,
-                ..
-            } = input.as_ref()
-            {
-                assert_eq!(index_name, "idx_users_id");
-                assert_eq!(table_name, "users");
-            } else {
-                panic!("expected IndexScan inside Filter, got {:?}", input);
-            }
+        // Should be IndexScan directly -- the filter is removed for equality predicates
+        if let LogicalPlan::IndexScan {
+            index_name,
+            table_name,
+            lookup_values,
+            ..
+        } = &result
+        {
+            assert_eq!(index_name, "idx_users_id");
+            assert_eq!(table_name, "users");
+            assert_eq!(lookup_values.len(), 1);
         } else {
-            panic!("expected Filter(IndexScan), got {:?}", result);
+            panic!("expected IndexScan, got {:?}", result);
         }
     }
 

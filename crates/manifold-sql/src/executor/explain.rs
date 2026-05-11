@@ -26,9 +26,14 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
         LogicalPlan::IndexScan {
             table_name,
             index_name,
+            lookup_values,
             ..
         } => {
-            out.push_str(&format!("{pfx}IndexScan {table_name} using {index_name}\n"));
+            let vals: Vec<String> = lookup_values.iter().map(format_expr_brief).collect();
+            out.push_str(&format!(
+                "{pfx}IndexScan {table_name} using {index_name} [{}]\n",
+                vals.join(", ")
+            ));
         }
         LogicalPlan::Filter { predicate, input } => {
             out.push_str(&format!("{pfx}Filter ({})\n", format_expr_brief(predicate)));

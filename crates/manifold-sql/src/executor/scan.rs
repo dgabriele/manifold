@@ -1,8 +1,11 @@
-use manifold::{ReadableTable, TableDefinition};
+use manifold::{MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableDefinition};
 
+use crate::catalog::schema::IndexDef;
 use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
-use crate::planner::plan::PlanSchema;
+use crate::expr::eval::evaluate;
+use crate::planner::plan::{PlanSchema, ScalarExpr};
+use crate::storage::index::encode_index_key;
 use crate::storage::row_format::decode_row;
 use crate::types::Value;
 
@@ -108,6 +111,202 @@ impl TableScan {
 }
 
 impl super::Executor for TableScan {
+    fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        if self.position < self.rows.len() {
+            let row = self.rows[self.position].clone();
+            self.position += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index point-lookup scan
+// ---------------------------------------------------------------------------
+
+/// Index point-lookup operator: uses a B-tree index to find matching rowids,
+/// then fetches only those rows from the data table.
+///
+/// Like `TableScan`, each output row is prefixed with the rowid.
+pub struct IndexPointScan {
+    rows: Vec<Vec<Value>>,
+    position: usize,
+}
+
+impl IndexPointScan {
+    /// Resolve lookup values, encode them as an index key, look up matching
+    /// rowids in the index table, and fetch the corresponding data rows.
+    fn resolve_lookup_values(
+        lookup_values: &[ScalarExpr],
+        params: &[Value],
+    ) -> Result<Vec<Value>> {
+        lookup_values
+            .iter()
+            .map(|expr| evaluate(expr, &[], params))
+            .collect()
+    }
+
+    /// Build an IndexPointScan from a read transaction.
+    pub fn from_read_txn(
+        txn: &manifold::ReadTransaction,
+        catalog: &Catalog,
+        table_name: &str,
+        index_name: &str,
+        lookup_values: &[ScalarExpr],
+        params: &[Value],
+    ) -> Result<Self> {
+        let table_schema = catalog
+            .get_table(table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
+        let col_types = table_schema.column_types();
+
+        let index_def = catalog
+            .get_index(index_name)
+            .ok_or_else(|| SqlError::IndexNotFound(index_name.to_string()))?
+            .clone();
+
+        let values = Self::resolve_lookup_values(lookup_values, params)?;
+        let key_bytes = encode_index_key(&values);
+
+        let data_name: &'static str =
+            Box::leak(format!("data_{table_name}").into_boxed_str());
+        let data_def = TableDefinition::<u64, &[u8]>::new(data_name);
+
+        let rowids = Self::lookup_rowids_read(txn, table_name, &index_def, &key_bytes)?;
+
+        let mut rows = Vec::with_capacity(rowids.len());
+        if !rowids.is_empty() {
+            let data_table = txn.open_table(data_def).map_err(SqlError::TableError)?;
+            for rowid in rowids {
+                if let Some(row_guard) = data_table.get(rowid).map_err(SqlError::Storage)? {
+                    let mut row = vec![Value::Integer(rowid as i64)];
+                    let decoded = decode_row(&col_types, row_guard.value())?;
+                    row.extend(decoded);
+                    rows.push(row);
+                }
+            }
+        }
+
+        Ok(Self { rows, position: 0 })
+    }
+
+    /// Build an IndexPointScan from a write transaction.
+    pub fn from_write_txn(
+        txn: &manifold::WriteTransaction,
+        catalog: &Catalog,
+        table_name: &str,
+        index_name: &str,
+        lookup_values: &[ScalarExpr],
+        params: &[Value],
+    ) -> Result<Self> {
+        let table_schema = catalog
+            .get_table(table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
+        let col_types = table_schema.column_types();
+
+        let index_def = catalog
+            .get_index(index_name)
+            .ok_or_else(|| SqlError::IndexNotFound(index_name.to_string()))?
+            .clone();
+
+        let values = Self::resolve_lookup_values(lookup_values, params)?;
+        let key_bytes = encode_index_key(&values);
+
+        let data_name: &'static str =
+            Box::leak(format!("data_{table_name}").into_boxed_str());
+        let data_def = TableDefinition::<u64, &[u8]>::new(data_name);
+
+        let rowids = Self::lookup_rowids_write(txn, table_name, &index_def, &key_bytes)?;
+
+        let mut rows = Vec::with_capacity(rowids.len());
+        if !rowids.is_empty() {
+            let data_table = txn.open_table(data_def)?;
+            for rowid in rowids {
+                if let Some(row_guard) = data_table
+                    .get(rowid)
+                    .map_err(SqlError::Storage)?
+                {
+                    let mut row = vec![Value::Integer(rowid as i64)];
+                    let decoded = decode_row(&col_types, row_guard.value())?;
+                    row.extend(decoded);
+                    rows.push(row);
+                }
+            }
+        }
+
+        Ok(Self { rows, position: 0 })
+    }
+
+    /// Look up rowids from the index using a read transaction.
+    fn lookup_rowids_read(
+        txn: &manifold::ReadTransaction,
+        table_name: &str,
+        index_def: &IndexDef,
+        key_bytes: &[u8],
+    ) -> Result<Vec<u64>> {
+        let idx_tbl_name = super::index_table_name(table_name, &index_def.name, index_def.unique);
+        let mut rowids = Vec::new();
+
+        if index_def.unique {
+            let idx_def = TableDefinition::<&[u8], u64>::new(idx_tbl_name);
+            match txn.open_table(idx_def) {
+                Ok(idx_table) => {
+                    if let Some(guard) = idx_table.get(key_bytes).map_err(SqlError::Storage)? {
+                        rowids.push(guard.value());
+                    }
+                }
+                Err(manifold::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(SqlError::TableError(e)),
+            }
+        } else {
+            let idx_def = MultimapTableDefinition::<&[u8], u64>::new(idx_tbl_name);
+            match txn.open_multimap_table(idx_def) {
+                Ok(idx_table) => {
+                    let values = idx_table.get(key_bytes).map_err(SqlError::Storage)?;
+                    for item in values {
+                        rowids.push(item.map_err(SqlError::Storage)?.value());
+                    }
+                }
+                Err(manifold::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(SqlError::TableError(e)),
+            }
+        }
+
+        Ok(rowids)
+    }
+
+    /// Look up rowids from the index using a write transaction.
+    fn lookup_rowids_write(
+        txn: &manifold::WriteTransaction,
+        table_name: &str,
+        index_def: &IndexDef,
+        key_bytes: &[u8],
+    ) -> Result<Vec<u64>> {
+        let idx_tbl_name = super::index_table_name(table_name, &index_def.name, index_def.unique);
+        let mut rowids = Vec::new();
+
+        if index_def.unique {
+            let idx_def = TableDefinition::<&[u8], u64>::new(idx_tbl_name);
+            let idx_table = txn.open_table(idx_def)?;
+            if let Some(guard) = idx_table.get(key_bytes).map_err(SqlError::Storage)? {
+                rowids.push(guard.value());
+            }
+        } else {
+            let idx_def = MultimapTableDefinition::<&[u8], u64>::new(idx_tbl_name);
+            let idx_table = txn.open_multimap_table(idx_def)?;
+            let values = idx_table.get(key_bytes).map_err(SqlError::Storage)?;
+            for item in values {
+                rowids.push(item.map_err(SqlError::Storage)?.value());
+            }
+        }
+
+        Ok(rowids)
+    }
+}
+
+impl super::Executor for IndexPointScan {
     fn next(&mut self) -> Result<Option<Vec<Value>>> {
         if self.position < self.rows.len() {
             let row = self.rows[self.position].clone();
