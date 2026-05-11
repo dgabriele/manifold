@@ -277,7 +277,7 @@ fn bind_select_body(
 
             let condition = match constraint {
                 Some(ast::JoinConstraint::On(expr)) => {
-                    Some(bind_expr(&scope, expr, params)?)
+                    Some(bind_expr_with_catalog(&scope, catalog, expr, params)?)
                 }
                 Some(ast::JoinConstraint::None) | None => None,
                 Some(ast::JoinConstraint::Natural) => None,
@@ -292,9 +292,9 @@ fn bind_select_body(
         }
     }
 
-    // WHERE
+    // WHERE — use bind_expr_with_catalog so subqueries are supported
     let filter = match &select.selection {
-        Some(expr) => Some(bind_expr(&scope, expr, params)?),
+        Some(expr) => Some(bind_expr_with_catalog(&scope, catalog, expr, params)?),
         None => None,
     };
 
@@ -439,16 +439,43 @@ pub fn bind_subquery(
 fn build_select_scope(catalog: &Catalog, select: &BoundSelect) -> Result<Scope> {
     let mut scope = Scope::new();
     for table_ref in &select.from {
-        scope.add_table(catalog, &table_ref.table_name, table_ref.alias.as_deref())?;
+        add_table_ref_to_scope(&mut scope, catalog, table_ref)?;
     }
     for join in &select.joins {
-        scope.add_table(
-            catalog,
-            &join.table.table_name,
-            join.table.alias.as_deref(),
-        )?;
+        add_table_ref_to_scope(&mut scope, catalog, &join.table)?;
     }
     Ok(scope)
+}
+
+/// Add a table reference (regular or derived) to a scope.
+fn add_table_ref_to_scope(
+    scope: &mut Scope,
+    catalog: &Catalog,
+    table_ref: &BoundTableRef,
+) -> Result<()> {
+    if let Some(subquery) = &table_ref.subquery {
+        // Derived table: reconstruct the columns from the subquery's projection.
+        let alias = table_ref
+            .alias
+            .as_deref()
+            .unwrap_or("__derived");
+        let columns: Vec<(String, crate::types::SqlType, bool)> = subquery
+            .projection
+            .iter()
+            .map(|item| {
+                let name = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| item.expr.display_name());
+                let sql_type = crate::binder::expr::bound_expr_sql_type(&item.expr);
+                (name, sql_type, true)
+            })
+            .collect();
+        scope.add_derived_table(alias, &columns);
+    } else {
+        scope.add_table(catalog, &table_ref.table_name, table_ref.alias.as_deref())?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

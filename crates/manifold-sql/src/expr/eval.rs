@@ -109,6 +109,12 @@ pub fn evaluate(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Va
             let val = evaluate(expr, row, params)?;
             cast_value(&val, target_type)
         }
+
+        ScalarExpr::InSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::ScalarSubquery { .. } => {
+            Err(SqlError::Execute("subquery evaluation not supported in this context".to_string()))
+        }
     }
 }
 

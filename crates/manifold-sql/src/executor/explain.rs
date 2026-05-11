@@ -269,5 +269,14 @@ fn format_expr_brief(expr: &crate::planner::plan::ScalarExpr) -> String {
         ScalarExpr::Cast { expr, target_type } => {
             format!("CAST({} AS {target_type})", format_expr_brief(expr))
         }
+        ScalarExpr::InSubquery { expr, negated, .. } => {
+            let kw = if *negated { "NOT IN" } else { "IN" };
+            format!("({} {kw} (SELECT ...))", format_expr_brief(expr))
+        }
+        ScalarExpr::Exists { negated, .. } => {
+            let kw = if *negated { "NOT EXISTS" } else { "EXISTS" };
+            format!("{kw} (SELECT ...)")
+        }
+        ScalarExpr::ScalarSubquery { .. } => "(SELECT ...)".to_string(),
     }
 }

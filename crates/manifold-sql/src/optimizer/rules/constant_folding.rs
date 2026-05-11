@@ -273,6 +273,18 @@ fn fold_expr(expr: ScalarExpr) -> ScalarExpr {
             let args: Vec<_> = args.into_iter().map(fold_expr).collect();
             ScalarExpr::Function { name, args }
         }
+        // Subquery expressions: fold the outer expr but leave the subquery plan as-is.
+        ScalarExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => ScalarExpr::InSubquery {
+            expr: Box::new(fold_expr(*expr)),
+            subquery,
+            negated,
+        },
+        // EXISTS and ScalarSubquery have no outer expr to fold.
+        ScalarExpr::Exists { .. } | ScalarExpr::ScalarSubquery { .. } => expr,
         // Leaf nodes -- nothing to fold
         other => other,
     }

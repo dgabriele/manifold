@@ -99,6 +99,21 @@ pub enum ScalarExpr {
         expr: Box<ScalarExpr>,
         target_type: SqlType,
     },
+    /// `expr IN (SELECT ...)` — the subquery plan produces a set of values.
+    InSubquery {
+        expr: Box<ScalarExpr>,
+        subquery: Box<LogicalPlan>,
+        negated: bool,
+    },
+    /// `EXISTS (SELECT ...)` — check if subquery produces any rows.
+    Exists {
+        subquery: Box<LogicalPlan>,
+        negated: bool,
+    },
+    /// Scalar subquery: `(SELECT ...)` producing a single value.
+    ScalarSubquery {
+        subquery: Box<LogicalPlan>,
+    },
 }
 
 // ---------------------------------------------------------------------------

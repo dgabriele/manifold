@@ -271,6 +271,10 @@ fn remap_join_columns(expr: ScalarExpr, left_width: usize, right_width: usize) -
             target_type,
         },
         other @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)) => other,
+        // Subqueries have their own scope; pass through unchanged.
+        other @ (ScalarExpr::InSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::ScalarSubquery { .. }) => other,
     }
 }
 

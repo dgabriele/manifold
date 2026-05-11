@@ -147,20 +147,19 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
         LogicalPlan::Empty
     } else {
         let first_table = &select.from[0];
-        let schema = build_scan_schema(catalog, &first_table.table_name)?;
         offsets.insert(first_table.table_id, 0);
-        LogicalPlan::Scan {
-            table_id: first_table.table_id,
-            table_name: first_table.table_name.clone(),
-            schema,
-        }
+        build_table_ref_plan(catalog, first_table)?
     };
 
     // Additional FROM tables are implicit cross joins
     for table_ref in select.from.iter().skip(1) {
         let current_width = plan_width(&current);
         offsets.insert(table_ref.table_id, current_width);
-        let right_schema = build_scan_schema(catalog, &table_ref.table_name)?;
+        let right_plan = build_table_ref_plan(catalog, table_ref)?;
+        let right_schema = right_plan
+            .schema()
+            .cloned()
+            .unwrap_or_else(PlanSchema::empty);
         let combined_schema = PlanSchema::concat(
             current.schema().unwrap_or(&PlanSchema::empty()),
             &right_schema,
@@ -168,11 +167,7 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
         current = LogicalPlan::Join {
             join_type: crate::binder::JoinType::Cross,
             left: Box::new(current),
-            right: Box::new(LogicalPlan::Scan {
-                table_id: table_ref.table_id,
-                table_name: table_ref.table_name.clone(),
-                schema: right_schema,
-            }),
+            right: Box::new(right_plan),
             condition: None,
             schema: combined_schema,
         };
@@ -182,7 +177,11 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
     for join in &select.joins {
         let current_width = plan_width(&current);
         offsets.insert(join.table.table_id, current_width);
-        let right_schema = build_scan_schema(catalog, &join.table.table_name)?;
+        let right_plan = build_table_ref_plan(catalog, &join.table)?;
+        let right_schema = right_plan
+            .schema()
+            .cloned()
+            .unwrap_or_else(PlanSchema::empty);
         let combined_schema = PlanSchema::concat(
             current.schema().unwrap_or(&PlanSchema::empty()),
             &right_schema,
@@ -194,19 +193,15 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
         current = LogicalPlan::Join {
             join_type: join.join_type,
             left: Box::new(current),
-            right: Box::new(LogicalPlan::Scan {
-                table_id: join.table.table_id,
-                table_name: join.table.table_name.clone(),
-                schema: right_schema,
-            }),
+            right: Box::new(right_plan),
             condition,
             schema: combined_schema,
         };
     }
 
-    // 3. WHERE filter
+    // 3. WHERE filter — use catalog-aware lowering to support subqueries
     if let Some(filter_expr) = &select.filter {
-        let predicate = lower_expr(filter_expr, &offsets)?;
+        let predicate = lower_expr_with_catalog(filter_expr, &offsets, catalog)?;
         current = LogicalPlan::Filter {
             predicate,
             input: Box::new(current),
@@ -530,6 +525,24 @@ fn plan_delete(
 /// The key operation: a `BoundExpr::Column { table_id, column_index }` becomes
 /// `ScalarExpr::ColumnRef { index: offsets[table_id] + column_index }`.
 fn lower_expr(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<ScalarExpr> {
+    lower_expr_inner(expr, offsets, None)
+}
+
+fn lower_expr_with_catalog(
+    expr: &BoundExpr,
+    offsets: &ColumnOffsets,
+    catalog: &Catalog,
+) -> Result<ScalarExpr> {
+    lower_expr_inner(expr, offsets, Some(catalog))
+}
+
+fn lower_expr_inner(
+    expr: &BoundExpr,
+    offsets: &ColumnOffsets,
+    catalog: Option<&Catalog>,
+) -> Result<ScalarExpr> {
+    let recurse = |e: &BoundExpr| lower_expr_inner(e, offsets, catalog);
+
     match expr {
         BoundExpr::Column(col_ref) => {
             let base = offsets.get(&col_ref.table_id).copied().unwrap_or(0);
@@ -543,15 +556,15 @@ fn lower_expr(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<ScalarExpr> {
             op, left, right, ..
         } => Ok(ScalarExpr::BinaryOp {
             op: *op,
-            left: Box::new(lower_expr(left, offsets)?),
-            right: Box::new(lower_expr(right, offsets)?),
+            left: Box::new(recurse(left)?),
+            right: Box::new(recurse(right)?),
         }),
         BoundExpr::UnaryOp { op, operand, .. } => Ok(ScalarExpr::UnaryOp {
             op: *op,
-            operand: Box::new(lower_expr(operand, offsets)?),
+            operand: Box::new(recurse(operand)?),
         }),
         BoundExpr::IsNull { operand, negated } => Ok(ScalarExpr::IsNull {
-            operand: Box::new(lower_expr(operand, offsets)?),
+            operand: Box::new(recurse(operand)?),
             negated: *negated,
         }),
         BoundExpr::InList {
@@ -561,10 +574,10 @@ fn lower_expr(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<ScalarExpr> {
         } => {
             let lowered_list = list
                 .iter()
-                .map(|e| lower_expr(e, offsets))
+                .map(&recurse)
                 .collect::<Result<Vec<_>>>()?;
             Ok(ScalarExpr::InList {
-                expr: Box::new(lower_expr(expr, offsets)?),
+                expr: Box::new(recurse(expr)?),
                 list: lowered_list,
                 negated: *negated,
             })
@@ -575,9 +588,9 @@ fn lower_expr(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<ScalarExpr> {
             high,
             negated,
         } => Ok(ScalarExpr::Between {
-            expr: Box::new(lower_expr(expr, offsets)?),
-            low: Box::new(lower_expr(low, offsets)?),
-            high: Box::new(lower_expr(high, offsets)?),
+            expr: Box::new(recurse(expr)?),
+            low: Box::new(recurse(low)?),
+            high: Box::new(recurse(high)?),
             negated: *negated,
         }),
         BoundExpr::Like {
@@ -585,14 +598,14 @@ fn lower_expr(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<ScalarExpr> {
             pattern,
             negated,
         } => Ok(ScalarExpr::Like {
-            expr: Box::new(lower_expr(expr, offsets)?),
-            pattern: Box::new(lower_expr(pattern, offsets)?),
+            expr: Box::new(recurse(expr)?),
+            pattern: Box::new(recurse(pattern)?),
             negated: *negated,
         }),
         BoundExpr::Function { name, args, .. } => {
             let lowered_args = args
                 .iter()
-                .map(|a| lower_expr(a, offsets))
+                .map(&recurse)
                 .collect::<Result<Vec<_>>>()?;
             Ok(ScalarExpr::Function {
                 name: name.clone(),
@@ -609,18 +622,48 @@ fn lower_expr(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<ScalarExpr> {
         BoundExpr::Cast {
             expr, target_type, ..
         } => Ok(ScalarExpr::Cast {
-            expr: Box::new(lower_expr(expr, offsets)?),
+            expr: Box::new(recurse(expr)?),
             target_type: target_type.clone(),
         }),
+        BoundExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let cat = catalog.ok_or_else(|| {
+                SqlError::Plan("subquery planning requires catalog context".to_string())
+            })?;
+            let lowered_expr = recurse(expr)?;
+            let subquery_plan = plan_select(cat, subquery)?;
+            Ok(ScalarExpr::InSubquery {
+                expr: Box::new(lowered_expr),
+                subquery: Box::new(subquery_plan),
+                negated: *negated,
+            })
+        }
+        BoundExpr::Exists { subquery, negated } => {
+            let cat = catalog.ok_or_else(|| {
+                SqlError::Plan("subquery planning requires catalog context".to_string())
+            })?;
+            let subquery_plan = plan_select(cat, subquery)?;
+            Ok(ScalarExpr::Exists {
+                subquery: Box::new(subquery_plan),
+                negated: *negated,
+            })
+        }
+        BoundExpr::ScalarSubquery { subquery } => {
+            let cat = catalog.ok_or_else(|| {
+                SqlError::Plan("subquery planning requires catalog context".to_string())
+            })?;
+            let subquery_plan = plan_select(cat, subquery)?;
+            Ok(ScalarExpr::ScalarSubquery {
+                subquery: Box::new(subquery_plan),
+            })
+        }
         BoundExpr::Wildcard => {
             // Wildcard should have been expanded by the binder
             Err(SqlError::Plan(
                 "unexpected wildcard in expression".to_string(),
-            ))
-        }
-        BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } | BoundExpr::ScalarSubquery { .. } => {
-            Err(SqlError::Plan(
-                "subquery expressions not yet supported in this context".to_string(),
             ))
         }
     }
@@ -961,6 +1004,25 @@ fn build_post_agg_projection(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build a plan node for a table reference (either a real table scan or a derived table subquery).
+fn build_table_ref_plan(
+    catalog: &Catalog,
+    table_ref: &crate::binder::BoundTableRef,
+) -> Result<LogicalPlan> {
+    if let Some(subquery) = &table_ref.subquery {
+        // Derived table: plan the subquery
+        plan_select(catalog, subquery)
+    } else {
+        // Regular table scan
+        let schema = build_scan_schema(catalog, &table_ref.table_name)?;
+        Ok(LogicalPlan::Scan {
+            table_id: table_ref.table_id,
+            table_name: table_ref.table_name.clone(),
+            schema,
+        })
+    }
+}
 
 /// Build a PlanSchema for a table scan from the catalog.
 fn build_scan_schema(catalog: &Catalog, table_name: &str) -> Result<PlanSchema> {

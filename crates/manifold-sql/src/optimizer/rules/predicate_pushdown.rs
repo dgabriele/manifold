@@ -176,8 +176,12 @@ fn push_filter(predicate: ScalarExpr, input: LogicalPlan) -> Result<LogicalPlan>
             input: proj_input,
         } => {
             if predicate_uses_only_passthrough_columns(&predicate, &expressions) {
-                // Safe to push below the project
-                let new_input = push_filter(predicate, *proj_input)?;
+                // Remap column refs through the project: if the predicate
+                // references output col#i and proj_exprs[i] is ColumnRef { index: j },
+                // replace col#i with col#j so the predicate works against the
+                // project's input rather than its output.
+                let remapped = remap_through_project(predicate, &expressions);
+                let new_input = push_filter(remapped, *proj_input)?;
                 Ok(LogicalPlan::Project {
                     expressions,
                     aliases,
@@ -329,6 +333,85 @@ fn collect_column_refs(expr: &ScalarExpr, out: &mut Vec<usize>) {
             }
         }
         ScalarExpr::Cast { expr, .. } => collect_column_refs(expr, out),
+        // Subqueries have their own scope; treat as opaque (no outer column refs to collect).
+        ScalarExpr::InSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::ScalarSubquery { .. } => {}
+    }
+}
+
+/// Remap column references in a predicate through a Project's expressions.
+///
+/// When pushing `Filter(col#i < 30)` below `Project([col#j, col#k])`,
+/// we need to replace `col#i` with the input column that the Project maps
+/// it to. For passthrough columns where `proj_exprs[i] = ColumnRef { index: j }`,
+/// we replace `col#i` with `col#j`.
+fn remap_through_project(expr: ScalarExpr, proj_exprs: &[ScalarExpr]) -> ScalarExpr {
+    match expr {
+        ScalarExpr::ColumnRef { index } => {
+            if let Some(ScalarExpr::ColumnRef { index: mapped }) = proj_exprs.get(index) {
+                ScalarExpr::ColumnRef { index: *mapped }
+            } else {
+                ScalarExpr::ColumnRef { index }
+            }
+        }
+        ScalarExpr::BinaryOp { op, left, right } => ScalarExpr::BinaryOp {
+            op,
+            left: Box::new(remap_through_project(*left, proj_exprs)),
+            right: Box::new(remap_through_project(*right, proj_exprs)),
+        },
+        ScalarExpr::UnaryOp { op, operand } => ScalarExpr::UnaryOp {
+            op,
+            operand: Box::new(remap_through_project(*operand, proj_exprs)),
+        },
+        ScalarExpr::IsNull { operand, negated } => ScalarExpr::IsNull {
+            operand: Box::new(remap_through_project(*operand, proj_exprs)),
+            negated,
+        },
+        ScalarExpr::InList {
+            expr,
+            list,
+            negated,
+        } => ScalarExpr::InList {
+            expr: Box::new(remap_through_project(*expr, proj_exprs)),
+            list: list
+                .into_iter()
+                .map(|e| remap_through_project(e, proj_exprs))
+                .collect(),
+            negated,
+        },
+        ScalarExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => ScalarExpr::Between {
+            expr: Box::new(remap_through_project(*expr, proj_exprs)),
+            low: Box::new(remap_through_project(*low, proj_exprs)),
+            high: Box::new(remap_through_project(*high, proj_exprs)),
+            negated,
+        },
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => ScalarExpr::Like {
+            expr: Box::new(remap_through_project(*expr, proj_exprs)),
+            pattern: Box::new(remap_through_project(*pattern, proj_exprs)),
+            negated,
+        },
+        ScalarExpr::Function { name, args } => ScalarExpr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|e| remap_through_project(e, proj_exprs))
+                .collect(),
+        },
+        ScalarExpr::Cast { expr, target_type } => ScalarExpr::Cast {
+            expr: Box::new(remap_through_project(*expr, proj_exprs)),
+            target_type,
+        },
+        other => other,
     }
 }
 

@@ -74,6 +74,8 @@ pub fn execute_query(
     params: &[Value],
 ) -> Result<ResultSet> {
     let read_txn = db.begin_read()?;
+    // Resolve subquery expressions before building the executor tree.
+    let plan = subquery::resolve_subqueries_read(plan, &read_txn, catalog, params)?;
     let mut executor = build_read_query_executor(&read_txn, catalog, &plan, params)?;
     collect_result_set(&mut *executor, &plan)
 }
@@ -95,6 +97,8 @@ pub fn query_in_txn(
     plan: LogicalPlan,
     params: &[Value],
 ) -> Result<ResultSet> {
+    // Resolve subquery expressions before building the executor tree.
+    let plan = subquery::resolve_subqueries_write(plan, txn, catalog, params)?;
     let mut executor = build_write_query_executor(txn, catalog, &plan, params)?;
     collect_result_set(&mut *executor, &plan)
 }
@@ -534,6 +538,24 @@ fn shift_column_refs(expr: &ScalarExpr, offset: usize) -> ScalarExpr {
         ScalarExpr::Cast { expr, target_type } => ScalarExpr::Cast {
             expr: Box::new(shift_column_refs(expr, offset)),
             target_type: target_type.clone(),
+        },
+        // Subquery expressions: shift outer expr refs but leave subquery plan as-is
+        // (the subquery has its own independent column namespace).
+        ScalarExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => ScalarExpr::InSubquery {
+            expr: Box::new(shift_column_refs(expr, offset)),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        ScalarExpr::Exists { subquery, negated } => ScalarExpr::Exists {
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        ScalarExpr::ScalarSubquery { subquery } => ScalarExpr::ScalarSubquery {
+            subquery: subquery.clone(),
         },
     }
 }

@@ -5,7 +5,7 @@ use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
 use crate::types::{SqlType, Value};
 
-use super::{AggregateFunc, BinaryOp, BoundExpr, BoundSelect, ColumnRef, UnaryOp};
+use super::{AggregateFunc, BinaryOp, BoundExpr, ColumnRef, UnaryOp};
 
 // ---------------------------------------------------------------------------
 // Scope — tracks tables and columns visible in the current query context
@@ -169,6 +169,36 @@ impl Scope {
             }
         }
         cols
+    }
+
+    /// Add a derived table (subquery in FROM) to this scope.
+    /// Takes the alias and a list of (column_name, sql_type, nullable) tuples.
+    /// Returns a scope-unique table ID.
+    pub fn add_derived_table(
+        &mut self,
+        alias: &str,
+        columns: &[(String, SqlType, bool)],
+    ) -> TableId {
+        let scope_id = self.next_scope_id;
+        self.next_scope_id += 1;
+
+        let scope_columns: Vec<ScopeColumn> = columns
+            .iter()
+            .map(|(name, sql_type, nullable)| ScopeColumn {
+                name: name.clone(),
+                sql_type: sql_type.clone(),
+                nullable: *nullable,
+            })
+            .collect();
+
+        self.tables.push(ScopeTable {
+            table_id: scope_id,
+            table_name: alias.to_string(),
+            alias: Some(alias.to_string()),
+            columns: scope_columns,
+        });
+
+        scope_id
     }
 
     /// Return all columns from a specific table (qualified wildcard, e.g. `t.*`).
@@ -726,13 +756,15 @@ fn expr_type(expr: &BoundExpr) -> Option<SqlType> {
         BoundExpr::Function { result_type, .. } => Some(result_type.clone()),
         BoundExpr::Aggregate { result_type, .. } => Some(result_type.clone()),
         BoundExpr::Cast { target_type, .. } => Some(target_type.clone()),
-        BoundExpr::InSubquery { .. } => Some(SqlType::Boolean),
-        BoundExpr::Exists { .. } => Some(SqlType::Boolean),
-        BoundExpr::ScalarSubquery { .. } => None,
-        BoundExpr::Wildcard => None,
         BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => Some(SqlType::Boolean),
         BoundExpr::ScalarSubquery { .. } => None,
+        BoundExpr::Wildcard => None,
     }
+}
+
+/// Public accessor for the inferred type of a BoundExpr.
+pub fn bound_expr_sql_type(expr: &BoundExpr) -> SqlType {
+    expr_type(expr).unwrap_or(SqlType::Text)
 }
 
 fn infer_binary_type(op: &BinaryOp, left: &BoundExpr, right: &BoundExpr) -> SqlType {
