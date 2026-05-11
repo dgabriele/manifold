@@ -148,21 +148,19 @@ fn print_workload_table(name: &str, results: &[WorkloadResult]) {
 fn open_manifold_cf(
     dir: &std::path::Path,
     with_wal: bool,
+    deferred: bool,
 ) -> (TempDir, Arc<manifold::column_family::ColumnFamilyDatabase>) {
     use manifold::column_family::ColumnFamilyDatabase;
 
     let tmpdir = TempDir::new_in(dir).unwrap();
-    let db = if with_wal {
-        ColumnFamilyDatabase::builder()
-            .pool_size(64)
-            .open(tmpdir.path().join("db"))
-            .unwrap()
-    } else {
-        ColumnFamilyDatabase::builder()
-            .without_wal()
-            .open(tmpdir.path().join("db"))
-            .unwrap()
-    };
+    let mut builder = ColumnFamilyDatabase::builder();
+    if !with_wal {
+        builder = builder.without_wal();
+    }
+    if deferred {
+        builder = builder.deferred_flush(true);
+    }
+    let db = builder.open(tmpdir.path().join("db")).unwrap();
     db.create_column_family("default", None).unwrap();
     (tmpdir, Arc::new(db))
 }
@@ -238,14 +236,14 @@ fn bench_sequential_write(dir: &std::path::Path, n: u64) -> WorkloadResult {
     const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 
     // Manifold
-    let (_tmp, db) = open_manifold_cf(dir, true);
+    let (_tmp, db) = open_manifold_cf(dir, true, true);
     let cf = manifold_cf(&db, "default");
     let start = Instant::now();
     for batch_start in (0..n).step_by(BATCH_SIZE) {
         let txn = cf.begin_write().unwrap();
         let mut t = txn.open_table(TABLE).unwrap();
         for i in batch_start..std::cmp::min(batch_start + BATCH_SIZE as u64, n) {
-            t.insert_buffered(&i, make_value(i).as_slice()).unwrap();
+            t.insert(&i, make_value(i).as_slice()).unwrap();
         }
         drop(t);
         txn.commit().unwrap();
@@ -287,14 +285,14 @@ fn bench_random_write(dir: &std::path::Path, n: u64) -> WorkloadResult {
     let keys = shuffled_keys(n, RNG_SEED);
 
     // Manifold
-    let (_tmp, db) = open_manifold_cf(dir, true);
+    let (_tmp, db) = open_manifold_cf(dir, true, true);
     let cf = manifold_cf(&db, "default");
     let start = Instant::now();
     for batch in keys.chunks(BATCH_SIZE) {
         let txn = cf.begin_write().unwrap();
         let mut t = txn.open_table(TABLE).unwrap();
         for &k in batch {
-            t.insert_buffered(&k, make_value(k).as_slice()).unwrap();
+            t.insert(&k, make_value(k).as_slice()).unwrap();
         }
         drop(t);
         txn.commit().unwrap();
@@ -334,7 +332,7 @@ fn bench_point_read_uniform(dir: &std::path::Path, n: u64) -> WorkloadResult {
     const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 
     // --- Populate Manifold ---
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true);
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..n).step_by(BATCH_SIZE) {
@@ -400,7 +398,7 @@ fn bench_point_read_zipfian(dir: &std::path::Path, n: u64) -> WorkloadResult {
     const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 
     // Populate both
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true);
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..n).step_by(BATCH_SIZE) {
@@ -464,7 +462,7 @@ fn bench_range_scan(dir: &std::path::Path, n: u64) -> WorkloadResult {
     const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 
     // Populate both
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true);
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..n).step_by(BATCH_SIZE) {
@@ -547,7 +545,7 @@ fn bench_mixed_50_50(dir: &std::path::Path, n: u64) -> WorkloadResult {
     let prepopulate = n / 2;
 
     // Populate Manifold
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true);
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..prepopulate).step_by(BATCH_SIZE) {
@@ -600,7 +598,7 @@ fn bench_mixed_50_50(dir: &std::path::Path, n: u64) -> WorkloadResult {
                             let k = prepopulate + counter;
                             let txn = cf.begin_write().unwrap();
                             let mut t = txn.open_table(TABLE).unwrap();
-                            let _ = t.insert_buffered(&k, make_value(k).as_slice());
+                            let _ = t.insert(&k, make_value(k).as_slice());
                             drop(t);
                             let _ = txn.commit();
                         }
@@ -680,7 +678,7 @@ fn bench_durable_write(dir: &std::path::Path, n: u64) -> WorkloadResult {
     let durable_batch = 100usize;
 
     // Manifold with WAL (durable)
-    let (_tmp, db) = open_manifold_cf(dir, true);
+    let (_tmp, db) = open_manifold_cf(dir, true, true);
     let cf = manifold_cf(&db, "default");
     let start = Instant::now();
     for batch_start in (0..n).step_by(durable_batch) {
@@ -688,7 +686,7 @@ fn bench_durable_write(dir: &std::path::Path, n: u64) -> WorkloadResult {
         txn.set_durability(Durability::Immediate).unwrap();
         let mut t = txn.open_table(TABLE).unwrap();
         for i in batch_start..std::cmp::min(batch_start + durable_batch as u64, n) {
-            t.insert_buffered(&i, make_value(i).as_slice()).unwrap();
+            t.insert(&i, make_value(i).as_slice()).unwrap();
         }
         drop(t);
         txn.commit().unwrap();
@@ -737,7 +735,7 @@ fn bench_concurrent_cf(dir: &std::path::Path, n: u64) -> WorkloadResult {
     let total_ops = per_cf * NUM_CFS as u64;
 
     // Manifold with independent CFs
-    let (_tmp, db) = open_manifold_cf(dir, true);
+    let (_tmp, db) = open_manifold_cf(dir, true, true);
     for i in 1..NUM_CFS {
         db.create_column_family(&format!("cf_{}", i), None).unwrap();
     }
@@ -758,7 +756,7 @@ fn bench_concurrent_cf(dir: &std::path::Path, n: u64) -> WorkloadResult {
                     let mut t = txn.open_table(TABLE).unwrap();
                     for i in batch_start..std::cmp::min(batch_start + BATCH_SIZE as u64, per_cf) {
                         let key = cf_id as u64 * per_cf + i;
-                        t.insert_buffered(&key, make_value(key).as_slice()).unwrap();
+                        t.insert(&key, make_value(key).as_slice()).unwrap();
                     }
                     drop(t);
                     txn.commit().unwrap();
