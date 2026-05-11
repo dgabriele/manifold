@@ -33,7 +33,7 @@ const BATCH_SIZE: usize = 1000;
 const RNG_SEED: u64 = 42;
 const CACHE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
-const SCALES: &[u64] = &[100_000, 500_000, 1_000_000, 5_000_000, 10_000_000];
+const SCALES: &[u64] = &[100_000, 500_000, 1_000_000, 2_000_000];
 
 // For workloads that are time-bounded (mixed), duration in seconds
 const MIXED_DURATION_SECS: u64 = 5;
