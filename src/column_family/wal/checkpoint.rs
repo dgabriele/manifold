@@ -289,11 +289,11 @@ impl CheckpointManager {
 
         // Clear memtable entries that were just flushed to the B-tree
         for cf_name in database.list_column_families() {
-            if let Ok(cf) = database.column_family(&cf_name) {
-                if let Some(memtable) = cf.memtable() {
-                    let mut mem = memtable.write().unwrap();
-                    mem.drain();
-                }
+            if let Ok(cf) = database.column_family(&cf_name)
+                && let Some(memtable) = cf.memtable()
+            {
+                let mut mem = memtable.write().unwrap();
+                mem.drain();
             }
         }
 

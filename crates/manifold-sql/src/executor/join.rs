@@ -36,6 +36,7 @@ pub struct NestedLoopJoin {
 }
 
 impl NestedLoopJoin {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         left: Box<dyn super::Executor>,
         mut right: Box<dyn super::Executor>,

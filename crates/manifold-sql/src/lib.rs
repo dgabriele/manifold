@@ -57,6 +57,7 @@ impl Row {
 
 /// Trait for extracting a typed value from a `Value`.
 pub trait FromValue: Sized {
+    /// Convert a SQL `Value` into `Self`, returning an error on type mismatch.
     fn from_value(value: &Value) -> Result<Self>;
 }
 
@@ -449,10 +450,8 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if !self.finished {
-            if let Some(txn) = self.txn.take() {
-                let _ = txn.abort();
-            }
+        if !self.finished && let Some(txn) = self.txn.take() {
+            let _ = txn.abort();
         }
     }
 }

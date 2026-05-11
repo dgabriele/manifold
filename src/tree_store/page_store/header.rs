@@ -147,6 +147,7 @@ impl UnrepairedDatabaseHeader {
         })
     }
 
+    #[allow(dead_code)]
     pub(super) fn page_size(&self) -> u32 {
         self.inner.page_size
     }

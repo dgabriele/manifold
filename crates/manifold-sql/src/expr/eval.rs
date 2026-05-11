@@ -125,7 +125,7 @@ fn apply_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<Value> {
                 (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(*l && *r)),
-                _ => Err(SqlError::TypeError(format!("AND requires boolean operands"))),
+                _ => Err(SqlError::TypeError("AND requires boolean operands".to_string())),
             };
         }
         BinaryOp::Or => {
@@ -133,7 +133,7 @@ fn apply_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<Value> {
                 (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(*l || *r)),
-                _ => Err(SqlError::TypeError(format!("OR requires boolean operands"))),
+                _ => Err(SqlError::TypeError("OR requires boolean operands".to_string())),
             };
         }
         _ => {}

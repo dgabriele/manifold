@@ -97,16 +97,11 @@ pub enum ConstraintDef {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum ForeignKeyAction {
+    #[default]
     Restrict,
     Cascade,
     SetNull,
     NoAction,
-}
-
-impl Default for ForeignKeyAction {
-    fn default() -> Self {
-        ForeignKeyAction::Restrict
-    }
 }

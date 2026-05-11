@@ -23,21 +23,19 @@ fn select_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
                 ref table_name,
                 ref schema,
             } = input
-            {
-                if let Some(index_name) =
+                && let Some(index_name) =
                     find_index_for_predicate(&predicate, table_id, table_name, catalog)
-                {
-                    let index_scan = LogicalPlan::IndexScan {
-                        table_id,
-                        table_name: table_name.clone(),
-                        index_name,
-                        schema: schema.clone(),
-                    };
-                    return Ok(LogicalPlan::Filter {
-                        predicate,
-                        input: Box::new(index_scan),
-                    });
-                }
+            {
+                let index_scan = LogicalPlan::IndexScan {
+                    table_id,
+                    table_name: table_name.clone(),
+                    index_name,
+                    schema: schema.clone(),
+                };
+                return Ok(LogicalPlan::Filter {
+                    predicate,
+                    input: Box::new(index_scan),
+                });
             }
             Ok(LogicalPlan::Filter {
                 predicate,

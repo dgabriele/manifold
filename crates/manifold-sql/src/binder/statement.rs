@@ -151,17 +151,17 @@ fn bind_query(
     let mut select = bind_query_body(catalog, &query.body, params)?;
 
     // ORDER BY
-    if let Some(order_by) = &query.order_by {
-        if let ast::OrderByKind::Expressions(exprs) = &order_by.kind {
-            let scope = build_select_scope(catalog, &select)?;
-            for ob in exprs {
-                let bound_expr = bind_expr(&scope, &ob.expr, params)?;
-                select.order_by.push(BoundOrderBy {
-                    expr: bound_expr,
-                    asc: ob.options.asc.unwrap_or(true),
-                    nulls_first: ob.options.nulls_first,
-                });
-            }
+    if let Some(order_by) = &query.order_by
+        && let ast::OrderByKind::Expressions(exprs) = &order_by.kind
+    {
+        let scope = build_select_scope(catalog, &select)?;
+        for ob in exprs {
+            let bound_expr = bind_expr(&scope, &ob.expr, params)?;
+            select.order_by.push(BoundOrderBy {
+                expr: bound_expr,
+                asc: ob.options.asc.unwrap_or(true),
+                nulls_first: ob.options.nulls_first,
+            });
         }
     }
 
@@ -177,7 +177,7 @@ fn bind_query(
         select.offset = Some(bind_expr(&scope, &offset.value, params)?);
     }
 
-    Ok(BoundStatement::Select(select))
+    Ok(BoundStatement::Select(Box::new(select)))
 }
 
 fn bind_query_body(
@@ -191,7 +191,7 @@ fn bind_query_body(
             // Nested query — just recurse
             let stmt = bind_query(catalog, q, params)?;
             match stmt {
-                BoundStatement::Select(s) => Ok(s),
+                BoundStatement::Select(s) => Ok(*s),
                 _ => Err(SqlError::Bind("expected SELECT in subquery".to_string())),
             }
         }
@@ -473,7 +473,7 @@ fn bind_insert(
                 _ => {
                     // INSERT ... SELECT
                     let select = bind_query_body(catalog, &query.body, params)?;
-                    InsertSource::Select(select)
+                    InsertSource::Select(Box::new(select))
                 }
             }
         }

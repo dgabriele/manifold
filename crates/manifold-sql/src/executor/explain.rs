@@ -45,7 +45,7 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
             } else {
                 expressions
                     .iter()
-                    .map(|e| format_expr_brief(e))
+                    .map(format_expr_brief)
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -123,7 +123,7 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
         } => {
             let cnt = count
                 .as_ref()
-                .map(|e| format_expr_brief(e))
+                .map(format_expr_brief)
                 .unwrap_or_else(|| "ALL".to_string());
             let off = offset
                 .as_ref()

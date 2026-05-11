@@ -100,11 +100,11 @@ pub fn load_catalog(txn: &manifold::ReadTransaction) -> Result<Catalog> {
             // Find the matching table and update its next_rowid.
             // We need to iterate table names to find the right one.
             for name in catalog.table_names() {
-                if let Some(schema) = catalog.get_table_mut(&name) {
-                    if schema.id == table_id {
-                        schema.next_rowid = next_rowid;
-                        break;
-                    }
+                if let Some(schema) = catalog.get_table_mut(&name)
+                    && schema.id == table_id
+                {
+                    schema.next_rowid = next_rowid;
+                    break;
                 }
             }
         }

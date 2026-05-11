@@ -185,10 +185,10 @@ fn fold_expr(expr: ScalarExpr) -> ScalarExpr {
         ScalarExpr::BinaryOp { op, left, right } => {
             let left = fold_expr(*left);
             let right = fold_expr(*right);
-            if let (ScalarExpr::Literal(lv), ScalarExpr::Literal(rv)) = (&left, &right) {
-                if let Some(result) = eval_binary(&op, lv, rv) {
-                    return ScalarExpr::Literal(result);
-                }
+            if let (ScalarExpr::Literal(lv), ScalarExpr::Literal(rv)) = (&left, &right)
+                && let Some(result) = eval_binary(&op, lv, rv)
+            {
+                return ScalarExpr::Literal(result);
             }
             ScalarExpr::BinaryOp {
                 op,
@@ -198,10 +198,10 @@ fn fold_expr(expr: ScalarExpr) -> ScalarExpr {
         }
         ScalarExpr::UnaryOp { op, operand } => {
             let operand = fold_expr(*operand);
-            if let ScalarExpr::Literal(ref v) = operand {
-                if let Some(result) = eval_unary(&op, v) {
-                    return ScalarExpr::Literal(result);
-                }
+            if let ScalarExpr::Literal(ref v) = operand
+                && let Some(result) = eval_unary(&op, v)
+            {
+                return ScalarExpr::Literal(result);
             }
             ScalarExpr::UnaryOp {
                 op,

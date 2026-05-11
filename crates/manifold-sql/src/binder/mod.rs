@@ -253,7 +253,7 @@ pub struct BoundAssignment {
 #[derive(Debug, Clone)]
 pub enum InsertSource {
     Values(Vec<Vec<BoundExpr>>),
-    Select(BoundSelect),
+    Select(Box<BoundSelect>),
 }
 
 #[derive(Debug, Clone)]
@@ -265,7 +265,7 @@ pub enum AlterTableOp {
 
 #[derive(Debug, Clone)]
 pub enum BoundStatement {
-    Select(BoundSelect),
+    Select(Box<BoundSelect>),
     Insert {
         table_id: TableId,
         table_name: String,

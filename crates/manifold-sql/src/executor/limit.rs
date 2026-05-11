@@ -39,10 +39,10 @@ impl super::Executor for Limit {
         }
 
         // Check if we've emitted enough.
-        if let Some(count) = self.count {
-            if self.emitted >= count {
-                return Ok(None);
-            }
+        if let Some(count) = self.count
+            && self.emitted >= count
+        {
+            return Ok(None);
         }
 
         match self.input.next()? {

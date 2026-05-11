@@ -1,3 +1,4 @@
+use crate::column_family::memtable::MemtableTableMap;
 use crate::db::TransactionGuard;
 use crate::sealed::Sealed;
 use crate::tree_store::{
@@ -137,7 +138,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
 
     /// Flushes all buffered writes from the in-memory overlay into the B-tree.
     ///
-    /// The overlay is drained in sorted key order (BTreeMap iteration order),
+    /// The overlay is drained in sorted key order (`BTreeMap` iteration order),
     /// applying inserts for `Some(value)` entries and removes for `None` tombstones.
     /// After flushing, the overlay is empty and `len_delta` is reset to 0.
     pub fn flush_overlay(&mut self) -> Result {
@@ -674,7 +675,9 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for Table<'_, K
 
     fn len(&self) -> Result<u64> {
         let base_len = self.tree.len()?;
-        Ok((base_len as i64 + self.len_delta) as u64)
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        let result = (base_len as i64 + self.len_delta) as u64;
+        Ok(result)
     }
 }
 
@@ -720,13 +723,11 @@ impl<K: Key, V: Value> Sealed for Table<'_, K, V> {}
 
 impl<K: Key + 'static, V: Value + 'static> Drop for Table<'_, K, V> {
     fn drop(&mut self) {
-        if !self.transaction.is_deferred_flush() && !self.overlay.is_empty() {
-            if let Err(e) = self.flush_overlay() {
-                eprintln!(
-                    "[MANIFOLD] Warning: flush_overlay failed during Table drop: {}",
-                    e
-                );
-            }
+        if !self.transaction.is_deferred_flush()
+            && !self.overlay.is_empty()
+            && let Err(e) = self.flush_overlay()
+        {
+            eprintln!("[MANIFOLD] Warning: flush_overlay failed during Table drop: {e}");
         }
         self.transaction.close_table(
             &self.name,
@@ -965,7 +966,7 @@ pub struct ReadOnlyTable<K: Key + 'static, V: Value + 'static> {
     name: String,
     tree: Btree<K, V>,
     transaction_guard: Arc<TransactionGuard>,
-    memtable: Option<Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>>,
+    memtable: Option<MemtableTableMap>,
 }
 
 impl<K: Key + 'static, V: Value + 'static> TableHandle for ReadOnlyTable<K, V> {
@@ -981,7 +982,7 @@ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
         hint: PageHint,
         guard: Arc<TransactionGuard>,
         mem: PageResolver,
-        memtable: Option<Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>>,
+        memtable: Option<MemtableTableMap>,
     ) -> Result<ReadOnlyTable<K, V>> {
         Ok(ReadOnlyTable {
             name,

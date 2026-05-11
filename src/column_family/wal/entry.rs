@@ -425,15 +425,15 @@ impl WALLogicalOpsPayload {
     ///
     /// Format:
     /// - `name_len`: u16 (2 bytes)
-    /// - `name_bytes`: [u8; name_len] (variable)
+    /// - `name_bytes`: [u8; `name_len`] (variable)
     /// - `op_count`: u32 (4 bytes)
     /// - for each op:
     ///   - `key_len`: u32 (4 bytes)
-    ///   - `key`: [u8; key_len] (variable)
+    ///   - `key`: [u8; `key_len`] (variable)
     ///   - `has_value`: u8 (0 = delete, 1 = insert/update)
-    ///   - if has_value:
+    ///   - if `has_value`:
     ///     - `value_len`: u32 (4 bytes)
-    ///     - `value`: [u8; value_len] (variable)
+    ///     - `value`: [u8; `value_len`] (variable)
     fn serialize_into(&self, buf: &mut Vec<u8>) {
         // Table name
         let name_bytes = self.table_name.as_bytes();

@@ -27,7 +27,7 @@ pub fn encode_row(types: &[SqlType], values: &[Value]) -> Result<Vec<u8>> {
     }
 
     let col_count = types.len();
-    let bitmap_len = (col_count + 7) / 8;
+    let bitmap_len = col_count.div_ceil(8);
 
     // Build null bitmap.
     let mut bitmap = vec![0u8; bitmap_len];
@@ -86,13 +86,7 @@ pub fn encode_row(types: &[SqlType], values: &[Value]) -> Result<Vec<u8>> {
 /// Decode all columns from a binary-encoded row.
 pub fn decode_row(types: &[SqlType], data: &[u8]) -> Result<Vec<Value>> {
     if data.len() < 2 {
-        if types.is_empty() && data.len() == 2 {
-            // handled below
-        } else if types.is_empty() && data.len() >= 2 {
-            // handled below
-        } else {
-            return Err(SqlError::Internal("row data too short".into()));
-        }
+        return Err(SqlError::Internal("row data too short".into()));
     }
 
     let col_count = u16::from_le_bytes([data[0], data[1]]) as usize;
@@ -129,7 +123,7 @@ pub fn decode_column(types: &[SqlType], data: &[u8], col_index: usize) -> Result
         )));
     }
 
-    let bitmap_len = (col_count + 7) / 8;
+    let bitmap_len = col_count.div_ceil(8);
 
     // Check null bitmap.
     let bitmap_byte = data[2 + col_index / 8];

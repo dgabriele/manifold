@@ -226,7 +226,7 @@ fn build_read_query_executor(
                 aggregates
                     .iter()
                     .map(|ae| crate::planner::plan::AggregateExpr {
-                        func: ae.func.clone(),
+                        func: ae.func,
                         arg: ae.arg.as_ref().map(|a| shift_column_refs(a, 1)),
                         distinct: ae.distinct,
                         result_type: ae.result_type.clone(),
@@ -383,7 +383,7 @@ fn build_write_query_executor(
                 aggregates
                     .iter()
                     .map(|ae| crate::planner::plan::AggregateExpr {
-                        func: ae.func.clone(),
+                        func: ae.func,
                         arg: ae.arg.as_ref().map(|a| shift_column_refs(a, 1)),
                         distinct: ae.distinct,
                         result_type: ae.result_type.clone(),
@@ -1197,20 +1197,18 @@ fn execute_insert(
 
         // Apply defaults for NULL columns that have defaults.
         for (i, col) in schema.columns.iter().enumerate() {
-            if full_row[i].is_null() {
-                if let Some(default) = &col.default {
-                    full_row[i] = match default {
-                        crate::catalog::schema::DefaultValue::Literal(v) => v.clone(),
-                        crate::catalog::schema::DefaultValue::Null => Value::Null,
-                        crate::catalog::schema::DefaultValue::CurrentTimestamp => {
-                            // chrono's `now` requires the "clock" feature; use Null as fallback.
-                            Value::Null
-                        }
-                        crate::catalog::schema::DefaultValue::CurrentDate => {
-                            Value::Null
-                        }
-                    };
-                }
+            if full_row[i].is_null()
+                && let Some(default) = &col.default
+            {
+                full_row[i] = match default {
+                    crate::catalog::schema::DefaultValue::Literal(v) => v.clone(),
+                    crate::catalog::schema::DefaultValue::Null => Value::Null,
+                    crate::catalog::schema::DefaultValue::CurrentTimestamp => {
+                        // chrono's `now` requires the "clock" feature; use Null as fallback.
+                        Value::Null
+                    }
+                    crate::catalog::schema::DefaultValue::CurrentDate => Value::Null,
+                };
             }
         }
 
@@ -1396,13 +1394,13 @@ fn check_insert_constraints(
 ) -> Result<()> {
     // 1. NOT NULL constraints (explicit ConstraintDef).
     for constraint in &schema.constraints {
-        if let ConstraintDef::NotNull { column, name, .. } = constraint {
-            if row[*column].is_null() {
-                return Err(SqlError::ConstraintViolation(format!(
-                    "NOT NULL constraint '{name}' violated on column '{}'",
-                    schema.columns[*column].name
-                )));
-            }
+        if let ConstraintDef::NotNull { column, name, .. } = constraint
+            && row[*column].is_null()
+        {
+            return Err(SqlError::ConstraintViolation(format!(
+                "NOT NULL constraint '{name}' violated on column '{}'",
+                schema.columns[*column].name
+            )));
         }
     }
 
@@ -1428,15 +1426,14 @@ fn check_insert_constraints(
 
     // 4. VARCHAR length check.
     for (i, col) in schema.columns.iter().enumerate() {
-        if let SqlType::Varchar(max_len) = &col.sql_type {
-            if let Value::Text(s) = &row[i] {
-                if s.len() > *max_len as usize {
-                    return Err(SqlError::ConstraintViolation(format!(
-                        "value for column '{}' exceeds VARCHAR({}) limit (got {} chars)",
-                        col.name, max_len, s.len()
-                    )));
-                }
-            }
+        if let SqlType::Varchar(max_len) = &col.sql_type
+            && let Value::Text(s) = &row[i]
+            && s.len() > *max_len as usize
+        {
+            return Err(SqlError::ConstraintViolation(format!(
+                "value for column '{}' exceeds VARCHAR({}) limit (got {} chars)",
+                col.name, max_len, s.len()
+            )));
         }
     }
 
@@ -1458,6 +1455,7 @@ fn check_insert_constraints(
 }
 
 /// Verify that the referenced parent row exists for a FK constraint.
+#[allow(clippy::too_many_arguments)]
 fn check_fk_parent_exists(
     txn: &manifold::WriteTransaction,
     catalog: &Catalog,
@@ -1830,13 +1828,12 @@ fn update_indexes_insert(
             if let Some(existing) = idx_table
                 .get(key_bytes.as_slice())
                 .map_err(SqlError::Storage)?
+                && existing.value() != rowid
             {
-                if existing.value() != rowid {
-                    return Err(SqlError::ConstraintViolation(format!(
-                        "duplicate key in unique index '{}'",
-                        index.name
-                    )));
-                }
+                return Err(SqlError::ConstraintViolation(format!(
+                    "duplicate key in unique index '{}'",
+                    index.name
+                )));
             }
 
             idx_table.insert(key_bytes.as_slice(), rowid)?;

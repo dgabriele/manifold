@@ -41,11 +41,12 @@ impl Memtable {
         self.sequence.fetch_add(1, Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn size_bytes(&self) -> usize {
         self.tables.values().map(|t| t.size_bytes).sum()
     }
 
-    /// Creates an immutable snapshot by cloning each table's BTreeMap into an Arc.
+    /// Creates an immutable snapshot by cloning each table's `BTreeMap` into an `Arc`.
     pub(crate) fn snapshot(&self) -> MemtableSnapshot {
         let tables = self
             .tables
@@ -61,10 +62,13 @@ impl Memtable {
     }
 }
 
+/// Inner table map type for a memtable snapshot entry.
+pub(crate) type MemtableTableMap = Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>;
+
 /// Immutable snapshot of memtable state, held by read transactions.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemtableSnapshot {
-    pub(crate) tables: BTreeMap<String, Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>>,
+    pub(crate) tables: BTreeMap<String, MemtableTableMap>,
 }
 
 /// Shared handle to a column family's memtable.

@@ -215,7 +215,7 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
 
     // 4. Check if we need aggregation (GROUP BY or aggregate functions in projection/having)
     let has_aggregates = select.projection.iter().any(|item| has_aggregate(&item.expr))
-        || select.having.as_ref().map_or(false, |h| has_aggregate(h))
+        || select.having.as_ref().is_some_and(has_aggregate)
         || !select.group_by.is_empty();
 
     if has_aggregates {
@@ -637,12 +637,11 @@ fn lower_post_agg_expr(
         BoundExpr::Column(col_ref) => {
             // Check if this column is one of the group-by expressions
             for (i, gb) in group_by.iter().enumerate() {
-                if let BoundExpr::Column(gb_col) = gb {
-                    if gb_col.table_id == col_ref.table_id
-                        && gb_col.column_index == col_ref.column_index
-                    {
-                        return Ok(ScalarExpr::ColumnRef { index: i });
-                    }
+                if let BoundExpr::Column(gb_col) = gb
+                    && gb_col.table_id == col_ref.table_id
+                    && gb_col.column_index == col_ref.column_index
+                {
+                    return Ok(ScalarExpr::ColumnRef { index: i });
                 }
             }
             // Not in group by — this would be an error in strict SQL, but we
@@ -794,12 +793,11 @@ fn lower_order_by_expr(
     if let BoundExpr::Column(col_ref) = expr {
         // Try to find this column in the projection
         for (i, item) in projection.iter().enumerate() {
-            if let BoundExpr::Column(proj_col) = &item.expr {
-                if proj_col.table_id == col_ref.table_id
-                    && proj_col.column_index == col_ref.column_index
-                {
-                    return Ok(ScalarExpr::ColumnRef { index: i });
-                }
+            if let BoundExpr::Column(proj_col) = &item.expr
+                && proj_col.table_id == col_ref.table_id
+                && proj_col.column_index == col_ref.column_index
+            {
+                return Ok(ScalarExpr::ColumnRef { index: i });
             }
         }
     }

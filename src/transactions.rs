@@ -853,6 +853,7 @@ impl SavepointTransactionState {
 /// A read/write transaction
 ///
 /// Only a single [`WriteTransaction`] may exist at a time
+#[allow(clippy::struct_excessive_bools)]
 pub struct WriteTransaction {
     transaction_tracker: Arc<TransactionTracker>,
     mem: Arc<TransactionalMemory>,
@@ -1727,7 +1728,7 @@ impl WriteTransaction {
     }
 
     /// Deferred flush commit path: skip B-tree mutation entirely.
-    /// Appends LogicalOps to WAL and merges into the shared memtable.
+    /// Appends `LogicalOps` to WAL and merges into the shared memtable.
     fn commit_inner_deferred(&mut self) -> Result<(), CommitError> {
         use crate::column_family::wal::entry::{WALEntry, WALOp};
 
