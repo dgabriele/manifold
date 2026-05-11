@@ -1,3 +1,4 @@
+pub mod persist;
 pub mod schema;
 
 use std::collections::HashMap;
