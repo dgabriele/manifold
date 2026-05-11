@@ -20,6 +20,7 @@ members = [
     "crates/manifold-vectors",
     "crates/manifold-graph",
     "crates/manifold-timeseries", "crates/manifold-properties",
+    "crates/manifold-sql",
 ]
 default-members = [".", "crates/manifold-derive"]
 

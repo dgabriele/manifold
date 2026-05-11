@@ -1,0 +1,18 @@
+[package]
+name = "manifold-sql"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+manifold = { path = "../..", package = "manifold-db" }
+sqlparser = { version = "0.55", features = ["visitor"] }
+rust_decimal = { version = "1.37", features = ["serde-with-str"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+uuid = { version = "1.17", features = ["v4", "serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.5"
+rand = "0.9"
