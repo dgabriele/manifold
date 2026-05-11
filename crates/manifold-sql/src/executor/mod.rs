@@ -66,17 +66,15 @@ pub fn execute_mut(
     Ok(result)
 }
 
-/// Execute a query statement (SELECT). Returns a result set.
-pub fn execute_query(
-    db: &manifold::Database,
+/// Execute a query with an already-opened read transaction.
+pub fn execute_query_with_read_txn(
+    read_txn: &manifold::ReadTransaction,
     catalog: &Catalog,
     plan: LogicalPlan,
     params: &[Value],
 ) -> Result<ResultSet> {
-    let read_txn = db.begin_read()?;
-    // Resolve subquery expressions before building the executor tree.
-    let plan = subquery::resolve_subqueries_read(plan, &read_txn, catalog, params)?;
-    let mut executor = build_read_query_executor(&read_txn, catalog, &plan, params)?;
+    let plan = subquery::resolve_subqueries_read(plan, read_txn, catalog, params)?;
+    let mut executor = build_read_query_executor(read_txn, catalog, &plan, params)?;
     collect_result_set(&mut *executor, &plan)
 }
 

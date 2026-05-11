@@ -192,8 +192,14 @@ struct ActiveTransaction {
 }
 
 /// The main entry point for the SQL engine.
+///
+/// Uses Manifold's Column Family backend with WAL enabled for optimal
+/// write performance (group commit batching, sequential I/O).
 pub struct Database {
-    db: manifold::Database,
+    /// Column family database (WAL-enabled).
+    _cf_db: manifold::column_family::ColumnFamilyDatabase,
+    /// The single column family used for all SQL data.
+    cf: manifold::column_family::ColumnFamily,
     catalog: Arc<Mutex<Catalog>>,
     /// Active SQL-level transaction started via BEGIN.
     active_txn: Mutex<Option<ActiveTransaction>>,
@@ -202,33 +208,37 @@ pub struct Database {
 impl Database {
     /// Open or create a database at the given path.
     ///
+    /// Uses WAL mode for improved write performance.
     /// Initializes system tables if the database is new, then loads the catalog.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = if path.as_ref().exists() {
-            manifold::Database::open(path)?
-        } else {
-            manifold::Database::create(path)?
-        };
+        let cf_db = manifold::column_family::ColumnFamilyDatabase::builder()
+            .pool_size(64) // WAL enabled
+            .open(path)?;
+
+        let cf = cf_db.column_family_or_create("default").map_err(|e| {
+            SqlError::Internal(format!("failed to open column family: {e}"))
+        })?;
 
         // Check if system tables exist.
         let needs_init = {
-            let read_txn = db.begin_read()?;
+            let read_txn = cf.begin_read()?;
             read_txn
                 .open_table(storage::catalog_tables::META_TABLE)
                 .is_err()
         };
 
         if needs_init {
-            let write_txn = db.begin_write()?;
+            let write_txn = cf.begin_write()?;
             catalog::persist::init_system_tables(&write_txn)?;
             write_txn.commit()?;
         }
 
-        let read_txn = db.begin_read()?;
+        let read_txn = cf.begin_read()?;
         let catalog = catalog::persist::load_catalog(&read_txn)?;
 
         Ok(Self {
-            db,
+            _cf_db: cf_db,
+            cf,
             catalog: Arc::new(Mutex::new(catalog)),
             active_txn: Mutex::new(None),
         })
@@ -257,7 +267,7 @@ impl Database {
                         "transaction already active".into(),
                     ));
                 }
-                let write_txn = self.db.begin_write()?;
+                let write_txn = self.cf.begin_write()?;
                 *active = Some(ActiveTransaction {
                     write_txn,
                     savepoints: HashMap::new(),
@@ -337,7 +347,11 @@ impl Database {
             )
         } else {
             drop(active);
-            executor::execute_mut(&self.db, &mut catalog, optimized, params)
+            // Auto-commit: start txn, execute, commit.
+            let write_txn = self.cf.begin_write()?;
+            let result = executor::execute_in_txn(&write_txn, &mut catalog, optimized, params)?;
+            write_txn.commit()?;
+            Ok(result)
         }
     }
 
@@ -360,13 +374,14 @@ impl Database {
             executor::query_in_txn(&state.write_txn, &catalog, optimized, params)
         } else {
             drop(active);
-            executor::execute_query(&self.db, &catalog, optimized, params)
+            let read_txn = self.cf.begin_read()?;
+            executor::execute_query_with_read_txn(&read_txn, &catalog, optimized, params)
         }
     }
 
     /// Begin an explicit transaction.
     pub fn begin(&self) -> Result<Transaction> {
-        let txn = self.db.begin_write()?;
+        let txn = self.cf.begin_write()?;
         Ok(Transaction {
             txn: Some(txn),
             catalog: Arc::clone(&self.catalog),
@@ -474,7 +489,10 @@ impl PreparedStatement {
             )
         } else {
             drop(active);
-            executor::execute_mut(&db.db, &mut catalog, plan, params)
+            let write_txn = db.cf.begin_write()?;
+            let result = executor::execute_in_txn(&write_txn, &mut catalog, plan, params)?;
+            write_txn.commit()?;
+            Ok(result)
         }
     }
 
@@ -493,7 +511,8 @@ impl PreparedStatement {
             executor::query_in_txn(&state.write_txn, &catalog, plan, params)
         } else {
             drop(active);
-            executor::execute_query(&db.db, &catalog, plan, params)
+            let read_txn = db.cf.begin_read()?;
+            executor::execute_query_with_read_txn(&read_txn, &catalog, plan, params)
         }
     }
 
