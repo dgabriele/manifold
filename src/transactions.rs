@@ -2589,6 +2589,7 @@ impl Drop for WriteTransaction {
 pub struct ReadTransaction {
     mem: Arc<TransactionalMemory>,
     tree: TableTree,
+    memtable_snapshot: Option<crate::column_family::memtable::MemtableSnapshot>,
 }
 
 impl ReadTransaction {
@@ -2603,7 +2604,14 @@ impl ReadTransaction {
             mem,
             tree: TableTree::new(root_page, PageHint::Clean, guard, resolver)
                 .map_err(TransactionError::Storage)?,
+            memtable_snapshot: None,
         })
+    }
+
+    /// Sets the memtable snapshot for this read transaction.
+    /// When set, table reads will check the memtable before falling through to the B-tree.
+    pub(crate) fn set_memtable_snapshot(&mut self, snapshot: crate::column_family::memtable::MemtableSnapshot) {
+        self.memtable_snapshot = Some(snapshot);
     }
 
     /// Open the given table
@@ -2616,6 +2624,10 @@ impl ReadTransaction {
             .get_table::<K, V>(definition.name(), TableType::Normal)?
             .ok_or_else(|| TableError::TableDoesNotExist(definition.name().to_string()))?;
 
+        let table_memtable = self.memtable_snapshot.as_ref()
+            .and_then(|s| s.tables.get(definition.name()))
+            .cloned();
+
         match header {
             InternalTableDefinition::Normal { table_root, .. } => Ok(ReadOnlyTable::new(
                 definition.name().to_string(),
@@ -2623,6 +2635,7 @@ impl ReadTransaction {
                 PageHint::Clean,
                 self.tree.transaction_guard().clone(),
                 PageResolver::new(self.mem.clone()),
+                table_memtable,
             )?),
             InternalTableDefinition::Multimap { .. } => unreachable!(),
         }

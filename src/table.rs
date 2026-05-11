@@ -965,6 +965,7 @@ pub struct ReadOnlyTable<K: Key + 'static, V: Value + 'static> {
     name: String,
     tree: Btree<K, V>,
     transaction_guard: Arc<TransactionGuard>,
+    memtable: Option<Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>>,
 }
 
 impl<K: Key + 'static, V: Value + 'static> TableHandle for ReadOnlyTable<K, V> {
@@ -980,11 +981,13 @@ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
         hint: PageHint,
         guard: Arc<TransactionGuard>,
         mem: PageResolver,
+        memtable: Option<Arc<BTreeMap<Vec<u8>, Option<Vec<u8>>>>>,
     ) -> Result<ReadOnlyTable<K, V>> {
         Ok(ReadOnlyTable {
             name,
             tree: Btree::new(root_page, hint, guard.clone(), mem)?,
             transaction_guard: guard,
+            memtable,
         })
     }
 
@@ -994,6 +997,18 @@ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
         &self,
         key: impl Borrow<K::SelfType<'a>>,
     ) -> Result<Option<AccessGuard<'static, V>>> {
+        // Check memtable snapshot first
+        if let Some(mem) = &self.memtable {
+            let key_bytes = K::as_bytes(key.borrow());
+            if let Some(entry) = mem.get(key_bytes.as_ref()) {
+                return match entry {
+                    Some(value_bytes) => {
+                        Ok(Some(AccessGuard::with_owned_value(value_bytes.clone())))
+                    }
+                    None => Ok(None), // tombstone
+                };
+            }
+        }
         self.tree.get(key.borrow())
     }
 
@@ -1030,6 +1045,18 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for ReadOnlyTab
 
 impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for ReadOnlyTable<K, V> {
     fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<'_, V>>> {
+        // Check memtable snapshot first
+        if let Some(mem) = &self.memtable {
+            let key_bytes = K::as_bytes(key.borrow());
+            if let Some(entry) = mem.get(key_bytes.as_ref()) {
+                return match entry {
+                    Some(value_bytes) => {
+                        Ok(Some(AccessGuard::with_owned_value(value_bytes.clone())))
+                    }
+                    None => Ok(None), // tombstone
+                };
+            }
+        }
         self.tree.get(key.borrow())
     }
 

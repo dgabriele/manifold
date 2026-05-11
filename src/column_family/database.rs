@@ -1150,9 +1150,15 @@ impl ColumnFamily {
             )))),
         })?;
 
-        // TODO(deferred-flush): txn.set_memtable_snapshot(snapshot) — added in Task 5
+        let mut txn = db.begin_read()?;
 
-        db.begin_read()
+        // Pass memtable snapshot if deferred flush is enabled
+        if let Some(memtable) = &self.memtable {
+            let snapshot = memtable.read().unwrap().snapshot();
+            txn.set_memtable_snapshot(snapshot);
+        }
+
+        Ok(txn)
     }
 
     /// Releases this column family's file handle back to the pool.
