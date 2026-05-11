@@ -169,6 +169,11 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         key: impl Borrow<K::SelfType<'k>>,
         value: impl Borrow<V::SelfType<'v>>,
     ) -> Result {
+        if self.transaction.is_deferred_flush() {
+            self.insert(key, value)?;
+            return Ok(());
+        }
+
         let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
         let value_bytes = V::as_bytes(value.borrow()).as_ref().to_vec();
 
@@ -215,6 +220,11 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         &mut self,
         key: impl Borrow<K::SelfType<'k>>,
     ) -> Result {
+        if self.transaction.is_deferred_flush() {
+            self.remove(key)?;
+            return Ok(());
+        }
+
         let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
 
         match self.overlay.get(&key_bytes) {
@@ -366,6 +376,18 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         if value_len + key_len > MAX_PAIR_LENGTH {
             return Err(StorageError::ValueTooLarge(value_len + key_len));
         }
+
+        if self.transaction.is_deferred_flush() {
+            let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
+            let value_bytes = V::as_bytes(value.borrow()).as_ref().to_vec();
+            // Push to transaction's deferred ops for WAL + memtable on commit
+            self.transaction
+                .push_deferred_op(&self.name, key_bytes.clone(), Some(value_bytes.clone()));
+            // Also insert into overlay for read-your-own-writes within this transaction
+            self.overlay.insert(key_bytes, Some(value_bytes));
+            return Ok(None);
+        }
+
         self.tree.insert(key.borrow(), value.borrow())
     }
 
@@ -376,6 +398,13 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
     ) -> Result<Option<AccessGuard<'_, V>>> {
+        if self.transaction.is_deferred_flush() {
+            let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
+            self.transaction
+                .push_deferred_op(&self.name, key_bytes.clone(), None);
+            self.overlay.insert(key_bytes, None);
+            return Ok(None);
+        }
         self.tree.remove(key.borrow())
     }
 
@@ -691,9 +720,12 @@ impl<K: Key, V: Value> Sealed for Table<'_, K, V> {}
 
 impl<K: Key + 'static, V: Value + 'static> Drop for Table<'_, K, V> {
     fn drop(&mut self) {
-        if !self.overlay.is_empty() {
+        if !self.transaction.is_deferred_flush() && !self.overlay.is_empty() {
             if let Err(e) = self.flush_overlay() {
-                eprintln!("Warning: failed to flush write buffer overlay on Table drop: {e}");
+                eprintln!(
+                    "[MANIFOLD] Warning: flush_overlay failed during Table drop: {}",
+                    e
+                );
             }
         }
         self.transaction.close_table(

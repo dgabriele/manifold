@@ -1131,7 +1131,10 @@ impl ColumnFamily {
             );
         }
 
-        // TODO(deferred-flush): txn.set_deferred_flush_context(memtable) — added in Task 4
+        // Enable deferred flush if memtable is present (set by ColumnFamilyDatabase when deferred_flush=true)
+        if let Some(memtable) = &self.memtable {
+            txn.set_deferred_flush_context(std::sync::Arc::clone(memtable));
+        }
 
         Ok(txn)
     }

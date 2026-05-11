@@ -875,6 +875,10 @@ pub struct WriteTransaction {
     wal_journal: Option<Arc<crate::column_family::wal::journal::WALJournal>>,
     cf_name: Option<String>,
     checkpoint_manager: Option<Arc<crate::column_family::wal::checkpoint::CheckpointManager>>,
+    // Deferred flush: skip B-tree mutation, WAL + memtable only
+    deferred_flush: bool,
+    deferred_memtable: Option<crate::column_family::memtable::SharedMemtable>,
+    pending_deferred_ops: Mutex<Vec<(String, crate::column_family::wal::entry::WALOp)>>,
 }
 
 impl WriteTransaction {
@@ -913,6 +917,9 @@ impl WriteTransaction {
             wal_journal: None,
             cf_name: None,
             checkpoint_manager: None,
+            deferred_flush: false,
+            deferred_memtable: None,
+            pending_deferred_ops: Mutex::new(Vec::new()),
         })
     }
 
@@ -930,6 +937,30 @@ impl WriteTransaction {
         self.cf_name = Some(cf_name);
         self.wal_journal = Some(wal_journal);
         self.checkpoint_manager = checkpoint_manager;
+    }
+
+    /// Enables deferred flush mode: inserts/removes skip B-tree mutation and
+    /// instead go to WAL + shared memtable on commit.
+    pub(crate) fn set_deferred_flush_context(
+        &mut self,
+        memtable: crate::column_family::memtable::SharedMemtable,
+    ) {
+        self.deferred_flush = true;
+        self.deferred_memtable = Some(memtable);
+    }
+
+    /// Returns whether this transaction uses deferred flush (WAL + memtable only).
+    pub(crate) fn is_deferred_flush(&self) -> bool {
+        self.deferred_flush
+    }
+
+    /// Pushes a deferred key-value operation for later WAL append + memtable merge.
+    pub(crate) fn push_deferred_op(&self, table_name: &str, key: Vec<u8>, value: Option<Vec<u8>>) {
+        use crate::column_family::wal::entry::WALOp;
+        self.pending_deferred_ops.lock().unwrap().push((
+            table_name.to_string(),
+            WALOp { key, value },
+        ));
     }
 
     /// Disable WAL for this specific transaction.
@@ -1589,6 +1620,10 @@ impl WriteTransaction {
     }
 
     fn commit_inner(&mut self) -> Result<(), CommitError> {
+        if self.deferred_flush {
+            return self.commit_inner_deferred();
+        }
+
         // Quick-repair requires 2-phase commit
         if self.quick_repair {
             self.two_phase_commit = true;
@@ -1687,6 +1722,75 @@ impl WriteTransaction {
             "Finished commit of transaction id={:?}",
             self.transaction_id
         );
+
+        Ok(())
+    }
+
+    /// Deferred flush commit path: skip B-tree mutation entirely.
+    /// Appends LogicalOps to WAL and merges into the shared memtable.
+    fn commit_inner_deferred(&mut self) -> Result<(), CommitError> {
+        use crate::column_family::wal::entry::{WALEntry, WALOp};
+
+        let wal_journal = self
+            .wal_journal
+            .as_ref()
+            .expect("deferred flush requires WAL");
+        let cf_name = self
+            .cf_name
+            .as_ref()
+            .expect("deferred flush requires CF name")
+            .clone();
+
+        // 1. Take pending ops
+        let all_ops: Vec<(String, WALOp)> =
+            std::mem::take(&mut *self.pending_deferred_ops.lock().unwrap());
+
+        if all_ops.is_empty() {
+            // Nothing to commit
+            return Ok(());
+        }
+
+        // 2. Group by table name
+        let mut by_table: BTreeMap<String, Vec<WALOp>> = BTreeMap::new();
+        for (table_name, op) in all_ops {
+            by_table.entry(table_name).or_default().push(op);
+        }
+
+        // 3. Append LogicalOps entries to WAL (one per table)
+        let mut last_sequence = 0u64;
+        for (table_name, ops) in &by_table {
+            let mut entry = WALEntry::new_logical_ops(
+                cf_name.clone(),
+                self.transaction_id.raw_id(),
+                table_name.clone(),
+                ops.clone(),
+            );
+            last_sequence = wal_journal
+                .append(&mut entry)
+                .map_err(|e| CommitError::Storage(StorageError::from(e)))?;
+        }
+
+        // 4. Wait for WAL fsync (group commit)
+        wal_journal
+            .wait_for_sync(last_sequence)
+            .map_err(|e| CommitError::Storage(StorageError::from(e)))?;
+
+        // 5. Merge into shared memtable
+        if let Some(memtable) = &self.deferred_memtable {
+            let mut mem = memtable.write().unwrap();
+            for (table_name, ops) in by_table {
+                let table_mem = mem.tables.entry(table_name).or_default();
+                for op in ops {
+                    table_mem.insert(op.key, op.value);
+                }
+            }
+            mem.next_sequence();
+        }
+
+        // 6. Register for checkpoint
+        if let Some(checkpoint_mgr) = &self.checkpoint_manager {
+            checkpoint_mgr.register_pending(last_sequence);
+        }
 
         Ok(())
     }
