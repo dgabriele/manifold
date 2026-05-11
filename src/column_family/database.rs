@@ -391,10 +391,15 @@ impl ColumnFamilyDatabase {
             let mem = db.get_memory();
 
             for entry in entries_for_cf {
+                // LogicalOps entries are handled separately during deferred flush replay
+                let txn_payload = match &entry.payload {
+                    super::wal::entry::WALPayload::Transaction(p) => p,
+                    super::wal::entry::WALPayload::LogicalOps(_) => continue,
+                };
+
                 // Convert WAL payload to BtreeHeader format
                 let data_root =
-                    entry
-                        .payload
+                    txn_payload
                         .user_root
                         .map(|(page_num, checksum, length)| BtreeHeader {
                             root: page_num,
@@ -402,8 +407,7 @@ impl ColumnFamilyDatabase {
                             length,
                         });
 
-                let system_root = entry
-                    .payload
+                let system_root = txn_payload
                     .system_root
                     .map(|(page_num, checksum, length)| BtreeHeader {
                         root: page_num,

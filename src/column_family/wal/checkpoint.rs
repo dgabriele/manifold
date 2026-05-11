@@ -1,7 +1,7 @@
 use super::config::CheckpointConfig;
 use super::journal::WALJournal;
 use crate::column_family::database::ColumnFamilyDatabase;
-use crate::column_family::wal::entry::WALEntry;
+use crate::column_family::wal::entry::{WALEntry, WALPayload};
 use crate::tree_store::BtreeHeader;
 use std::collections::BTreeSet;
 use std::io;
@@ -320,6 +320,12 @@ impl CheckpointManager {
         database: &Arc<ColumnFamilyDatabase>,
         entry: &WALEntry,
     ) -> io::Result<()> {
+        // LogicalOps entries are handled separately during deferred flush replay
+        let txn_payload = match &entry.payload {
+            WALPayload::Transaction(p) => p,
+            WALPayload::LogicalOps(_) => return Ok(()),
+        };
+
         // Get the column family
         let cf = database.column_family(&entry.cf_name).map_err(|e| {
             io::Error::new(
@@ -337,8 +343,7 @@ impl CheckpointManager {
         let mem = db.get_memory();
 
         // Convert WAL payload to BtreeHeader format
-        let data_root = entry
-            .payload
+        let data_root = txn_payload
             .user_root
             .map(|(page_num, checksum, length)| BtreeHeader {
                 root: page_num,
@@ -346,8 +351,7 @@ impl CheckpointManager {
                 length,
             });
 
-        let system_root = entry
-            .payload
+        let system_root = txn_payload
             .system_root
             .map(|(page_num, checksum, length)| BtreeHeader {
                 root: page_num,
