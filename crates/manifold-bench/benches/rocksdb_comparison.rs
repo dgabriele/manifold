@@ -331,8 +331,8 @@ fn bench_point_read_uniform(dir: &std::path::Path, n: u64) -> WorkloadResult {
     use manifold::TableDefinition;
     const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 
-    // --- Populate Manifold ---
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
+    // --- Populate Manifold (no deferred flush — data must be in B-tree for reads) ---
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, false);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..n).step_by(BATCH_SIZE) {
@@ -397,8 +397,8 @@ fn bench_point_read_zipfian(dir: &std::path::Path, n: u64) -> WorkloadResult {
     use manifold::TableDefinition;
     const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 
-    // Populate both
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
+    // Populate both (no deferred flush — data must be in B-tree for reads)
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, false);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..n).step_by(BATCH_SIZE) {
@@ -461,8 +461,8 @@ fn bench_range_scan(dir: &std::path::Path, n: u64) -> WorkloadResult {
     use manifold::TableDefinition;
     const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 
-    // Populate both
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
+    // Populate both (no deferred flush — data must be in B-tree for range scans)
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, false);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..n).step_by(BATCH_SIZE) {
@@ -544,8 +544,8 @@ fn bench_mixed_50_50(dir: &std::path::Path, n: u64) -> WorkloadResult {
 
     let prepopulate = n / 2;
 
-    // Populate Manifold
-    let (_tmp_m, db_m) = open_manifold_cf(dir, true, true);
+    // Populate Manifold (no deferred flush — pre-populated data must be in B-tree for reads)
+    let (_tmp_m, db_m) = open_manifold_cf(dir, true, false);
     {
         let cf = manifold_cf(&db_m, "default");
         for batch_start in (0..prepopulate).step_by(BATCH_SIZE) {
