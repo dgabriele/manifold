@@ -90,6 +90,60 @@ pub fn execute_in_txn(
     execute_plan_mut(txn, catalog, &plan, params)
 }
 
+/// Execute a mutating statement within an existing write transaction,
+/// deferring data-table flushes for INSERT operations. The caller
+/// (Database) is responsible for flushing dirty tables before reads
+/// and at commit time.
+pub fn execute_in_txn_buffered(
+    txn: &manifold::WriteTransaction,
+    catalog: &mut Catalog,
+    plan: LogicalPlan,
+    params: &[Value],
+    dirty_tables: &mut std::collections::HashSet<String>,
+) -> Result<u64> {
+    // For INSERT plans, use the buffered path that skips flush_overlay.
+    match &plan {
+        LogicalPlan::Insert { table_name, .. } => {
+            let result = execute_plan_mut_buffered(txn, catalog, &plan, params)?;
+            dirty_tables.insert(table_name.clone());
+            Ok(result)
+        }
+        // For UPDATE/DELETE, flush the target table first (need to read rows).
+        LogicalPlan::Update { table_name, .. } | LogicalPlan::Delete { table_name, .. } => {
+            flush_table(txn, dirty_tables, table_name)?;
+            execute_plan_mut(txn, catalog, &plan, params)
+        }
+        _ => execute_plan_mut(txn, catalog, &plan, params),
+    }
+}
+
+/// Flush all dirty tables' data-table overlays.
+pub fn flush_dirty_tables(
+    txn: &manifold::WriteTransaction,
+    dirty_tables: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    for table_name in dirty_tables.drain() {
+        let dt_name = data_table_name(&table_name);
+        let mut table = txn.open_table(TableDefinition::<u64, &[u8]>::new(dt_name))?;
+        table.flush_overlay()?;
+    }
+    Ok(())
+}
+
+/// Flush a specific dirty table if it has unflushed writes.
+fn flush_table(
+    txn: &manifold::WriteTransaction,
+    dirty_tables: &mut std::collections::HashSet<String>,
+    table_name: &str,
+) -> Result<()> {
+    if dirty_tables.remove(table_name) {
+        let dt_name = data_table_name(table_name);
+        let mut table = txn.open_table(TableDefinition::<u64, &[u8]>::new(dt_name))?;
+        table.flush_overlay()?;
+    }
+    Ok(())
+}
+
 /// Execute a query within an existing write transaction.
 pub fn query_in_txn(
     txn: &manifold::WriteTransaction,
@@ -681,6 +735,24 @@ fn execute_plan_mut(
     }
 }
 
+/// Like execute_plan_mut but skips flush_overlay for INSERT (deferred to commit).
+fn execute_plan_mut_buffered(
+    txn: &manifold::WriteTransaction,
+    catalog: &mut Catalog,
+    plan: &LogicalPlan,
+    params: &[Value],
+) -> Result<u64> {
+    match plan {
+        LogicalPlan::Insert {
+            table_name,
+            columns,
+            source,
+            ..
+        } => execute_insert_no_flush(txn, catalog, table_name, columns, source, params),
+        _ => execute_plan_mut(txn, catalog, plan, params),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DDL: CREATE TABLE
 // ---------------------------------------------------------------------------
@@ -1173,6 +1245,29 @@ fn execute_insert(
     source: &LogicalPlan,
     params: &[Value],
 ) -> Result<u64> {
+    execute_insert_inner(txn, catalog, table_name, target_columns, source, params, false)
+}
+
+fn execute_insert_no_flush(
+    txn: &manifold::WriteTransaction,
+    catalog: &mut Catalog,
+    table_name: &str,
+    target_columns: &[usize],
+    source: &LogicalPlan,
+    params: &[Value],
+) -> Result<u64> {
+    execute_insert_inner(txn, catalog, table_name, target_columns, source, params, true)
+}
+
+fn execute_insert_inner(
+    txn: &manifold::WriteTransaction,
+    catalog: &mut Catalog,
+    table_name: &str,
+    target_columns: &[usize],
+    source: &LogicalPlan,
+    params: &[Value],
+    skip_flush: bool,
+) -> Result<u64> {
     let schema = catalog
         .get_table(table_name)
         .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?
@@ -1265,8 +1360,10 @@ fn execute_insert(
         count += 1;
     }
 
-    // Flush all buffered data-table writes into the B-tree in one batch.
-    data_table.flush_overlay()?;
+    // Flush buffered writes unless caller defers flush to transaction commit.
+    if !skip_flush {
+        data_table.flush_overlay()?;
+    }
 
     drop(data_table);
 

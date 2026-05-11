@@ -255,6 +255,47 @@ fn bench_bulk_insert(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. Bulk insert with prepared statements (isolates write perf from parse overhead)
+// ---------------------------------------------------------------------------
+
+fn bench_bulk_insert_prepared(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bulk_insert_prepared");
+    group.sample_size(10);
+
+    let (db, _dir) = create_db();
+    create_table(&db);
+
+    let stmt = db
+        .prepare("INSERT INTO t (id, name, value, category) VALUES ($1, $2, $3, $4)")
+        .unwrap();
+
+    let counter = std::cell::Cell::new(1_000_000_i64);
+
+    group.bench_function("1000_rows", |b| {
+        b.iter(|| {
+            let base = counter.get();
+            counter.set(base + 1000);
+            db.execute("BEGIN", &[]).unwrap();
+            for i in 0..1000 {
+                let id = base + i;
+                stmt.execute(
+                    &db,
+                    &[
+                        Value::Integer(id),
+                        Value::Text(format!("name_{id}")),
+                        Value::Integer(id % 1000),
+                        Value::Text(format!("cat_{}", id % 10)),
+                    ],
+                )
+                .unwrap();
+            }
+            db.execute("COMMIT", &[]).unwrap();
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // 6. Update by PK
 // ---------------------------------------------------------------------------
 
@@ -422,6 +463,7 @@ criterion_group!(
     bench_single_insert,
     bench_single_insert_prepared,
     bench_bulk_insert,
+    bench_bulk_insert_prepared,
     bench_update_by_pk,
     bench_delete_by_pk,
     bench_inner_join,

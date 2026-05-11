@@ -187,6 +187,8 @@ impl ResultSet {
 struct ActiveTransaction {
     write_txn: manifold::WriteTransaction,
     savepoints: HashMap<String, manifold::Savepoint>,
+    /// Tables with unflushed buffered data-table writes.
+    dirty_tables: std::collections::HashSet<String>,
 }
 
 /// The main entry point for the SQL engine.
@@ -259,14 +261,17 @@ impl Database {
                 *active = Some(ActiveTransaction {
                     write_txn,
                     savepoints: HashMap::new(),
+                    dirty_tables: std::collections::HashSet::new(),
                 });
                 return Ok(0);
             }
             LogicalPlan::CommitTransaction => {
                 let mut active = self.active_txn.lock().unwrap();
-                let state = active.take().ok_or_else(|| {
+                let mut state = active.take().ok_or_else(|| {
                     SqlError::Transaction("no active transaction".into())
                 })?;
+                // Flush all dirty tables before committing.
+                executor::flush_dirty_tables(&state.write_txn, &mut state.dirty_tables)?;
                 state.write_txn.commit()?;
                 return Ok(0);
             }
@@ -323,7 +328,13 @@ impl Database {
         // If there's an active explicit transaction, use it.
         let mut active = self.active_txn.lock().unwrap();
         if let Some(state) = active.as_mut() {
-            executor::execute_in_txn(&state.write_txn, &mut catalog, optimized, params)
+            executor::execute_in_txn_buffered(
+                &state.write_txn,
+                &mut catalog,
+                optimized,
+                params,
+                &mut state.dirty_tables,
+            )
         } else {
             drop(active);
             executor::execute_mut(&self.db, &mut catalog, optimized, params)
@@ -342,9 +353,10 @@ impl Database {
         let plan = planner::plan(&catalog, &bound)?;
         let optimized = optimizer::optimize(plan, &catalog)?;
 
-        // If there's an active explicit transaction, query through it.
-        let active = self.active_txn.lock().unwrap();
-        if let Some(state) = active.as_ref() {
+        // If there's an active explicit transaction, flush dirty tables then query.
+        let mut active = self.active_txn.lock().unwrap();
+        if let Some(state) = active.as_mut() {
+            executor::flush_dirty_tables(&state.write_txn, &mut state.dirty_tables)?;
             executor::query_in_txn(&state.write_txn, &catalog, optimized, params)
         } else {
             drop(active);
@@ -450,10 +462,16 @@ impl PreparedStatement {
 
         let mut catalog = db.catalog.lock().unwrap();
 
-        // If there's an active explicit transaction, use it.
+        // If there's an active explicit transaction, use buffered writes.
         let mut active = db.active_txn.lock().unwrap();
         if let Some(state) = active.as_mut() {
-            executor::execute_in_txn(&state.write_txn, &mut catalog, plan, params)
+            executor::execute_in_txn_buffered(
+                &state.write_txn,
+                &mut catalog,
+                plan,
+                params,
+                &mut state.dirty_tables,
+            )
         } else {
             drop(active);
             executor::execute_mut(&db.db, &mut catalog, plan, params)
@@ -468,9 +486,10 @@ impl PreparedStatement {
 
         let catalog = db.catalog.lock().unwrap();
 
-        // If there's an active explicit transaction, query through it.
-        let active = db.active_txn.lock().unwrap();
-        if let Some(state) = active.as_ref() {
+        // If there's an active explicit transaction, flush dirty tables then query.
+        let mut active = db.active_txn.lock().unwrap();
+        if let Some(state) = active.as_mut() {
+            executor::flush_dirty_tables(&state.write_txn, &mut state.dirty_tables)?;
             executor::query_in_txn(&state.write_txn, &catalog, plan, params)
         } else {
             drop(active);
