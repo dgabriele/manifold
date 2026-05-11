@@ -85,6 +85,22 @@ pub fn plan(catalog: &Catalog, stmt: &BoundStatement) -> Result<LogicalPlan> {
             if_exists: *if_exists,
         }),
 
+        BoundStatement::Union { left, right, all } => {
+            let left_plan = plan(catalog, left)?;
+            let right_plan = plan(catalog, right)?;
+            // Use the left side's schema for the union output.
+            let schema = left_plan
+                .schema()
+                .cloned()
+                .unwrap_or_else(PlanSchema::empty);
+            Ok(LogicalPlan::Union {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+                all: *all,
+                schema,
+            })
+        }
+
         BoundStatement::Explain(inner) => {
             let inner_plan = plan(catalog, inner)?;
             Ok(LogicalPlan::Explain {

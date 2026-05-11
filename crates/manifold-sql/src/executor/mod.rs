@@ -5,6 +5,8 @@ mod limit;
 mod project;
 mod scan;
 mod sort;
+pub mod subquery;
+pub mod union;
 mod values;
 
 use manifold::{MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
@@ -230,6 +232,19 @@ fn build_read_query_executor(
                 schema.clone(),
             )))
         }
+        LogicalPlan::Union { left, right, all, .. } => {
+            let left_exec = build_read_query_executor(txn, catalog, left, params)?;
+            let right_exec = build_read_query_executor(txn, catalog, right, params)?;
+            if *all {
+                Ok(Box::new(union::UnionAll::new(left_exec, right_exec)))
+            } else {
+                Ok(Box::new(union::UnionDistinct::new(left_exec, right_exec)?))
+            }
+        }
+        LogicalPlan::Distinct { input } => {
+            let child = build_read_query_executor(txn, catalog, input, params)?;
+            Ok(Box::new(union::UnionDistinct::new(child, Box::new(EmptyExecutor))?))
+        }
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(
             "unsupported plan node in query: {plan:?}"
@@ -356,6 +371,19 @@ fn build_write_query_executor(
                 params,
                 schema.clone(),
             )))
+        }
+        LogicalPlan::Union { left, right, all, .. } => {
+            let left_exec = build_write_query_executor(txn, catalog, left, params)?;
+            let right_exec = build_write_query_executor(txn, catalog, right, params)?;
+            if *all {
+                Ok(Box::new(union::UnionAll::new(left_exec, right_exec)))
+            } else {
+                Ok(Box::new(union::UnionDistinct::new(left_exec, right_exec)?))
+            }
+        }
+        LogicalPlan::Distinct { input } => {
+            let child = build_write_query_executor(txn, catalog, input, params)?;
+            Ok(Box::new(union::UnionDistinct::new(child, Box::new(EmptyExecutor))?))
         }
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(

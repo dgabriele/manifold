@@ -204,6 +204,38 @@ fn right_join() {
 }
 
 // ---------------------------------------------------------------------------
+// UNION / UNION ALL tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn union_all() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, val TEXT)", &[]).unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, val TEXT)", &[]).unwrap();
+    db.execute("INSERT INTO a (id, val) VALUES (1, 'x')", &[]).unwrap();
+    db.execute("INSERT INTO a (id, val) VALUES (2, 'y')", &[]).unwrap();
+    db.execute("INSERT INTO b (id, val) VALUES (1, 'y')", &[]).unwrap();
+    db.execute("INSERT INTO b (id, val) VALUES (2, 'z')", &[]).unwrap();
+    let result = db.query("SELECT val FROM a UNION ALL SELECT val FROM b", &[]).unwrap();
+    assert_eq!(result.row_count(), 4); // x, y, y, z (duplicates kept)
+}
+
+#[test]
+fn union_distinct() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, val TEXT)", &[]).unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, val TEXT)", &[]).unwrap();
+    db.execute("INSERT INTO a (id, val) VALUES (1, 'x')", &[]).unwrap();
+    db.execute("INSERT INTO a (id, val) VALUES (2, 'y')", &[]).unwrap();
+    db.execute("INSERT INTO b (id, val) VALUES (1, 'y')", &[]).unwrap();
+    db.execute("INSERT INTO b (id, val) VALUES (2, 'z')", &[]).unwrap();
+    let result = db.query("SELECT val FROM a UNION SELECT val FROM b", &[]).unwrap();
+    assert_eq!(result.row_count(), 3); // x, y, z (duplicate 'y' removed)
+}
+
+// ---------------------------------------------------------------------------
 // Aggregate tests
 // ---------------------------------------------------------------------------
 

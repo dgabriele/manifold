@@ -1,4 +1,4 @@
-use sqlparser::ast::{self, ObjectType, SetExpr, TableFactor};
+use sqlparser::ast::{self, ObjectType, SetExpr, SetOperator, TableFactor};
 
 use crate::catalog::schema::{
     self as schema, ColumnDef, ConstraintDef, ForeignKeyAction,
@@ -81,6 +81,51 @@ fn bind_query(
     query: &ast::Query,
     params: &[Value],
 ) -> Result<BoundStatement> {
+    // Handle UNION / INTERSECT / EXCEPT at the top level before ORDER BY / LIMIT.
+    if let SetExpr::SetOperation { op, set_quantifier, left, right } = query.body.as_ref() {
+        let all = matches!(set_quantifier, ast::SetQuantifier::All);
+        match op {
+            SetOperator::Union => {
+                let left_stmt = bind_query(catalog, &ast::Query {
+                    with: None,
+                    body: left.clone(),
+                    order_by: None,
+                    limit: None,
+                    limit_by: vec![],
+                    offset: None,
+                    fetch: None,
+                    locks: vec![],
+                    for_clause: None,
+                    settings: None,
+                    format_clause: None,
+                }, params)?;
+                let right_stmt = bind_query(catalog, &ast::Query {
+                    with: None,
+                    body: right.clone(),
+                    order_by: None,
+                    limit: None,
+                    limit_by: vec![],
+                    offset: None,
+                    fetch: None,
+                    locks: vec![],
+                    for_clause: None,
+                    settings: None,
+                    format_clause: None,
+                }, params)?;
+                return Ok(BoundStatement::Union {
+                    left: Box::new(left_stmt),
+                    right: Box::new(right_stmt),
+                    all,
+                });
+            }
+            other => {
+                return Err(SqlError::Bind(format!(
+                    "unsupported set operation: {other}"
+                )));
+            }
+        }
+    }
+
     let mut select = bind_query_body(catalog, &query.body, params)?;
 
     // ORDER BY

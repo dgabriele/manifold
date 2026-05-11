@@ -308,6 +308,11 @@ pub enum BoundStatement {
         name: String,
         if_exists: bool,
     },
+    Union {
+        left: Box<BoundStatement>,
+        right: Box<BoundStatement>,
+        all: bool,
+    },
     Explain(Box<BoundStatement>),
     Analyze {
         table_name: Option<String>,
