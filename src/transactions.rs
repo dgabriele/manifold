@@ -964,6 +964,31 @@ impl WriteTransaction {
         ));
     }
 
+    /// Look up a key in pending deferred ops for a given table.
+    /// Returns the most recent value if found (Some(bytes) for insert, None for delete),
+    /// or Err(()) if the key is not in pending ops.
+    pub(crate) fn get_deferred_op(&self, table_name: &str, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, ()> {
+        let ops = self.pending_deferred_ops.lock().unwrap();
+        // Search in reverse to find the most recent op for this key
+        for (tbl, op) in ops.iter().rev() {
+            if tbl == table_name && op.key == key {
+                return Ok(op.value.clone());
+            }
+        }
+        Err(())
+    }
+
+    /// Look up a key in the shared memtable (committed data from prior transactions
+    /// that hasn't been checkpointed to the B-tree yet).
+    /// Returns Some(Some(bytes)) for a found value, Some(None) for a tombstone,
+    /// or None if the key is not in the memtable.
+    pub(crate) fn get_from_memtable(&self, table_name: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let memtable = self.deferred_memtable.as_ref()?;
+        let mem = memtable.read().unwrap();
+        let table_mem = mem.tables.get(table_name)?;
+        table_mem.entries.get(key).cloned()
+    }
+
     /// Disable WAL for this specific transaction.
     ///
     /// This is useful for bulk load operations where WAL overhead provides no benefit.

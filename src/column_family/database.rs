@@ -569,7 +569,11 @@ impl ColumnFamilyDatabase {
 
         let mut column_families = HashMap::new();
         for cf_meta in &header.read().unwrap().column_families {
-            let state = ColumnFamilyState::new(cf_meta.name.clone(), cf_meta.segments.clone());
+            let state = if deferred_flush {
+                ColumnFamilyState::new_with_memtable(cf_meta.name.clone(), cf_meta.segments.clone())
+            } else {
+                ColumnFamilyState::new(cf_meta.name.clone(), cf_meta.segments.clone())
+            };
             column_families.insert(cf_meta.name.clone(), Arc::new(state));
         }
 
@@ -693,14 +697,14 @@ impl ColumnFamilyDatabase {
             (metadata.segments, metadata.name.clone())
         };
 
-        let state = Arc::new(ColumnFamilyState::new(name.clone(), segments));
+        let state = if self.deferred_flush {
+            Arc::new(ColumnFamilyState::new_with_memtable(name.clone(), segments))
+        } else {
+            Arc::new(ColumnFamilyState::new(name.clone(), segments))
+        };
         cfs.insert(name.clone(), Arc::clone(&state));
 
-        let memtable = if self.deferred_flush {
-            Some(crate::column_family::memtable::new_shared_memtable())
-        } else {
-            None
-        };
+        let memtable = state.memtable.clone();
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -744,11 +748,7 @@ impl ColumnFamilyDatabase {
 
         match cfs.get(name) {
             Some(state) => {
-                let memtable = if self.deferred_flush {
-                    Some(crate::column_family::memtable::new_shared_memtable())
-                } else {
-                    None
-                };
+                let memtable = state.memtable.clone();
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -811,11 +811,7 @@ impl ColumnFamilyDatabase {
         {
             let cfs = self.column_families.read().unwrap();
             if let Some(state) = cfs.get(name) {
-                let memtable = if self.deferred_flush {
-                    Some(crate::column_family::memtable::new_shared_memtable())
-                } else {
-                    None
-                };
+                let memtable = state.memtable.clone();
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {

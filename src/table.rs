@@ -684,13 +684,36 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for Table<'_, K
 impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'_, K, V> {
     fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<'_, V>>> {
         let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
+        // Check local overlay first (current Table handle's buffered writes).
         if let Some(entry) = self.overlay.get(&key_bytes) {
             return match entry {
                 Some(value_bytes) => {
                     Ok(Some(AccessGuard::with_owned_value(value_bytes.clone())))
                 }
-                None => Ok(None),
+                None => Ok(None), // tombstone
             };
+        }
+        // In deferred_flush mode, check pending deferred ops from prior Table handles
+        // in this transaction (e.g., a previous open_table/insert/drop cycle).
+        if self.transaction.is_deferred_flush() {
+            if let Ok(value) = self.transaction.get_deferred_op(&self.name, &key_bytes) {
+                return match value {
+                    Some(value_bytes) => {
+                        Ok(Some(AccessGuard::with_owned_value(value_bytes)))
+                    }
+                    None => Ok(None), // tombstone
+                };
+            }
+            // Also check the shared memtable for committed data from prior transactions
+            // that hasn't been checkpointed to the B-tree yet.
+            if let Some(value) = self.transaction.get_from_memtable(&self.name, &key_bytes) {
+                return match value {
+                    Some(value_bytes) => {
+                        Ok(Some(AccessGuard::with_owned_value(value_bytes)))
+                    }
+                    None => Ok(None), // tombstone
+                };
+            }
         }
         self.tree.get(key.borrow())
     }

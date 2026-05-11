@@ -24,6 +24,9 @@ pub(crate) struct ColumnFamilyState {
     pub segments: Arc<RwLock<Vec<Segment>>>,
     /// Lazily initialized Database instance.
     pub db: Arc<RwLock<Option<Arc<Database>>>>,
+    /// Shared memtable for deferred flush mode. Created once, shared across all
+    /// ColumnFamily handles for this CF so that read-after-write is visible.
+    pub memtable: Option<super::memtable::SharedMemtable>,
 }
 
 impl ColumnFamilyState {
@@ -33,6 +36,16 @@ impl ColumnFamilyState {
             name,
             segments: Arc::new(RwLock::new(segments)),
             db: Arc::new(RwLock::new(None)),
+            memtable: None,
+        }
+    }
+
+    pub fn new_with_memtable(name: String, segments: Vec<Segment>) -> Self {
+        Self {
+            name,
+            segments: Arc::new(RwLock::new(segments)),
+            db: Arc::new(RwLock::new(None)),
+            memtable: Some(super::memtable::new_shared_memtable()),
         }
     }
 

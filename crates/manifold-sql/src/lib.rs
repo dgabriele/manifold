@@ -212,7 +212,10 @@ impl Database {
     /// Initializes system tables if the database is new, then loads the catalog.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let cf_db = manifold::column_family::ColumnFamilyDatabase::builder()
-            .pool_size(64) // WAL enabled
+            .pool_size(64) // WAL enabled (group commit batching)
+            // Note: deferred_flush(true) would further improve write perf but requires
+            // merge iterators in Table::range() for correct memtable visibility.
+            // See docs/deferred-flush-todo.md for the path forward.
             .open(path)?;
 
         let cf = cf_db.column_family_or_create("default").map_err(|e| {
