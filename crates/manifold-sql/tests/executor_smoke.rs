@@ -1,5 +1,169 @@
 use manifold_sql::Database;
 
+fn setup() -> (Database, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    (db, dir)
+}
+
+// ---------------------------------------------------------------------------
+// Constraint enforcement tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn not_null_violation() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        &[],
+    )
+    .unwrap();
+    let err = db
+        .execute("INSERT INTO t (id) VALUES (1)", &[])
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("not null") || msg.contains("constraint") || msg.contains("null"),
+        "expected NOT NULL error, got: {err}"
+    );
+}
+
+#[test]
+fn not_null_allows_value() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        &[],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (1, 'hello')", &[])
+        .unwrap();
+    let result = db.query("SELECT name FROM t WHERE id = 1", &[]).unwrap();
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "hello");
+}
+
+#[test]
+fn unique_violation() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+        &[],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (id, email) VALUES (1, 'a@b.com')", &[])
+        .unwrap();
+    let err = db
+        .execute("INSERT INTO t (id, email) VALUES (2, 'a@b.com')", &[])
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("constraint") || msg.contains("duplicate"),
+        "expected UNIQUE error, got: {err}"
+    );
+}
+
+#[test]
+fn unique_allows_different_values() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+        &[],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (id, email) VALUES (1, 'a@b.com')", &[])
+        .unwrap();
+    db.execute("INSERT INTO t (id, email) VALUES (2, 'c@d.com')", &[])
+        .unwrap();
+    let result = db.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 2);
+}
+
+#[test]
+fn type_enforcement() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, count INTEGER)",
+        &[],
+    )
+    .unwrap();
+    // Integer literal should work.
+    db.execute("INSERT INTO t (id, count) VALUES (1, 42)", &[])
+        .unwrap();
+    // Text literal in integer column should fail.
+    let err = db
+        .execute("INSERT INTO t (id, count) VALUES (2, 'not a number')", &[])
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("type"),
+        "expected type error, got: {err}"
+    );
+}
+
+#[test]
+fn varchar_length_enforcement() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, code VARCHAR(3))",
+        &[],
+    )
+    .unwrap();
+    // Within limit.
+    db.execute("INSERT INTO t (id, code) VALUES (1, 'abc')", &[])
+        .unwrap();
+    // Exceeds limit.
+    let err = db
+        .execute("INSERT INTO t (id, code) VALUES (2, 'abcdef')", &[])
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("varchar") || msg.contains("exceeds") || msg.contains("constraint"),
+        "expected VARCHAR length error, got: {err}"
+    );
+}
+
+#[test]
+fn update_not_null_violation() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        &[],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (1, 'hello')", &[])
+        .unwrap();
+    let err = db
+        .execute("UPDATE t SET name = NULL WHERE id = 1", &[])
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("not null") || msg.contains("constraint") || msg.contains("null"),
+        "expected NOT NULL error on UPDATE, got: {err}"
+    );
+}
+
+#[test]
+fn update_unique_violation() {
+    let (db, _dir) = setup();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)",
+        &[],
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (id, email) VALUES (1, 'a@b.com')", &[])
+        .unwrap();
+    db.execute("INSERT INTO t (id, email) VALUES (2, 'c@d.com')", &[])
+        .unwrap();
+    let err = db
+        .execute("UPDATE t SET email = 'a@b.com' WHERE id = 2", &[])
+        .unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("constraint") || msg.contains("duplicate"),
+        "expected UNIQUE error on UPDATE, got: {err}"
+    );
+}
+
 #[test]
 fn create_table_and_insert() {
     let dir = tempfile::TempDir::new().unwrap();

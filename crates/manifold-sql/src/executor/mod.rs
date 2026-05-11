@@ -20,7 +20,7 @@ use crate::expr::eval::evaluate;
 use crate::planner::plan::{LogicalPlan, ScalarExpr};
 use crate::storage::index::encode_index_key;
 use crate::storage::row_format::{decode_row, encode_row};
-use crate::types::Value;
+use crate::types::{SqlType, Value};
 use crate::ResultSet;
 use crate::Row;
 
@@ -1169,27 +1169,8 @@ fn execute_insert(
             }
         }
 
-        // Check NOT NULL constraints.
-        for constraint in &schema.constraints {
-            if let ConstraintDef::NotNull { column, name, .. } = constraint {
-                if full_row[*column].is_null() {
-                    return Err(SqlError::ConstraintViolation(format!(
-                        "NOT NULL constraint '{name}' violated on column '{}'",
-                        schema.columns[*column].name
-                    )));
-                }
-            }
-        }
-
-        // Also check column-level `nullable: false` (from is_primary_key etc).
-        for (i, col) in schema.columns.iter().enumerate() {
-            if !col.nullable && full_row[i].is_null() {
-                return Err(SqlError::ConstraintViolation(format!(
-                    "column '{}' cannot be null",
-                    col.name
-                )));
-            }
-        }
+        // Run all constraint checks (NOT NULL, type, VARCHAR length, UNIQUE, FK).
+        check_insert_constraints(txn, catalog, &schema, &full_row)?;
 
         let rowid = next_rowid;
         next_rowid += 1;
@@ -1276,6 +1257,9 @@ fn execute_update(
             new_values[*col_idx] = val;
         }
 
+        // Run constraint checks on the new row values.
+        check_insert_constraints(txn, catalog, &schema, &new_values)?;
+
         // Remove old index entries, add new ones.
         update_indexes_delete(txn, table_name, &indexes, old_values, rowid)?;
         update_indexes_insert(txn, table_name, &indexes, &new_values, rowid)?;
@@ -1337,6 +1321,9 @@ fn execute_delete(
 
         let values = &row[1..];
 
+        // Check FK constraints: other tables referencing this row.
+        check_delete_constraints(txn, catalog, table_name, values)?;
+
         // Remove index entries.
         update_indexes_delete(txn, table_name, &indexes, values, rowid)?;
 
@@ -1346,6 +1333,345 @@ fn execute_delete(
 
     drop(data_table);
     Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Constraint checking
+// ---------------------------------------------------------------------------
+
+/// Check constraints for INSERT and UPDATE operations.
+///
+/// Validates NOT NULL, type compatibility, VARCHAR length, and FK (child-side).
+/// UNIQUE is checked via index insertion in `update_indexes_insert`.
+fn check_insert_constraints(
+    txn: &manifold::WriteTransaction,
+    catalog: &Catalog,
+    schema: &TableSchema,
+    row: &[Value],
+) -> Result<()> {
+    // 1. NOT NULL constraints (explicit ConstraintDef).
+    for constraint in &schema.constraints {
+        if let ConstraintDef::NotNull { column, name, .. } = constraint {
+            if row[*column].is_null() {
+                return Err(SqlError::ConstraintViolation(format!(
+                    "NOT NULL constraint '{name}' violated on column '{}'",
+                    schema.columns[*column].name
+                )));
+            }
+        }
+    }
+
+    // 2. Column-level `nullable: false` (from is_primary_key, etc.).
+    for (i, col) in schema.columns.iter().enumerate() {
+        if !col.nullable && row[i].is_null() {
+            return Err(SqlError::ConstraintViolation(format!(
+                "column '{}' cannot be null",
+                col.name
+            )));
+        }
+    }
+
+    // 3. Type enforcement — check value is compatible with declared column type.
+    for (i, col) in schema.columns.iter().enumerate() {
+        if !row[i].is_compatible_with(&col.sql_type) {
+            return Err(SqlError::TypeError(format!(
+                "column '{}' has type {} but got value {}",
+                col.name, col.sql_type, row[i]
+            )));
+        }
+    }
+
+    // 4. VARCHAR length check.
+    for (i, col) in schema.columns.iter().enumerate() {
+        if let SqlType::Varchar(max_len) = &col.sql_type {
+            if let Value::Text(s) = &row[i] {
+                if s.len() > *max_len as usize {
+                    return Err(SqlError::ConstraintViolation(format!(
+                        "value for column '{}' exceeds VARCHAR({}) limit (got {} chars)",
+                        col.name, max_len, s.len()
+                    )));
+                }
+            }
+        }
+    }
+
+    // 5. FK constraints (child side): verify referenced rows exist in parent table.
+    for constraint in &schema.constraints {
+        if let ConstraintDef::ForeignKey {
+            name,
+            columns,
+            ref_table,
+            ref_columns,
+            ..
+        } = constraint
+        {
+            check_fk_parent_exists(txn, catalog, name, schema, row, columns, ref_table, ref_columns)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify that the referenced parent row exists for a FK constraint.
+fn check_fk_parent_exists(
+    txn: &manifold::WriteTransaction,
+    catalog: &Catalog,
+    fk_name: &str,
+    _child_schema: &TableSchema,
+    child_row: &[Value],
+    child_cols: &[usize],
+    ref_table_name: &str,
+    ref_col_names: &[String],
+) -> Result<()> {
+    // If all FK columns are NULL, skip (NULLs satisfy FK constraint).
+    if child_cols.iter().all(|&i| child_row[i].is_null()) {
+        return Ok(());
+    }
+
+    let parent_schema = catalog
+        .get_table(ref_table_name)
+        .ok_or_else(|| SqlError::ConstraintViolation(format!(
+            "FK '{fk_name}': referenced table '{ref_table_name}' not found"
+        )))?;
+
+    let parent_col_indices: Vec<usize> = ref_col_names
+        .iter()
+        .map(|name| {
+            parent_schema.column_index(name).ok_or_else(|| {
+                SqlError::ConstraintViolation(format!(
+                    "FK '{fk_name}': referenced column '{name}' not found in '{ref_table_name}'"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let child_values: Vec<Value> = child_cols.iter().map(|&i| child_row[i].clone()).collect();
+
+    // Try to use a unique index on the parent table for efficient lookup.
+    let parent_indexes: Vec<IndexDef> = catalog
+        .indexes_for_table(parent_schema.id)
+        .into_iter()
+        .cloned()
+        .collect();
+
+    // Check if there's a unique index on exactly the referenced columns.
+    let matching_index = parent_indexes.iter().find(|idx| {
+        idx.unique && idx.columns == parent_col_indices
+    });
+
+    if let Some(idx) = matching_index {
+        let key_bytes = encode_index_key(&child_values);
+        let idx_name = index_table_name(ref_table_name, &idx.name, true);
+        let idx_def = TableDefinition::<&[u8], u64>::new(idx_name);
+        let idx_table = txn.open_table(idx_def)?;
+        if idx_table
+            .get(key_bytes.as_slice())
+            .map_err(SqlError::Storage)?
+            .is_none()
+        {
+            return Err(SqlError::ConstraintViolation(format!(
+                "FK constraint '{fk_name}' violated: no matching row in '{ref_table_name}'"
+            )));
+        }
+    } else {
+        // Fallback: scan the parent data table.
+        let data_name = data_table_name(ref_table_name);
+        let def = TableDefinition::<u64, &[u8]>::new(data_name);
+        let parent_table = txn.open_table(def)?;
+        let parent_types = parent_schema.column_types();
+        let mut found = false;
+        let iter = parent_table.iter().map_err(SqlError::Storage)?;
+        for entry in iter {
+            let (_, v) = entry.map_err(SqlError::Storage)?;
+            let parent_row = decode_row(&parent_types, v.value())?;
+            let matches = parent_col_indices
+                .iter()
+                .zip(child_values.iter())
+                .all(|(&pi, cv)| parent_row[pi] == *cv);
+            if matches {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(SqlError::ConstraintViolation(format!(
+                "FK constraint '{fk_name}' violated: no matching row in '{ref_table_name}'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check FK constraints when deleting a row from a parent table.
+///
+/// Scans all tables in the catalog for FK constraints referencing this table,
+/// and enforces the appropriate action (RESTRICT, CASCADE, SET NULL).
+fn check_delete_constraints(
+    txn: &manifold::WriteTransaction,
+    catalog: &Catalog,
+    parent_table_name: &str,
+    parent_row: &[Value],
+) -> Result<()> {
+    let parent_schema = match catalog.get_table(parent_table_name) {
+        Some(s) => s.clone(),
+        None => return Ok(()),
+    };
+
+    // Find all FK constraints in other tables that reference this table.
+    let all_table_names: Vec<String> = catalog.table_names();
+    for child_table_name in &all_table_names {
+        let child_schema = match catalog.get_table(child_table_name) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+
+        for constraint in &child_schema.constraints {
+            if let ConstraintDef::ForeignKey {
+                name,
+                columns: child_cols,
+                ref_table,
+                ref_columns,
+                on_delete,
+                ..
+            } = constraint
+            {
+                if ref_table != parent_table_name {
+                    continue;
+                }
+
+                // Resolve referenced column indices in the parent.
+                let parent_col_indices: Vec<usize> = match ref_columns
+                    .iter()
+                    .map(|n| parent_schema.column_index(n))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                // Extract the parent values for the referenced columns.
+                let parent_key: Vec<Value> = parent_col_indices
+                    .iter()
+                    .map(|&i| parent_row[i].clone())
+                    .collect();
+
+                // Scan the child table for matching rows.
+                let child_data_name = data_table_name(child_table_name);
+                let child_def = TableDefinition::<u64, &[u8]>::new(child_data_name);
+                let child_types = child_schema.column_types();
+
+                match on_delete {
+                    crate::catalog::schema::ForeignKeyAction::Restrict
+                    | crate::catalog::schema::ForeignKeyAction::NoAction => {
+                        let child_table = txn.open_table(child_def)?;
+                        let iter = child_table.iter().map_err(SqlError::Storage)?;
+                        for entry in iter {
+                            let (_, v) = entry.map_err(SqlError::Storage)?;
+                            let child_row = decode_row(&child_types, v.value())?;
+                            let matches = child_cols
+                                .iter()
+                                .zip(parent_key.iter())
+                                .all(|(&ci, pk)| child_row[ci] == *pk);
+                            if matches {
+                                return Err(SqlError::ConstraintViolation(format!(
+                                    "FK constraint '{name}' on '{child_table_name}' restricts delete from '{parent_table_name}'"
+                                )));
+                            }
+                        }
+                    }
+                    crate::catalog::schema::ForeignKeyAction::Cascade => {
+                        // Delete all child rows that reference this parent row.
+                        let mut child_table = txn.open_table(child_def)?;
+                        let mut to_delete = Vec::new();
+                        {
+                            let iter = child_table.iter().map_err(SqlError::Storage)?;
+                            for entry in iter {
+                                let (k, v) = entry.map_err(SqlError::Storage)?;
+                                let rowid = k.value();
+                                let child_row = decode_row(&child_types, v.value())?;
+                                let matches = child_cols
+                                    .iter()
+                                    .zip(parent_key.iter())
+                                    .all(|(&ci, pk)| child_row[ci] == *pk);
+                                if matches {
+                                    to_delete.push((rowid, child_row));
+                                }
+                            }
+                        }
+
+                        let child_indexes: Vec<IndexDef> = catalog
+                            .indexes_for_table(child_schema.id)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+
+                        for (rowid, child_row) in &to_delete {
+                            update_indexes_delete(
+                                txn,
+                                child_table_name,
+                                &child_indexes,
+                                child_row,
+                                *rowid,
+                            )?;
+                            child_table.remove(*rowid)?;
+                        }
+                    }
+                    crate::catalog::schema::ForeignKeyAction::SetNull => {
+                        // Set FK columns to NULL in child rows.
+                        let mut child_table = txn.open_table(child_def)?;
+                        let mut to_update = Vec::new();
+                        {
+                            let iter = child_table.iter().map_err(SqlError::Storage)?;
+                            for entry in iter {
+                                let (k, v) = entry.map_err(SqlError::Storage)?;
+                                let rowid = k.value();
+                                let child_row = decode_row(&child_types, v.value())?;
+                                let matches = child_cols
+                                    .iter()
+                                    .zip(parent_key.iter())
+                                    .all(|(&ci, pk)| child_row[ci] == *pk);
+                                if matches {
+                                    to_update.push((rowid, child_row));
+                                }
+                            }
+                        }
+
+                        let child_indexes: Vec<IndexDef> = catalog
+                            .indexes_for_table(child_schema.id)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+
+                        for (rowid, old_child_row) in &to_update {
+                            update_indexes_delete(
+                                txn,
+                                child_table_name,
+                                &child_indexes,
+                                old_child_row,
+                                *rowid,
+                            )?;
+                            let mut new_child_row = old_child_row.clone();
+                            for &ci in child_cols {
+                                new_child_row[ci] = Value::Null;
+                            }
+                            update_indexes_insert(
+                                txn,
+                                child_table_name,
+                                &child_indexes,
+                                &new_child_row,
+                                *rowid,
+                            )?;
+                            let encoded = encode_row(&child_types, &new_child_row)?;
+                            child_table.insert(*rowid, encoded.as_slice())?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
