@@ -73,6 +73,21 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         target_type: SqlType,
     },
+    /// `expr IN (SELECT ...)` / `expr NOT IN (SELECT ...)`
+    InSubquery {
+        expr: Box<BoundExpr>,
+        subquery: Box<BoundSelect>,
+        negated: bool,
+    },
+    /// `EXISTS (SELECT ...)` / `NOT EXISTS (SELECT ...)`
+    Exists {
+        subquery: Box<BoundSelect>,
+        negated: bool,
+    },
+    /// Scalar subquery: `(SELECT ...)` producing a single value
+    ScalarSubquery {
+        subquery: Box<BoundSelect>,
+    },
     Wildcard,
 }
 
@@ -113,6 +128,18 @@ impl BoundExpr {
             BoundExpr::Cast { expr, target_type } => {
                 format!("CAST({} AS {target_type})", expr.display_name())
             }
+            BoundExpr::InSubquery { expr, negated, .. } => {
+                let not = if *negated { "NOT " } else { "" };
+                format!("({} {}IN (subquery))", expr.display_name(), not)
+            }
+            BoundExpr::Exists { negated, .. } => {
+                if *negated {
+                    "NOT EXISTS (subquery)".to_string()
+                } else {
+                    "EXISTS (subquery)".to_string()
+                }
+            }
+            BoundExpr::ScalarSubquery { .. } => "(subquery)".to_string(),
             BoundExpr::Wildcard => "*".to_string(),
         }
     }
@@ -222,6 +249,8 @@ pub struct BoundTableRef {
     pub table_id: TableId,
     pub table_name: String,
     pub alias: Option<String>,
+    /// If this table ref is a derived table (subquery in FROM), the bound select.
+    pub subquery: Option<Box<BoundSelect>>,
 }
 
 #[derive(Debug, Clone)]

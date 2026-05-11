@@ -618,6 +618,11 @@ fn lower_expr(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<ScalarExpr> {
                 "unexpected wildcard in expression".to_string(),
             ))
         }
+        BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } | BoundExpr::ScalarSubquery { .. } => {
+            Err(SqlError::Plan(
+                "subquery expressions not yet supported in this context".to_string(),
+            ))
+        }
     }
 }
 
@@ -744,6 +749,11 @@ fn lower_post_agg_expr(
         BoundExpr::Wildcard => Err(SqlError::Plan(
             "unexpected wildcard in post-aggregation expression".to_string(),
         )),
+        BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } | BoundExpr::ScalarSubquery { .. } => {
+            Err(SqlError::Plan(
+                "subquery expressions not yet supported in post-aggregation context".to_string(),
+            ))
+        }
     }
 }
 
@@ -989,6 +999,8 @@ fn bound_expr_type(expr: &BoundExpr) -> SqlType {
         BoundExpr::Aggregate { result_type, .. } => result_type.clone(),
         BoundExpr::Cast { target_type, .. } => target_type.clone(),
         BoundExpr::Parameter(_) | BoundExpr::Wildcard => SqlType::Text,
+        BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => SqlType::Boolean,
+        BoundExpr::ScalarSubquery { .. } => SqlType::Text,
     }
 }
 

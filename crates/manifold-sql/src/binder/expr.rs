@@ -5,7 +5,7 @@ use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
 use crate::types::{SqlType, Value};
 
-use super::{AggregateFunc, BinaryOp, BoundExpr, ColumnRef, UnaryOp};
+use super::{AggregateFunc, BinaryOp, BoundExpr, BoundSelect, ColumnRef, UnaryOp};
 
 // ---------------------------------------------------------------------------
 // Scope — tracks tables and columns visible in the current query context
@@ -211,6 +211,24 @@ pub fn bind_expr(
     expr: &ast::Expr,
     params: &[Value],
 ) -> Result<BoundExpr> {
+    bind_expr_inner(scope, None, expr, params)
+}
+
+pub fn bind_expr_with_catalog(
+    scope: &Scope,
+    catalog: &Catalog,
+    expr: &ast::Expr,
+    params: &[Value],
+) -> Result<BoundExpr> {
+    bind_expr_inner(scope, Some(catalog), expr, params)
+}
+
+fn bind_expr_inner(
+    scope: &Scope,
+    catalog: Option<&Catalog>,
+    expr: &ast::Expr,
+    params: &[Value],
+) -> Result<BoundExpr> {
     match expr {
         // Simple identifier → column lookup
         ast::Expr::Identifier(ident) => {
@@ -240,8 +258,8 @@ pub fn bind_expr(
 
         // Binary operations
         ast::Expr::BinaryOp { left, op, right } => {
-            let bound_left = bind_expr(scope, left, params)?;
-            let bound_right = bind_expr(scope, right, params)?;
+            let bound_left = bind_expr_inner(scope, catalog, left, params)?;
+            let bound_right = bind_expr_inner(scope, catalog, right, params)?;
             let bin_op = map_binary_op(op)?;
             let result_type = infer_binary_type(&bin_op, &bound_left, &bound_right);
             Ok(BoundExpr::BinaryOp {
@@ -254,7 +272,7 @@ pub fn bind_expr(
 
         // Unary operations
         ast::Expr::UnaryOp { op, expr } => {
-            let bound_expr = bind_expr(scope, expr, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
             let unary_op = map_unary_op(op)?;
             let result_type = infer_unary_type(&unary_op, &bound_expr);
             Ok(BoundExpr::UnaryOp {
@@ -266,14 +284,14 @@ pub fn bind_expr(
 
         // IS NULL / IS NOT NULL
         ast::Expr::IsNull(expr) => {
-            let bound_expr = bind_expr(scope, expr, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
             Ok(BoundExpr::IsNull {
                 operand: Box::new(bound_expr),
                 negated: false,
             })
         }
         ast::Expr::IsNotNull(expr) => {
-            let bound_expr = bind_expr(scope, expr, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
             Ok(BoundExpr::IsNull {
                 operand: Box::new(bound_expr),
                 negated: true,
@@ -286,10 +304,10 @@ pub fn bind_expr(
             list,
             negated,
         } => {
-            let bound_expr = bind_expr(scope, expr, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
             let bound_list = list
                 .iter()
-                .map(|e| bind_expr(scope, e, params))
+                .map(|e| bind_expr_inner(scope, catalog, e, params))
                 .collect::<Result<Vec<_>>>()?;
             Ok(BoundExpr::InList {
                 expr: Box::new(bound_expr),
@@ -305,9 +323,9 @@ pub fn bind_expr(
             low,
             high,
         } => {
-            let bound_expr = bind_expr(scope, expr, params)?;
-            let bound_low = bind_expr(scope, low, params)?;
-            let bound_high = bind_expr(scope, high, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
+            let bound_low = bind_expr_inner(scope, catalog, low, params)?;
+            let bound_high = bind_expr_inner(scope, catalog, high, params)?;
             Ok(BoundExpr::Between {
                 expr: Box::new(bound_expr),
                 low: Box::new(bound_low),
@@ -323,8 +341,8 @@ pub fn bind_expr(
             pattern,
             ..
         } => {
-            let bound_expr = bind_expr(scope, expr, params)?;
-            let bound_pattern = bind_expr(scope, pattern, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
+            let bound_pattern = bind_expr_inner(scope, catalog, pattern, params)?;
             Ok(BoundExpr::Like {
                 expr: Box::new(bound_expr),
                 pattern: Box::new(bound_pattern),
@@ -339,8 +357,8 @@ pub fn bind_expr(
             pattern,
             ..
         } => {
-            let bound_expr = bind_expr(scope, expr, params)?;
-            let bound_pattern = bind_expr(scope, pattern, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
+            let bound_pattern = bind_expr_inner(scope, catalog, pattern, params)?;
             Ok(BoundExpr::Like {
                 expr: Box::new(bound_expr),
                 pattern: Box::new(bound_pattern),
@@ -349,7 +367,7 @@ pub fn bind_expr(
         }
 
         // Parenthesized expression
-        ast::Expr::Nested(inner) => bind_expr(scope, inner, params),
+        ast::Expr::Nested(inner) => bind_expr_inner(scope, catalog, inner, params),
 
         // Function call
         ast::Expr::Function(func) => bind_function(scope, func, params),
@@ -358,7 +376,7 @@ pub fn bind_expr(
         ast::Expr::Cast {
             expr, data_type, ..
         } => {
-            let bound_expr = bind_expr(scope, expr, params)?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
             let target_type = sql_data_type_to_sql_type(data_type)?;
             Ok(BoundExpr::Cast {
                 expr: Box::new(bound_expr),
@@ -368,7 +386,7 @@ pub fn bind_expr(
 
         // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE
         ast::Expr::IsTrue(expr) => {
-            let bound = bind_expr(scope, expr, params)?;
+            let bound = bind_expr_inner(scope, catalog, expr, params)?;
             Ok(BoundExpr::BinaryOp {
                 op: BinaryOp::Eq,
                 left: Box::new(bound),
@@ -377,7 +395,7 @@ pub fn bind_expr(
             })
         }
         ast::Expr::IsFalse(expr) => {
-            let bound = bind_expr(scope, expr, params)?;
+            let bound = bind_expr_inner(scope, catalog, expr, params)?;
             Ok(BoundExpr::BinaryOp {
                 op: BinaryOp::Eq,
                 left: Box::new(bound),
@@ -386,7 +404,7 @@ pub fn bind_expr(
             })
         }
         ast::Expr::IsNotTrue(expr) => {
-            let bound = bind_expr(scope, expr, params)?;
+            let bound = bind_expr_inner(scope, catalog, expr, params)?;
             Ok(BoundExpr::UnaryOp {
                 op: UnaryOp::Not,
                 operand: Box::new(BoundExpr::BinaryOp {
@@ -399,7 +417,7 @@ pub fn bind_expr(
             })
         }
         ast::Expr::IsNotFalse(expr) => {
-            let bound = bind_expr(scope, expr, params)?;
+            let bound = bind_expr_inner(scope, catalog, expr, params)?;
             Ok(BoundExpr::UnaryOp {
                 op: UnaryOp::Not,
                 operand: Box::new(BoundExpr::BinaryOp {
@@ -409,6 +427,47 @@ pub fn bind_expr(
                     result_type: SqlType::Boolean,
                 }),
                 result_type: SqlType::Boolean,
+            })
+        }
+
+        // IN subquery: expr IN (SELECT ...)
+        ast::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let cat = catalog.ok_or_else(|| {
+                SqlError::Bind("subqueries require catalog context".to_string())
+            })?;
+            let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
+            let subselect = crate::binder::statement::bind_subquery(cat, subquery, params)?;
+            Ok(BoundExpr::InSubquery {
+                expr: Box::new(bound_expr),
+                subquery: Box::new(subselect),
+                negated: *negated,
+            })
+        }
+
+        // EXISTS (SELECT ...)
+        ast::Expr::Exists { subquery, negated } => {
+            let cat = catalog.ok_or_else(|| {
+                SqlError::Bind("subqueries require catalog context".to_string())
+            })?;
+            let subselect = crate::binder::statement::bind_subquery(cat, subquery, params)?;
+            Ok(BoundExpr::Exists {
+                subquery: Box::new(subselect),
+                negated: *negated,
+            })
+        }
+
+        // Scalar subquery: (SELECT ...)
+        ast::Expr::Subquery(subquery) => {
+            let cat = catalog.ok_or_else(|| {
+                SqlError::Bind("subqueries require catalog context".to_string())
+            })?;
+            let subselect = crate::binder::statement::bind_subquery(cat, subquery, params)?;
+            Ok(BoundExpr::ScalarSubquery {
+                subquery: Box::new(subselect),
             })
         }
 
@@ -667,7 +726,12 @@ fn expr_type(expr: &BoundExpr) -> Option<SqlType> {
         BoundExpr::Function { result_type, .. } => Some(result_type.clone()),
         BoundExpr::Aggregate { result_type, .. } => Some(result_type.clone()),
         BoundExpr::Cast { target_type, .. } => Some(target_type.clone()),
+        BoundExpr::InSubquery { .. } => Some(SqlType::Boolean),
+        BoundExpr::Exists { .. } => Some(SqlType::Boolean),
+        BoundExpr::ScalarSubquery { .. } => None,
         BoundExpr::Wildcard => None,
+        BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => Some(SqlType::Boolean),
+        BoundExpr::ScalarSubquery { .. } => None,
     }
 }
 

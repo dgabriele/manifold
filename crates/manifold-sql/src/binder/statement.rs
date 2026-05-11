@@ -7,7 +7,7 @@ use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
 use crate::types::Value;
 
-use super::expr::{bind_expr, sql_data_type_to_sql_type, Scope};
+use super::expr::{bind_expr, bind_expr_with_catalog, sql_data_type_to_sql_type, Scope};
 use super::{
     AlterTableOp, BoundAssignment, BoundExpr, BoundJoin, BoundOrderBy, BoundSelect,
     BoundSelectItem, BoundStatement, BoundTableRef, InsertSource, JoinType,
@@ -383,12 +383,56 @@ fn bind_table_factor(
                 table_id,
                 table_name,
                 alias: alias_str,
+                subquery: None,
+            })
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let alias_str = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| "__derived".to_string());
+
+            // Bind the subquery to get its output schema.
+            let bound_select = bind_subquery(catalog, subquery, &[])?;
+
+            // Create a synthetic scope table from the subquery's projection.
+            let columns: Vec<(String, crate::types::SqlType, bool)> = bound_select
+                .projection
+                .iter()
+                .map(|item| {
+                    let name = item
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| item.expr.display_name());
+                    let sql_type = crate::binder::expr::bound_expr_sql_type(&item.expr);
+                    (name, sql_type, true)
+                })
+                .collect();
+
+            let table_id = scope.add_derived_table(&alias_str, &columns);
+
+            Ok(BoundTableRef {
+                table_id,
+                table_name: format!("__subquery_{}", table_id),
+                alias: Some(alias_str),
+                subquery: Some(Box::new(bound_select)),
             })
         }
         other => Err(SqlError::Bind(format!(
             "unsupported table factor: {other}"
         ))),
     }
+}
+
+/// Bind a subquery (used by IN subquery, EXISTS, derived tables).
+pub fn bind_subquery(
+    catalog: &Catalog,
+    query: &ast::Query,
+    params: &[Value],
+) -> Result<BoundSelect> {
+    bind_query_body(catalog, &query.body, params)
 }
 
 /// Build a scope from a BoundSelect's from/joins for use in ORDER BY / LIMIT binding.
