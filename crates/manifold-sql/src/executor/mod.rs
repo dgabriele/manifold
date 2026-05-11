@@ -1257,13 +1257,16 @@ fn execute_insert(
         next_rowid += 1;
 
         let encoded = encode_row(&col_types, &full_row)?;
-        data_table.insert(rowid, encoded.as_slice())?;
+        data_table.insert_buffered(rowid, encoded.as_slice())?;
 
         // Update indexes.
         update_indexes_insert(txn, table_name, &indexes, &full_row, rowid)?;
 
         count += 1;
     }
+
+    // Flush all buffered data-table writes into the B-tree in one batch.
+    data_table.flush_overlay()?;
 
     drop(data_table);
 
