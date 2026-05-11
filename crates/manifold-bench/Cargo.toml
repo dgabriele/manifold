@@ -24,7 +24,7 @@ sled = "0.34.7"
 libc = "0.2.99"
 ctrlc = "3.2.3"
 heed = "0.22"
-rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
+rocksdb = { version = "0.24.0", default-features = false, features = ["lz4"] }
 fjall = "=2.11"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 comfy-table = "7.0.1"
@@ -109,4 +109,8 @@ harness = false
 
 [[bench]]
 name = "timeseries_benchmark"
+harness = false
+
+[[bench]]
+name = "rocksdb_comparison"
 harness = false
