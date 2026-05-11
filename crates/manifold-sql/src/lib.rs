@@ -17,8 +17,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use manifold::ReadableDatabase;
+use sqlparser::ast::Visit;
 
 use catalog::Catalog;
+use planner::plan::LogicalPlan;
 
 // ---------------------------------------------------------------------------
 // Row
@@ -373,6 +375,170 @@ impl Database {
         let optimized = optimizer::optimize(plan, &catalog)?;
         Ok(executor::explain::format_plan(&optimized))
     }
+
+    /// Prepare a SQL statement for repeated execution.
+    ///
+    /// Parses, binds, plans, and optimizes the statement once. The returned
+    /// [`PreparedStatement`] can then be executed many times with different
+    /// parameters, skipping all compilation overhead.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        let stmts = parser::parse(sql)?;
+        if stmts.len() != 1 {
+            return Err(SqlError::Parse(
+                "prepare() requires exactly one statement".into(),
+            ));
+        }
+
+        let param_count = count_params(&stmts[0]);
+
+        // Create dummy params filled with Null so the binder's bounds check
+        // passes. The actual parameter values are supplied at execution time.
+        let dummy_params: Vec<Value> = vec![Value::Null; param_count];
+
+        let catalog = self.catalog.lock().unwrap();
+        let bound = binder::bind(&catalog, &stmts[0], &dummy_params)?;
+        let plan = planner::plan(&catalog, &bound)?;
+        let optimized = optimizer::optimize(plan, &catalog)?;
+
+        let columns = optimized
+            .schema()
+            .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+
+        let is_query = matches!(
+            &optimized,
+            LogicalPlan::Project { .. }
+                | LogicalPlan::Sort { .. }
+                | LogicalPlan::Limit { .. }
+                | LogicalPlan::Distinct { .. }
+                | LogicalPlan::Aggregate { .. }
+                | LogicalPlan::Scan { .. }
+                | LogicalPlan::Filter { .. }
+                | LogicalPlan::Join { .. }
+                | LogicalPlan::Union { .. }
+                | LogicalPlan::IndexScan { .. }
+        );
+
+        Ok(PreparedStatement {
+            plan: optimized,
+            param_count,
+            is_query,
+            columns,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PreparedStatement
+// ---------------------------------------------------------------------------
+
+/// A pre-compiled SQL statement that can be executed multiple times with
+/// different parameters. Created via [`Database::prepare`].
+pub struct PreparedStatement {
+    plan: LogicalPlan,
+    param_count: usize,
+    is_query: bool,
+    columns: Vec<String>,
+}
+
+impl PreparedStatement {
+    /// Execute a prepared mutating statement (INSERT, UPDATE, DELETE, etc.)
+    /// with the given parameters. Returns the number of rows affected.
+    pub fn execute(&self, db: &Database, params: &[Value]) -> Result<u64> {
+        self.validate_params(params)?;
+        let plan = self.plan.clone();
+
+        let mut catalog = db.catalog.lock().unwrap();
+
+        // If there's an active explicit transaction, use it.
+        let mut active = db.active_txn.lock().unwrap();
+        if let Some(state) = active.as_mut() {
+            executor::execute_in_txn(&state.write_txn, &mut catalog, plan, params)
+        } else {
+            drop(active);
+            executor::execute_mut(&db.db, &mut catalog, plan, params)
+        }
+    }
+
+    /// Execute a prepared query (SELECT) with the given parameters.
+    /// Returns a [`ResultSet`].
+    pub fn query(&self, db: &Database, params: &[Value]) -> Result<ResultSet> {
+        self.validate_params(params)?;
+        let plan = self.plan.clone();
+
+        let catalog = db.catalog.lock().unwrap();
+
+        // If there's an active explicit transaction, query through it.
+        let active = db.active_txn.lock().unwrap();
+        if let Some(state) = active.as_ref() {
+            executor::query_in_txn(&state.write_txn, &catalog, plan, params)
+        } else {
+            drop(active);
+            executor::execute_query(&db.db, &catalog, plan, params)
+        }
+    }
+
+    /// Returns the number of parameters expected by this statement.
+    pub fn param_count(&self) -> usize {
+        self.param_count
+    }
+
+    /// Returns whether this is a query (SELECT) statement.
+    pub fn is_query(&self) -> bool {
+        self.is_query
+    }
+
+    /// Returns the output column names (empty for non-query statements).
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    fn validate_params(&self, params: &[Value]) -> Result<()> {
+        if params.len() < self.param_count {
+            return Err(SqlError::Execute(format!(
+                "expected {} parameters, got {}",
+                self.param_count,
+                params.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parameter counting
+// ---------------------------------------------------------------------------
+
+/// Count the maximum parameter index in a SQL statement AST.
+///
+/// Uses sqlparser's `Visit` trait to walk the AST looking for `$N` placeholders,
+/// and returns the highest N found (which equals the number of params needed,
+/// since parameters are 1-based).
+fn count_params(stmt: &sqlparser::ast::Statement) -> usize {
+    use sqlparser::ast::Value as AstValue;
+
+    struct ParamCounter {
+        max_idx: usize,
+    }
+
+    impl sqlparser::ast::Visitor for ParamCounter {
+        type Break = ();
+
+        fn pre_visit_value(&mut self, value: &AstValue) -> core::ops::ControlFlow<()> {
+            if let AstValue::Placeholder(p) = value
+                && let Some(idx_str) = p.strip_prefix('$')
+                && let Ok(idx) = idx_str.parse::<usize>()
+                && idx > self.max_idx
+            {
+                self.max_idx = idx;
+            }
+            core::ops::ControlFlow::Continue(())
+        }
+    }
+
+    let mut counter = ParamCounter { max_idx: 0 };
+    let _ = stmt.visit(&mut counter);
+    counter.max_idx
 }
 
 // ---------------------------------------------------------------------------

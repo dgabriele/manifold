@@ -66,6 +66,37 @@ fn bench_point_lookup(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Point Lookup (PK) — Prepared Statement
+// ---------------------------------------------------------------------------
+
+fn bench_point_lookup_prepared(c: &mut Criterion) {
+    let mut group = c.benchmark_group("point_lookup_prepared");
+    let mut rng = rand::rng();
+
+    for &size in &[100, 1_000, 10_000, 100_000] {
+        if size >= 100_000 {
+            group.sample_size(10);
+        }
+
+        let (db, _dir) = create_db();
+        create_table(&db);
+        populate_table(&db, size);
+
+        let stmt = db
+            .prepare("SELECT id, name, value, category FROM t WHERE id = $1")
+            .unwrap();
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter(|| {
+                let id = rng.random_range(1..=size as i64);
+                stmt.query(&db, &[Value::Integer(id)]).unwrap();
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // 2. Range Scan
 // ---------------------------------------------------------------------------
 
@@ -137,6 +168,42 @@ fn bench_single_insert(c: &mut Criterion) {
             counter.set(id + 1);
             db.execute(
                 "INSERT INTO t (id, name, value, category) VALUES ($1, $2, $3, $4)",
+                &[
+                    Value::Integer(id),
+                    Value::Text(format!("name_{id}")),
+                    Value::Integer(id % 1000),
+                    Value::Text(format!("cat_{}", id % 10)),
+                ],
+            )
+            .unwrap();
+        });
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Single Insert — Prepared Statement
+// ---------------------------------------------------------------------------
+
+fn bench_single_insert_prepared(c: &mut Criterion) {
+    let mut group = c.benchmark_group("single_insert_prepared");
+
+    let (db, _dir) = create_db();
+    create_table(&db);
+    populate_table(&db, 1_000);
+
+    let stmt = db
+        .prepare("INSERT INTO t (id, name, value, category) VALUES ($1, $2, $3, $4)")
+        .unwrap();
+
+    let counter = std::cell::Cell::new(2_000_i64);
+
+    group.bench_function("insert", |b| {
+        b.iter(|| {
+            let id = counter.get();
+            counter.set(id + 1);
+            stmt.execute(
+                &db,
                 &[
                     Value::Integer(id),
                     Value::Text(format!("name_{id}")),
@@ -349,9 +416,11 @@ fn bench_group_by_aggregate(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_point_lookup,
+    bench_point_lookup_prepared,
     bench_range_scan,
     bench_full_table_scan,
     bench_single_insert,
+    bench_single_insert_prepared,
     bench_bulk_insert,
     bench_update_by_pk,
     bench_delete_by_pk,
