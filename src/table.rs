@@ -9,6 +9,7 @@ use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{AccessGuard, AccessGuardMut, StorageError, WriteTransaction};
 use crate::{Result, TableHandle};
 use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
@@ -67,6 +68,10 @@ pub struct Table<'txn, K: Key + 'static, V: Value + 'static> {
     name: String,
     transaction: &'txn WriteTransaction,
     tree: BtreeMut<K, V>,
+    // In-memory write buffer: keys map to Some(value_bytes) for inserts or None for tombstones
+    overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    // Tracks net change in entry count from buffered operations
+    len_delta: i64,
 }
 
 impl<K: Key + 'static, V: Value + 'static> TableHandle for Table<'_, K, V> {
@@ -120,6 +125,8 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
                 freed_pages,
                 allocated_pages,
             ),
+            overlay: BTreeMap::new(),
+            len_delta: 0,
         }
     }
 
@@ -128,21 +135,136 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         self.tree.print_debug(include_values)
     }
 
+    /// Flushes all buffered writes from the in-memory overlay into the B-tree.
+    ///
+    /// The overlay is drained in sorted key order (BTreeMap iteration order),
+    /// applying inserts for `Some(value)` entries and removes for `None` tombstones.
+    /// After flushing, the overlay is empty and `len_delta` is reset to 0.
+    pub fn flush_overlay(&mut self) -> Result {
+        let overlay = std::mem::take(&mut self.overlay);
+        for (key_bytes, value_opt) in overlay {
+            let key = K::from_bytes(&key_bytes);
+            match value_opt {
+                Some(value_bytes) => {
+                    let value = V::from_bytes(&value_bytes);
+                    self.tree.insert(&key, &value)?;
+                }
+                None => {
+                    self.tree.remove(&key)?;
+                }
+            }
+        }
+        self.len_delta = 0;
+        Ok(())
+    }
+
+    /// Buffers an insert in the in-memory overlay without mutating the B-tree.
+    ///
+    /// The write is deferred until `flush_overlay()` is called (or Table is dropped).
+    /// Reads via `get()` will see buffered values immediately.
+    /// Note: `range()`, `iter()`, `first()`, and `last()` do NOT reflect buffered
+    /// writes until `flush_overlay()` is called.
+    pub fn insert_buffered<'k, 'v>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+        value: impl Borrow<V::SelfType<'v>>,
+    ) -> Result {
+        let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
+        let value_bytes = V::as_bytes(value.borrow()).as_ref().to_vec();
+
+        if value_bytes.len() > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(value_bytes.len()));
+        }
+        if key_bytes.len() > MAX_VALUE_LENGTH {
+            return Err(StorageError::ValueTooLarge(key_bytes.len()));
+        }
+        if value_bytes.len() + key_bytes.len() > MAX_PAIR_LENGTH {
+            return Err(StorageError::ValueTooLarge(
+                value_bytes.len() + key_bytes.len(),
+            ));
+        }
+
+        match self.overlay.get(&key_bytes) {
+            Some(Some(_)) => {
+                // Already in overlay with a value: update, no len change
+            }
+            Some(None) => {
+                // Tombstone in overlay: un-deleting
+                self.len_delta += 1;
+            }
+            None => {
+                // Not in overlay: check B-tree
+                let btree_key = K::from_bytes(&key_bytes);
+                if self.tree.get(&btree_key)?.is_none() {
+                    self.len_delta += 1;
+                }
+            }
+        }
+
+        self.overlay.insert(key_bytes, Some(value_bytes));
+        Ok(())
+    }
+
+    /// Buffers a remove (tombstone) in the in-memory overlay without mutating the B-tree.
+    ///
+    /// The remove is deferred until `flush_overlay()` is called (or Table is dropped).
+    /// Reads via `get()` will see the key as absent immediately.
+    /// Note: `range()`, `iter()`, `first()`, and `last()` do NOT reflect buffered
+    /// removes until `flush_overlay()` is called.
+    pub fn remove_buffered<'k>(
+        &mut self,
+        key: impl Borrow<K::SelfType<'k>>,
+    ) -> Result {
+        let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
+
+        match self.overlay.get(&key_bytes) {
+            Some(None) => {
+                // Already a tombstone: no change
+                return Ok(());
+            }
+            Some(Some(_)) => {
+                // Was in overlay with a value: check if key exists in B-tree
+                let btree_key = K::from_bytes(&key_bytes);
+                if self.tree.get(&btree_key)?.is_some() {
+                    // Key existed in B-tree AND was overwritten in overlay;
+                    // tombstone removes the B-tree entry, net -1
+                    self.len_delta -= 1;
+                } else {
+                    // Key only existed in overlay (new insert), tombstone cancels it
+                    self.len_delta -= 1;
+                }
+            }
+            None => {
+                // Not in overlay: check B-tree
+                let btree_key = K::from_bytes(&key_bytes);
+                if self.tree.get(&btree_key)?.is_some() {
+                    self.len_delta -= 1;
+                }
+            }
+        }
+
+        self.overlay.insert(key_bytes, None);
+        Ok(())
+    }
+
     /// Returns an accessor, which allows mutation, to the value corresponding to the given key
     pub fn get_mut<'k>(
         &mut self,
         key: impl Borrow<K::SelfType<'k>>,
     ) -> Result<Option<AccessGuardMut<'_, V>>> {
+        self.flush_overlay()?;
         self.tree.get_mut(key.borrow())
     }
 
     /// Removes and returns the first key-value pair in the table
     pub fn pop_first(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
+        self.flush_overlay()?;
         self.tree.pop_first()
     }
 
     /// Removes and returns the last key-value pair in the table
     pub fn pop_last(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
+        self.flush_overlay()?;
         self.tree.pop_last()
     }
 
@@ -158,6 +280,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         &mut self,
         predicate: F,
     ) -> Result<ExtractIf<'_, K, V, F>> {
+        self.flush_overlay()?;
         self.extract_from_if::<K::SelfType<'_>, F>(.., predicate)
     }
 
@@ -177,6 +300,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
+        self.flush_overlay()?;
         let inner = self.tree.extract_from_if(&range, predicate)?;
         Ok(ExtractIf::new(inner, Some(self.transaction)))
     }
@@ -192,6 +316,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         &mut self,
         predicate: F,
     ) -> Result {
+        self.flush_overlay()?;
         let mut panic_guard = RetainPanicGuard::new(self.transaction);
         let result = self.tree.retain_in::<K::SelfType<'_>, F>(predicate, ..);
         panic_guard.disarm();
@@ -213,6 +338,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
+        self.flush_overlay()?;
         let mut panic_guard = RetainPanicGuard::new(self.transaction);
         let result = self.tree.retain_in(predicate, range);
         panic_guard.disarm();
@@ -454,6 +580,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     /// This is analogous to [`std::collections::BTreeMap::entry`], and avoids the double
     /// lookup that a `get` followed by `insert` would require when updating a value.
     pub fn entry<'a>(&'a mut self, key: K::SelfType<'a>) -> Result<Entry<'a, K, V>> {
+        self.flush_overlay()?;
         let key_len = K::as_bytes(&key).as_ref().len();
         if key_len > MAX_VALUE_LENGTH {
             return Err(StorageError::ValueTooLarge(key_len));
@@ -487,6 +614,7 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
         key: impl Borrow<K::SelfType<'a>>,
         value_length: usize,
     ) -> Result<AccessGuardMutInPlace<'_, V>> {
+        self.flush_overlay()?;
         if value_length > MAX_VALUE_LENGTH {
             return Err(StorageError::ValueTooLarge(value_length));
         }
@@ -516,15 +644,27 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for Table<'_, K
     }
 
     fn len(&self) -> Result<u64> {
-        self.tree.len()
+        let base_len = self.tree.len()?;
+        Ok((base_len as i64 + self.len_delta) as u64)
     }
 }
 
 impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'_, K, V> {
     fn get<'a>(&self, key: impl Borrow<K::SelfType<'a>>) -> Result<Option<AccessGuard<'_, V>>> {
+        let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
+        if let Some(entry) = self.overlay.get(&key_bytes) {
+            return match entry {
+                Some(value_bytes) => {
+                    Ok(Some(AccessGuard::with_owned_value(value_bytes.clone())))
+                }
+                None => Ok(None),
+            };
+        }
         self.tree.get(key.borrow())
     }
 
+    /// Note: buffered writes via `insert_buffered()` are NOT visible in range iteration
+    /// until `flush_overlay()` is called.
     fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<'_, K, V>>
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
@@ -534,10 +674,14 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'_, K, 
             .map(|x| Range::new(x, self.transaction.transaction_guard()))
     }
 
+    /// Note: buffered writes via `insert_buffered()` are NOT visible until
+    /// `flush_overlay()` is called.
     fn first(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
         self.tree.first()
     }
 
+    /// Note: buffered writes via `insert_buffered()` are NOT visible until
+    /// `flush_overlay()` is called.
     fn last(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
         self.tree.last()
     }
@@ -547,6 +691,11 @@ impl<K: Key, V: Value> Sealed for Table<'_, K, V> {}
 
 impl<K: Key + 'static, V: Value + 'static> Drop for Table<'_, K, V> {
     fn drop(&mut self) {
+        if !self.overlay.is_empty() {
+            if let Err(e) = self.flush_overlay() {
+                eprintln!("Warning: failed to flush write buffer overlay on Table drop: {e}");
+            }
+        }
         self.transaction.close_table(
             &self.name,
             &self.tree,
