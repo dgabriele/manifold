@@ -130,7 +130,8 @@ pub fn load_catalog(txn: &manifold::ReadTransaction) -> Result<Catalog> {
     Ok(catalog)
 }
 
-/// Persist a table schema to the system tables.
+/// Persist a table schema to the system tables (schema + sequence).
+/// Use this for DDL operations that change the schema structure.
 pub fn save_table(txn: &manifold::WriteTransaction, schema: &TableSchema) -> Result<()> {
     let json = serde_json::to_vec(schema)
         .map_err(|e| SqlError::Internal(format!("failed to serialize table schema: {e}")))?;
@@ -138,9 +139,16 @@ pub fn save_table(txn: &manifold::WriteTransaction, schema: &TableSchema) -> Res
     let mut tables = txn.open_table(TABLES_TABLE)?;
     tables.insert(schema.id, json.as_slice())?;
 
-    let mut sequences = txn.open_table(SEQUENCES_TABLE)?;
-    sequences.insert(schema.id, schema.next_rowid)?;
+    save_sequence(txn, schema.id, schema.next_rowid)?;
 
+    Ok(())
+}
+
+/// Persist only the sequence counter (next_rowid) for a table.
+/// Use this for DML operations (INSERT) that only change the rowid counter.
+pub fn save_sequence(txn: &manifold::WriteTransaction, table_id: TableId, next_rowid: u64) -> Result<()> {
+    let mut sequences = txn.open_table(SEQUENCES_TABLE)?;
+    sequences.insert(table_id, next_rowid)?;
     Ok(())
 }
 

@@ -1272,8 +1272,7 @@ fn execute_insert(
         .get_table_mut(table_name)
         .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
     schema_mut.next_rowid = next_rowid;
-    let updated = schema_mut.clone();
-    persist::save_table(txn, &updated)?;
+    persist::save_sequence(txn, schema_mut.id, next_rowid)?;
 
     Ok(count)
 }
