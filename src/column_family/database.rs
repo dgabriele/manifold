@@ -391,10 +391,44 @@ impl ColumnFamilyDatabase {
             let mem = db.get_memory();
 
             for entry in entries_for_cf {
-                // LogicalOps entries are handled separately during deferred flush replay
+                match &entry.payload {
+                    super::wal::entry::WALPayload::LogicalOps(payload) => {
+                        // During recovery, apply LogicalOps directly to the B-tree
+                        // (same as checkpoint). This means the memtable starts empty
+                        // after recovery, which is the simplest correct behavior.
+                        let txn = db.begin_write().map_err(|e| {
+                            DatabaseError::Storage(StorageError::from(io::Error::other(
+                                format!("recovery begin_write: {e}"),
+                            )))
+                        })?;
+                        {
+                            let table_def: crate::TableDefinition<&[u8], &[u8]> =
+                                crate::TableDefinition::new(&payload.table_name);
+                            let mut table = txn.open_table(table_def).map_err(|e| {
+                                DatabaseError::Storage(StorageError::from(io::Error::other(
+                                    format!("recovery open_table: {e}"),
+                                )))
+                            })?;
+                            for op in &payload.ops {
+                                match &op.value {
+                                    Some(v) => {
+                                        let _ = table.insert(op.key.as_slice(), v.as_slice());
+                                    }
+                                    None => {
+                                        let _ = table.remove(op.key.as_slice());
+                                    }
+                                }
+                            }
+                        }
+                        let _ = txn.commit();
+                        continue;
+                    }
+                    super::wal::entry::WALPayload::Transaction(_) => {}
+                }
+
                 let txn_payload = match &entry.payload {
                     super::wal::entry::WALPayload::Transaction(p) => p,
-                    super::wal::entry::WALPayload::LogicalOps(_) => continue,
+                    super::wal::entry::WALPayload::LogicalOps(_) => unreachable!(),
                 };
 
                 // Convert WAL payload to BtreeHeader format
