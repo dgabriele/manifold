@@ -171,6 +171,7 @@ pub struct ColumnFamilyDatabase {
     header: Arc<RwLock<MasterHeader>>,
     wal_journal: Option<Arc<WALJournal>>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
+    deferred_flush: bool,
 }
 
 impl ColumnFamilyDatabase {
@@ -306,6 +307,7 @@ impl ColumnFamilyDatabase {
             header,
             wal_journal,
             checkpoint_manager,
+            deferred_flush: false,
         })
     }
 
@@ -473,11 +475,17 @@ impl ColumnFamilyDatabase {
         Ok(())
     }
 
+    /// Returns whether deferred flush mode is enabled.
+    pub fn is_deferred_flush(&self) -> bool {
+        self.deferred_flush
+    }
+
     /// Internal implementation of open, called by the builder (native platforms).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open_with_builder(
         path: PathBuf,
         pool_size: usize,
+        deferred_flush: bool,
     ) -> Result<Self, DatabaseError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -564,6 +572,7 @@ impl ColumnFamilyDatabase {
                 header: Arc::clone(&header),
                 wal_journal: Some(Arc::clone(journal_arc)),
                 checkpoint_manager: None, // Will be set after creation
+                deferred_flush,
             });
 
             let manager = CheckpointManager::start(Arc::clone(journal_arc), db_arc, config);
@@ -581,6 +590,7 @@ impl ColumnFamilyDatabase {
             header,
             wal_journal,
             checkpoint_manager,
+            deferred_flush,
         })
     }
 
@@ -648,6 +658,12 @@ impl ColumnFamilyDatabase {
         let state = Arc::new(ColumnFamilyState::new(name.clone(), segments));
         cfs.insert(name.clone(), Arc::clone(&state));
 
+        let memtable = if self.deferred_flush {
+            Some(crate::column_family::memtable::new_shared_memtable())
+        } else {
+            None
+        };
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             Ok(ColumnFamily {
@@ -659,6 +675,7 @@ impl ColumnFamilyDatabase {
                 header_backend: self.header_backend.clone(),
                 wal_journal: self.wal_journal.clone(),
                 checkpoint_manager: self.checkpoint_manager.clone(),
+                memtable,
             })
         }
         #[cfg(target_arch = "wasm32")]
@@ -672,6 +689,7 @@ impl ColumnFamilyDatabase {
                 file_growth_lock: self.file_growth_lock.clone(),
                 wal_journal: self.wal_journal.clone(),
                 checkpoint_manager: self.checkpoint_manager.clone(),
+                memtable,
             })
         }
     }
@@ -688,6 +706,12 @@ impl ColumnFamilyDatabase {
 
         match cfs.get(name) {
             Some(state) => {
+                let memtable = if self.deferred_flush {
+                    Some(crate::column_family::memtable::new_shared_memtable())
+                } else {
+                    None
+                };
+
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     Ok(ColumnFamily {
@@ -699,6 +723,7 @@ impl ColumnFamilyDatabase {
                         header_backend: self.header_backend.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
+                        memtable,
                     })
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -712,6 +737,7 @@ impl ColumnFamilyDatabase {
                         file_growth_lock: self.file_growth_lock.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
+                        memtable,
                     })
                 }
             }
@@ -747,6 +773,12 @@ impl ColumnFamilyDatabase {
         {
             let cfs = self.column_families.read().unwrap();
             if let Some(state) = cfs.get(name) {
+                let memtable = if self.deferred_flush {
+                    Some(crate::column_family::memtable::new_shared_memtable())
+                } else {
+                    None
+                };
+
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     return Ok(ColumnFamily {
@@ -758,6 +790,7 @@ impl ColumnFamilyDatabase {
                         header_backend: self.header_backend.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
+                        memtable,
                     });
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -770,6 +803,7 @@ impl ColumnFamilyDatabase {
                         header_backend: self.header_backend.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
+                        memtable,
                     });
                 }
             }
@@ -1050,12 +1084,18 @@ pub struct ColumnFamily {
     header: Arc<RwLock<MasterHeader>>,
     wal_journal: Option<Arc<WALJournal>>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
+    memtable: Option<crate::column_family::memtable::SharedMemtable>,
 }
 
 impl ColumnFamily {
     /// Returns the name of this column family.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns a reference to the shared memtable, if deferred flush is enabled.
+    pub(crate) fn memtable(&self) -> Option<&crate::column_family::memtable::SharedMemtable> {
+        self.memtable.as_ref()
     }
 
     /// Begins a write transaction for this column family.
@@ -1087,6 +1127,8 @@ impl ColumnFamily {
             );
         }
 
+        // TODO(deferred-flush): txn.set_deferred_flush_context(memtable) — added in Task 4
+
         Ok(txn)
     }
 
@@ -1100,6 +1142,9 @@ impl ColumnFamily {
                 "database initialization error: {e}"
             )))),
         })?;
+
+        // TODO(deferred-flush): txn.set_memtable_snapshot(snapshot) — added in Task 5
+
         db.begin_read()
     }
 
