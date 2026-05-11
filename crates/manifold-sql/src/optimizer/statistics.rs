@@ -1,15 +1,17 @@
+use serde::{Deserialize, Serialize};
+
 use crate::catalog::schema::TableId;
 use crate::catalog::Catalog;
 
 /// Statistics for a single table, used by the optimizer for cost estimation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableStatistics {
     pub row_count: u64,
     pub indexes: Vec<IndexStatistics>,
 }
 
 /// Statistics for a single index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStatistics {
     pub name: String,
     pub cardinality: u64,

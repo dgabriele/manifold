@@ -257,7 +257,7 @@ impl Database {
         })
     }
 
-    /// Show the optimized plan for a SQL statement.
+    /// Show the optimized plan for a SQL statement as a human-readable tree.
     pub fn explain(&self, sql: &str) -> Result<String> {
         let stmts = parser::parse(sql)?;
         let stmt = stmts
@@ -268,7 +268,7 @@ impl Database {
         let bound = binder::bind(&catalog, stmt, &[])?;
         let plan = planner::plan(&catalog, &bound)?;
         let optimized = optimizer::optimize(plan, &catalog)?;
-        Ok(format!("{optimized:?}"))
+        Ok(executor::explain::format_plan(&optimized))
     }
 }
 

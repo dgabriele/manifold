@@ -545,3 +545,26 @@ fn count_empty_table() {
     assert_eq!(result.row_count(), 1);
     assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// EXPLAIN and ANALYZE tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn explain_basic() {
+    let (db, _dir) = setup();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", &[]).unwrap();
+    let plan = db.explain("SELECT name FROM t WHERE id = 1").unwrap();
+    assert!(plan.contains("Scan") || plan.contains("scan"), "expected Scan in plan, got: {plan}");
+    assert!(plan.contains("Filter") || plan.contains("filter"), "expected Filter in plan, got: {plan}");
+}
+
+#[test]
+fn analyze_command() {
+    let (db, _dir) = setup();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", &[]).unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (1, 'a')", &[]).unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (2, 'b')", &[]).unwrap();
+    db.execute("ANALYZE t", &[]).unwrap();
+    // After ANALYZE, the optimizer should have stats. Just verify it doesn't error.
+}

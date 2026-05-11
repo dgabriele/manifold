@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod explain;
 mod filter;
 pub mod join;
 mod limit;
@@ -17,7 +18,9 @@ use crate::catalog::schema::{ColumnDef, ConstraintDef, IndexDef, TableSchema};
 use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
 use crate::expr::eval::evaluate;
+use crate::optimizer::statistics::{IndexStatistics, TableStatistics};
 use crate::planner::plan::{LogicalPlan, ScalarExpr};
+use crate::storage::catalog_tables::STATISTICS_TABLE;
 use crate::storage::index::encode_index_key;
 use crate::storage::row_format::{decode_row, encode_row};
 use crate::types::{SqlType, Value};
@@ -253,6 +256,15 @@ fn build_read_query_executor(
             let child = build_read_query_executor(txn, catalog, input, params)?;
             Ok(Box::new(union::UnionDistinct::new(child, Box::new(EmptyExecutor))?))
         }
+        LogicalPlan::Explain { input } => {
+            let formatted = explain::format_plan(input);
+            Ok(Box::new(values::Values::new(
+                vec![vec![crate::planner::plan::ScalarExpr::Literal(
+                    Value::Text(formatted),
+                )]],
+                params,
+            )))
+        }
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(
             "unsupported plan node in query: {plan:?}"
@@ -400,6 +412,15 @@ fn build_write_query_executor(
         LogicalPlan::Distinct { input } => {
             let child = build_write_query_executor(txn, catalog, input, params)?;
             Ok(Box::new(union::UnionDistinct::new(child, Box::new(EmptyExecutor))?))
+        }
+        LogicalPlan::Explain { input } => {
+            let formatted = explain::format_plan(input);
+            Ok(Box::new(values::Values::new(
+                vec![vec![crate::planner::plan::ScalarExpr::Literal(
+                    Value::Text(formatted),
+                )]],
+                params,
+            )))
         }
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(
@@ -617,6 +638,14 @@ fn execute_plan_mut(
         LogicalPlan::Delete {
             table_name, input, ..
         } => execute_delete(txn, catalog, table_name, input, params),
+
+        LogicalPlan::Analyze { table_name } => {
+            execute_analyze(txn, catalog, table_name.as_deref())
+        }
+
+        // EXPLAIN can also arrive via execute_mut when issued as a bare
+        // statement (e.g. EXPLAIN CREATE TABLE …).  Just no-op.
+        LogicalPlan::Explain { .. } => Ok(0),
 
         _ => Err(SqlError::Execute(format!(
             "unsupported mutating plan: {plan:?}"
@@ -1688,6 +1717,92 @@ fn check_delete_constraints(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ANALYZE
+// ---------------------------------------------------------------------------
+
+/// Execute an ANALYZE statement.
+///
+/// For each table being analyzed, count rows and gather cardinality estimates
+/// for indexed columns, then persist the result to `_statistics`.
+fn execute_analyze(
+    txn: &manifold::WriteTransaction,
+    catalog: &Catalog,
+    table_name: Option<&str>,
+) -> Result<u64> {
+    let names: Vec<String> = if let Some(name) = table_name {
+        if !catalog.has_table(name) {
+            return Err(SqlError::TableNotFound(name.to_string()));
+        }
+        vec![name.to_string()]
+    } else {
+        catalog.table_names()
+    };
+
+    let mut stats_table = txn.open_table(STATISTICS_TABLE)?;
+
+    for name in &names {
+        let schema = match catalog.get_table(name) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+
+        let col_types = schema.column_types();
+
+        // Count rows and collect per-column distinct values.
+        let data_name = data_table_name(name);
+        let data_def = TableDefinition::<u64, &[u8]>::new(data_name);
+        let data_table = txn.open_table(data_def)?;
+
+        let indexes: Vec<IndexDef> = catalog
+            .indexes_for_table(schema.id)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // Track distinct values per index column set using encoded key bytes.
+        let mut distinct_sets: Vec<std::collections::HashSet<Vec<u8>>> =
+            indexes.iter().map(|_| std::collections::HashSet::new()).collect();
+
+        let mut row_count: u64 = 0;
+
+        let iter = data_table.iter().map_err(SqlError::Storage)?;
+        for entry in iter {
+            let (_, v) = entry.map_err(SqlError::Storage)?;
+            let row = decode_row(&col_types, v.value())?;
+            row_count += 1;
+
+            for (i, idx) in indexes.iter().enumerate() {
+                let key_vals: Vec<Value> = idx.columns.iter().map(|&ci| row[ci].clone()).collect();
+                let key_bytes = encode_index_key(&key_vals);
+                distinct_sets[i].insert(key_bytes);
+            }
+        }
+
+        let index_stats: Vec<IndexStatistics> = indexes
+            .iter()
+            .zip(distinct_sets.iter())
+            .map(|(idx, distinct)| IndexStatistics {
+                name: idx.name.clone(),
+                cardinality: distinct.len() as u64,
+            })
+            .collect();
+
+        let table_stats = TableStatistics {
+            row_count,
+            indexes: index_stats,
+        };
+
+        let json = serde_json::to_vec(&table_stats).map_err(|e| {
+            SqlError::Internal(format!("failed to serialize statistics for '{name}': {e}"))
+        })?;
+
+        stats_table.insert(schema.id, json.as_slice())?;
+    }
+
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
