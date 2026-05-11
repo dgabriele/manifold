@@ -41,3 +41,4 @@ flamegraph.svg
 *.pem
 credentials.json
 secrets.json
+.worktrees/
