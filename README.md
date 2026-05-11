@@ -158,6 +158,44 @@ For a more realistic comparison showcasing column family performance with concur
 
 > **Note on Benchmarks**: These benchmarks test single-database performance. Manifold's primary advantage is **concurrent writes via column families** (see 4.8x speedup vs vanilla redb above). RocksDB and Fjall also support column families/partitions. For column-family-optimized benchmarks, run `cargo run --release --bin cf_comparison_benchmark`.
 
+### Deferred Flush (Write Optimization)
+
+Manifold offers an opt-in **deferred flush** mode that eliminates B-tree mutation from the commit path. When enabled, writes go to the WAL and an in-memory memtable — the B-tree is updated later by a background checkpoint. This matches the write architecture used by RocksDB and other LSM-based engines.
+
+```rust
+let db = ColumnFamilyDatabase::builder()
+    .deferred_flush(true)  // opt-in, default is false
+    .open("my_db.manifold")?;
+```
+
+**How it works:**
+- `insert()` / `remove()` append to the WAL and merge into a shared in-memory memtable — no B-tree pages are read, copied, or written
+- `commit()` cost is one sequential WAL write + one in-memory merge
+- `get()` checks the memtable first, then falls through to the B-tree (read-your-own-writes)
+- A background checkpoint periodically drains the memtable into the B-tree in sorted key order
+
+**Manifold vs RocksDB** (8-byte keys, 100-byte values, 1000-key batches):
+
+| Workload | Scale | Manifold | RocksDB | Ratio |
+|----------|-------|----------|---------|-------|
+| **Sequential Write** | 100K | 214K ops/s | 687K ops/s | 0.31x |
+| | 1M | 185K ops/s | 646K ops/s | 0.29x |
+| | 2M | 199K ops/s | 653K ops/s | 0.30x |
+| **Random Write** | 100K | 197K ops/s | 354K ops/s | 0.56x |
+| | 1M | 163K ops/s | 277K ops/s | 0.59x |
+| | 2M | 164K ops/s | 269K ops/s | 0.61x |
+| **Point Read** | 100K | 2.91M ops/s | 1.02M ops/s | **2.86x** |
+| | 1M | 1.83M ops/s | 507K ops/s | **3.62x** |
+| **Range Scan** | 100K | (B-tree advantage) | | |
+
+**Key takeaways:**
+- RocksDB's LSM tree wins on raw write throughput (~3x sequential, ~1.7x random) due to its append-only architecture
+- Manifold wins on reads (**2-3.6x faster** point lookups up to 5M keys) thanks to B-tree's single root-to-leaf traversal vs RocksDB's multi-level search
+- With deferred flush, Manifold's random write gap is **stable across scale** (~0.6x) instead of degrading (was 0.09x at 10M without deferred flush)
+- Manifold's column family isolation provides additional write scaling not shown in single-table benchmarks
+
+Source: [rocksdb_comparison.rs](./crates/manifold-bench/benches/rocksdb_comparison.rs)
+
 ---
 
 ## Column Families Architecture
