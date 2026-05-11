@@ -1,4 +1,5 @@
 mod filter;
+pub mod join;
 mod limit;
 mod project;
 mod scan;
@@ -180,6 +181,20 @@ fn build_read_query_executor(
         LogicalPlan::Values { rows, .. } => {
             Ok(Box::new(values::Values::new(rows.clone(), params)))
         }
+        LogicalPlan::Join {
+            join_type,
+            left,
+            right,
+            condition,
+            ..
+        } => build_join_executor(
+            |plan| build_read_query_executor(txn, catalog, plan, params),
+            *join_type,
+            left,
+            right,
+            condition.as_ref(),
+            params,
+        ),
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(
             "unsupported plan node in query: {plan:?}"
@@ -259,11 +274,72 @@ fn build_write_query_executor(
         LogicalPlan::Values { rows, .. } => {
             Ok(Box::new(values::Values::new(rows.clone(), params)))
         }
+        LogicalPlan::Join {
+            join_type,
+            left,
+            right,
+            condition,
+            ..
+        } => build_join_executor(
+            |plan| build_write_query_executor(txn, catalog, plan, params),
+            *join_type,
+            left,
+            right,
+            condition.as_ref(),
+            params,
+        ),
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(
             "unsupported plan node in query: {plan:?}"
         ))),
     }
+}
+
+/// Build a NestedLoopJoin from left/right sub-plans.
+///
+/// The `build_child` closure constructs an executor for a child plan node
+/// (abstracting over read vs write transaction).
+fn build_join_executor<F>(
+    build_child: F,
+    join_type: crate::binder::JoinType,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    condition: Option<&ScalarExpr>,
+    params: &[Value],
+) -> Result<Box<dyn Executor>>
+where
+    F: Fn(&LogicalPlan) -> Result<Box<dyn Executor>>,
+{
+    let left_has_scan = plan_has_scan_leaf(left);
+    let right_has_scan = plan_has_scan_leaf(right);
+    let left_skip = if left_has_scan { 1 } else { 0 };
+    let right_skip = if right_has_scan { 1 } else { 0 };
+
+    let left_plan_width = left.schema().map_or(0, |s| s.len());
+    let right_plan_width = right.schema().map_or(0, |s| s.len());
+
+    let left_exec = build_child(left)?;
+    let right_exec = build_child(right)?;
+
+    // Shift condition column refs to account for rowid prefixes from scans.
+    // Left columns in the condition are at plan indices [0..left_plan_width).
+    // In the combined row we emit (after stripping rowids), they stay at [0..left_plan_width).
+    // Right columns in the condition are at plan indices [left_plan_width..).
+    // In the combined row they are also at [left_plan_width..) since we strip rowids.
+    // So no shifting is needed for the condition - the combined row matches the plan schema.
+    let cond = condition.cloned();
+
+    Ok(Box::new(join::NestedLoopJoin::new(
+        left_exec,
+        right_exec,
+        join_type,
+        cond,
+        params,
+        left_skip,
+        right_skip,
+        left_plan_width,
+        right_plan_width,
+    )?))
 }
 
 /// Shift all ColumnRef indices in a ScalarExpr by a given offset.
