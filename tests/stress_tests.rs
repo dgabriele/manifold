@@ -1559,4 +1559,234 @@ mod stress {
         let t = txn.open_table(TABLE_U64).unwrap();
         assert_eq!(t.len().unwrap(), cycles as u64 * writes_per_cycle);
     }
+
+    // ========================================================================
+    // WRITE BUFFER HELPERS
+    // ========================================================================
+
+    fn shuffled_keys_seeded(n: u64, seed: u64) -> Vec<u64> {
+        let mut keys: Vec<u64> = (0..n).collect();
+        let mut rng = seed;
+        for i in (1..keys.len()).rev() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (rng >> 33) as usize % (i + 1);
+            keys.swap(i, j);
+        }
+        keys
+    }
+
+    // ========================================================================
+    // 25. WRITE BUFFER: READ-YOUR-WRITES
+    // ========================================================================
+
+    /// Inserts 10K random keys via insert_buffered and verifies they are
+    /// readable via get() within the same transaction (read-your-own-writes).
+    /// After commit, verifies all keys are persisted.
+    #[test]
+    fn stress_write_buffer_read_your_writes() {
+        let tmp = tmpfile();
+        let db = Database::create(tmp.path()).unwrap();
+
+        let keys = shuffled_keys_seeded(10_000, 42);
+
+        // Write phase: insert_buffered + verify in same txn
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(TABLE_U64).unwrap();
+            for &k in &keys {
+                t.insert_buffered(&k, &(k * 3)).unwrap();
+            }
+            // Verify each key is readable via get()
+            for &k in &keys {
+                let val = t.get(&k).unwrap().unwrap();
+                assert_eq!(val.value(), k * 3, "Read-your-write failed for key {}", k);
+            }
+            // Verify len is exact
+            assert_eq!(t.len().unwrap(), 10_000);
+        }
+        txn.commit().unwrap();
+
+        // Read back via read transaction
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(TABLE_U64).unwrap();
+        assert_eq!(t.len().unwrap(), 10_000);
+        for &k in &keys {
+            let val = t.get(&k).unwrap().unwrap();
+            assert_eq!(val.value(), k * 3, "Persisted value mismatch for key {}", k);
+        }
+    }
+
+    // ========================================================================
+    // 26. WRITE BUFFER: TOMBSTONES
+    // ========================================================================
+
+    /// Seeds 100 keys via regular insert, then uses insert_buffered and
+    /// remove_buffered to add new keys and delete some. Verifies len(),
+    /// get() for removed and surviving keys, and final persisted state.
+    #[test]
+    fn stress_write_buffer_tombstones() {
+        let tmp = tmpfile();
+        let db = Database::create(tmp.path()).unwrap();
+
+        // Seed 100 keys (0..100) via regular insert
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(TABLE_U64).unwrap();
+            for i in 0u64..100 {
+                t.insert(&i, &(i * 10)).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+
+        // New transaction: buffer inserts and deletes
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(TABLE_U64).unwrap();
+
+            // insert_buffered keys 100..200
+            for i in 100u64..200 {
+                t.insert_buffered(&i, &(i * 10)).unwrap();
+            }
+
+            // remove_buffered keys 0..10 (existing on disk)
+            for i in 0u64..10 {
+                t.remove_buffered(&i).unwrap();
+            }
+
+            // remove_buffered keys 100..110 (just buffered above)
+            for i in 100u64..110 {
+                t.remove_buffered(&i).unwrap();
+            }
+
+            // Verify len: 100 original - 10 removed + 100 added - 10 removed = 180
+            assert_eq!(t.len().unwrap(), 180, "len() should be exactly 180");
+
+            // Verify removed keys return None
+            for i in 0u64..10 {
+                assert!(t.get(&i).unwrap().is_none(), "Key {} should be tombstoned", i);
+            }
+            for i in 100u64..110 {
+                assert!(t.get(&i).unwrap().is_none(), "Key {} should be tombstoned", i);
+            }
+
+            // Verify surviving keys return values
+            for i in 10u64..100 {
+                let val = t.get(&i).unwrap().unwrap();
+                assert_eq!(val.value(), i * 10);
+            }
+            for i in 110u64..200 {
+                let val = t.get(&i).unwrap().unwrap();
+                assert_eq!(val.value(), i * 10);
+            }
+        }
+        txn.commit().unwrap();
+
+        // Read back and verify final state
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(TABLE_U64).unwrap();
+        assert_eq!(t.len().unwrap(), 180);
+
+        for i in 0u64..10 {
+            assert!(t.get(&i).unwrap().is_none(), "Key {} should not exist after commit", i);
+        }
+        for i in 100u64..110 {
+            assert!(t.get(&i).unwrap().is_none(), "Key {} should not exist after commit", i);
+        }
+        for i in 10u64..100 {
+            assert_eq!(t.get(&i).unwrap().unwrap().value(), i * 10);
+        }
+        for i in 110u64..200 {
+            assert_eq!(t.get(&i).unwrap().unwrap().value(), i * 10);
+        }
+    }
+
+    // ========================================================================
+    // 27. WRITE BUFFER: LARGE BATCH (1M KEYS)
+    // ========================================================================
+
+    /// Inserts 1M random keys via insert_buffered in a single transaction.
+    /// Verifies len, commits, and spot-checks persisted data.
+    #[test]
+    fn stress_write_buffer_large_batch() {
+        let tmp = tmpfile();
+        let db = Database::create(tmp.path()).unwrap();
+
+        let n = 1_000_000u64;
+        let keys = shuffled_keys_seeded(n, 7777);
+
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(TABLE_U64).unwrap();
+            for &k in &keys {
+                t.insert_buffered(&k, &(k.wrapping_mul(17))).unwrap();
+            }
+            assert_eq!(t.len().unwrap(), n);
+        }
+        txn.commit().unwrap();
+
+        // Read back: verify len and spot-check
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(TABLE_U64).unwrap();
+        assert_eq!(t.len().unwrap(), n);
+
+        // Spot-check first, middle, last keys from the shuffled order
+        for &k in &[keys[0], keys[n as usize / 2], keys[n as usize - 1]] {
+            let val = t.get(&k).unwrap().unwrap();
+            assert_eq!(val.value(), k.wrapping_mul(17), "Spot check failed for key {}", k);
+        }
+        // Also check boundary keys
+        assert_eq!(t.get(&0u64).unwrap().unwrap().value(), 0u64.wrapping_mul(17));
+        assert_eq!(
+            t.get(&(n - 1)).unwrap().unwrap().value(),
+            (n - 1).wrapping_mul(17)
+        );
+    }
+
+    // ========================================================================
+    // 28. WRITE BUFFER: MIXED DIRECT AND BUFFERED
+    // ========================================================================
+
+    /// In one transaction, uses regular insert() for even keys and
+    /// insert_buffered() for odd keys. Verifies all keys readable and
+    /// len is correct both before and after commit.
+    #[test]
+    fn stress_write_buffer_mixed_direct_and_buffered() {
+        let tmp = tmpfile();
+        let db = Database::create(tmp.path()).unwrap();
+
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(TABLE_U64).unwrap();
+
+            // insert() even keys 0, 2, 4, ..., 98
+            for i in (0u64..100).step_by(2) {
+                t.insert(&i, &(i * 5)).unwrap();
+            }
+
+            // insert_buffered() odd keys 1, 3, 5, ..., 99
+            for i in (1u64..100).step_by(2) {
+                t.insert_buffered(&i, &(i * 5)).unwrap();
+            }
+
+            // Verify all 100 keys are readable
+            for i in 0u64..100 {
+                let val = t.get(&i).unwrap();
+                assert!(val.is_some(), "Key {} not found in mixed insert", i);
+                assert_eq!(val.unwrap().value(), i * 5);
+            }
+
+            // Verify len
+            assert_eq!(t.len().unwrap(), 100);
+        }
+        txn.commit().unwrap();
+
+        // Read back via read transaction
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(TABLE_U64).unwrap();
+        assert_eq!(t.len().unwrap(), 100);
+        for i in 0u64..100 {
+            let val = t.get(&i).unwrap().unwrap();
+            assert_eq!(val.value(), i * 5, "Persisted mismatch for key {}", i);
+        }
+    }
 }
