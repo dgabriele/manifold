@@ -36,8 +36,8 @@ impl SqlType {
             SqlType::Decimal { .. } => Some(16),
             SqlType::Uuid => Some(16),
             SqlType::Date => Some(4),
-            SqlType::Timestamp => Some(12),
-            SqlType::TimestampTz => Some(12),
+            SqlType::Timestamp => Some(8),
+            SqlType::TimestampTz => Some(8),
             SqlType::Text | SqlType::Varchar(_) | SqlType::Blob | SqlType::Json => None,
         }
     }
