@@ -305,7 +305,10 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
                 .alias
                 .clone()
                 .unwrap_or_else(|| item.expr.display_name());
-            let col = plan_column_for_bound_expr(&item.expr);
+            let mut col = plan_column_for_bound_expr(&item.expr);
+            // Use the alias as the column name in the schema so it propagates
+            // to the ResultSet column headers.
+            col.name = alias.clone();
             expressions.push(scalar);
             aliases.push(alias);
             proj_columns.push(col);
@@ -935,7 +938,8 @@ fn build_post_agg_projection(
             .alias
             .clone()
             .unwrap_or_else(|| item.expr.display_name());
-        let col = plan_column_for_bound_expr(&item.expr);
+        let mut col = plan_column_for_bound_expr(&item.expr);
+        col.name = alias.clone();
         expressions.push(scalar);
         aliases.push(alias);
         columns.push(col);

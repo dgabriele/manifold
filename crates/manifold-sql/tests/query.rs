@@ -40,7 +40,6 @@ fn select_specific_columns() {
 }
 
 #[test]
-#[ignore = "column aliases not propagated to ResultSet column names"]
 fn select_with_column_alias() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[])
@@ -345,7 +344,6 @@ fn cross_join() {
 }
 
 #[test]
-#[ignore = "multi-table (3+) joins return 0 rows — chained join not fully supported"]
 fn multi_table_join_three_tables() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT)", &[]).unwrap();
@@ -372,7 +370,6 @@ fn multi_table_join_three_tables() {
 }
 
 #[test]
-#[ignore = "self-join (same table with alias) returns 0 rows — table aliasing in joins not fully supported"]
 fn self_join() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)", &[]).unwrap();
@@ -537,7 +534,6 @@ fn order_by_multiple_columns() {
 }
 
 #[test]
-#[ignore = "NULLS FIRST / NULLS LAST may not be supported yet"]
 fn order_by_nulls_first() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE t (id INTEGER, val INTEGER)", &[]).unwrap();

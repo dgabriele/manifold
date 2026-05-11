@@ -8,7 +8,6 @@ use manifold_sql::Value;
 // ===========================================================================
 
 #[test]
-#[ignore] // SMALLINT + INTEGER + BIGINT in same row causes storage offset corruption
 fn integer_types_mixed_row() {
     let (db, _dir) = test_db();
     db.execute(
@@ -60,7 +59,6 @@ fn smallint_roundtrip() {
 }
 
 #[test]
-#[ignore] // SMALLINT overflow not yet enforced; values silently truncated
 fn integer_overflow_smallint() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s SMALLINT)", &[])

@@ -1212,6 +1212,16 @@ fn execute_insert(
             }
         }
 
+        // Auto-fill INTEGER PRIMARY KEY columns that are NULL (auto-increment).
+        for (i, col) in schema.columns.iter().enumerate() {
+            if col.is_primary_key
+                && full_row[i].is_null()
+                && matches!(col.sql_type, SqlType::Integer | SqlType::BigInt)
+            {
+                full_row[i] = Value::Integer(next_rowid as i64);
+            }
+        }
+
         // Run all constraint checks (NOT NULL, type, VARCHAR length, UNIQUE, FK).
         check_insert_constraints(txn, catalog, &schema, &full_row)?;
 
@@ -1421,6 +1431,18 @@ fn check_insert_constraints(
                 "column '{}' has type {} but got value {}",
                 col.name, col.sql_type, row[i]
             )));
+        }
+
+        // 3b. Range checking for narrowing integer conversions.
+        if let SqlType::SmallInt = &col.sql_type {
+            if let Value::Integer(v) = &row[i] {
+                if *v < i16::MIN as i64 || *v > i16::MAX as i64 {
+                    return Err(SqlError::TypeError(format!(
+                        "value {} out of range for column '{}' of type SMALLINT (range {}..{})",
+                        v, col.name, i16::MIN, i16::MAX
+                    )));
+                }
+            }
         }
     }
 
@@ -1816,6 +1838,12 @@ fn update_indexes_insert(
 ) -> Result<()> {
     for index in indexes {
         let key_values: Vec<Value> = index.columns.iter().map(|&i| row[i].clone()).collect();
+
+        // Per SQL standard, NULLs are not considered equal for UNIQUE constraints.
+        // If any column in a unique index key is NULL, skip the uniqueness check
+        // (but still store the entry so we can clean it up on delete).
+        let has_null = key_values.iter().any(|v| v.is_null());
+
         let key_bytes = encode_index_key(&key_values);
 
         let idx_name = index_table_name(table_name, &index.name, index.unique);
@@ -1824,16 +1852,18 @@ fn update_indexes_insert(
             let idx_def = TableDefinition::<&[u8], u64>::new(idx_name);
             let mut idx_table = txn.open_table(idx_def)?;
 
-            // Check for uniqueness violation.
-            if let Some(existing) = idx_table
-                .get(key_bytes.as_slice())
-                .map_err(SqlError::Storage)?
-                && existing.value() != rowid
-            {
-                return Err(SqlError::ConstraintViolation(format!(
-                    "duplicate key in unique index '{}'",
-                    index.name
-                )));
+            // Check for uniqueness violation only when no key column is NULL.
+            if !has_null {
+                if let Some(existing) = idx_table
+                    .get(key_bytes.as_slice())
+                    .map_err(SqlError::Storage)?
+                    && existing.value() != rowid
+                {
+                    return Err(SqlError::ConstraintViolation(format!(
+                        "duplicate key in unique index '{}'",
+                        index.name
+                    )));
+                }
             }
 
             idx_table.insert(key_bytes.as_slice(), rowid)?;

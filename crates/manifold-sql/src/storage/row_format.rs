@@ -186,27 +186,117 @@ pub fn decode_column(types: &[SqlType], data: &[u8], col_index: usize) -> Result
     }
 }
 
-fn encode_fixed_value(value: &Value, _ty: &SqlType, buf: &mut Vec<u8>) -> Result<()> {
-    match value {
-        Value::Boolean(v) => buf.push(if *v { 1 } else { 0 }),
-        Value::SmallInt(v) => buf.extend_from_slice(&v.to_le_bytes()),
-        Value::Integer(v) => buf.extend_from_slice(&v.to_le_bytes()),
-        Value::Real(v) => buf.extend_from_slice(&v.to_le_bytes()),
-        Value::Decimal(v) => buf.extend_from_slice(&v.serialize()),
-        Value::Uuid(v) => buf.extend_from_slice(v.as_bytes()),
-        Value::Date(v) => {
+fn encode_fixed_value(value: &Value, ty: &SqlType, buf: &mut Vec<u8>) -> Result<()> {
+    // Encode based on the *target column type* so that the byte width always
+    // matches `ty.fixed_width()`, regardless of the runtime Value variant.
+    match ty {
+        SqlType::Boolean => {
+            let v = match value {
+                Value::Boolean(b) => *b,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as BOOLEAN"
+                    )));
+                }
+            };
+            buf.push(if v { 1 } else { 0 });
+        }
+        SqlType::SmallInt => {
+            let v: i16 = match value {
+                Value::SmallInt(s) => *s,
+                Value::Integer(i) => *i as i16,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as SMALLINT"
+                    )));
+                }
+            };
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        SqlType::Integer | SqlType::BigInt => {
+            let v: i64 = match value {
+                Value::Integer(i) => *i,
+                Value::SmallInt(s) => *s as i64,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as INTEGER/BIGINT"
+                    )));
+                }
+            };
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        SqlType::Real => {
+            let v: f64 = match value {
+                Value::Real(f) => *f,
+                Value::Integer(i) => *i as f64,
+                Value::SmallInt(s) => *s as f64,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as REAL"
+                    )));
+                }
+            };
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        SqlType::Decimal { .. } => {
+            let v = match value {
+                Value::Decimal(d) => *d,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as DECIMAL"
+                    )));
+                }
+            };
+            buf.extend_from_slice(&v.serialize());
+        }
+        SqlType::Uuid => {
+            let v = match value {
+                Value::Uuid(u) => u,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as UUID"
+                    )));
+                }
+            };
+            buf.extend_from_slice(v.as_bytes());
+        }
+        SqlType::Date => {
+            let v = match value {
+                Value::Date(d) => *d,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as DATE"
+                    )));
+                }
+            };
             let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let days = (*v - epoch).num_days() as i32;
+            let days = (v - epoch).num_days() as i32;
             buf.extend_from_slice(&days.to_le_bytes());
         }
-        Value::Timestamp(v) => {
+        SqlType::Timestamp => {
+            let v = match value {
+                Value::Timestamp(ts) => *ts,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as TIMESTAMP"
+                    )));
+                }
+            };
             let epoch = DateTime::<Utc>::UNIX_EPOCH.naive_utc();
-            let micros = (*v - epoch)
+            let micros = (v - epoch)
                 .num_microseconds()
                 .ok_or_else(|| SqlError::Internal("timestamp out of range".into()))?;
             buf.extend_from_slice(&micros.to_le_bytes());
         }
-        Value::TimestampTz(v) => {
+        SqlType::TimestampTz => {
+            let v = match value {
+                Value::TimestampTz(ts) => ts,
+                _ => {
+                    return Err(SqlError::Internal(format!(
+                        "cannot encode {value:?} as TIMESTAMPTZ"
+                    )));
+                }
+            };
             let micros = v
                 .signed_duration_since(DateTime::<Utc>::UNIX_EPOCH)
                 .num_microseconds()
@@ -215,7 +305,7 @@ fn encode_fixed_value(value: &Value, _ty: &SqlType, buf: &mut Vec<u8>) -> Result
         }
         _ => {
             return Err(SqlError::Internal(format!(
-                "cannot encode {value:?} as fixed-width"
+                "type {ty} is not fixed-width, cannot encode {value:?}"
             )));
         }
     }

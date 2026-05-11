@@ -29,7 +29,6 @@ fn primary_key_uniqueness() {
 }
 
 #[test]
-#[ignore] // PK column has implicit NOT NULL; auto-increment not yet implemented
 fn primary_key_auto_increment() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[])
@@ -112,7 +111,6 @@ fn unique_single_column() {
 }
 
 #[test]
-#[ignore] // UNIQUE index currently treats NULLs as equal; should allow multiple NULLs per SQL standard
 fn unique_allows_nulls() {
     let (db, _dir) = test_db();
     db.execute(

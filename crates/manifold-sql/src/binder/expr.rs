@@ -26,6 +26,7 @@ struct ScopeColumn {
 
 pub struct Scope {
     tables: Vec<ScopeTable>,
+    next_scope_id: TableId,
 }
 
 impl Default for Scope {
@@ -36,10 +37,18 @@ impl Default for Scope {
 
 impl Scope {
     pub fn new() -> Self {
-        Self { tables: Vec::new() }
+        Self {
+            tables: Vec::new(),
+            // Start scope IDs high to avoid collision with real catalog IDs.
+            next_scope_id: 1_000_000,
+        }
     }
 
     /// Add a table from the catalog to this scope, with an optional alias.
+    ///
+    /// Returns a scope-unique table ID. When the same table appears multiple
+    /// times (e.g. self-join), each occurrence gets a distinct ID so that the
+    /// planner can assign different column offsets.
     pub fn add_table(
         &mut self,
         catalog: &Catalog,
@@ -60,15 +69,18 @@ impl Scope {
             })
             .collect();
 
-        let table_id = schema.id;
+        // Assign a unique scope-level ID so self-joins get distinct IDs.
+        let scope_id = self.next_scope_id;
+        self.next_scope_id += 1;
+
         self.tables.push(ScopeTable {
-            table_id,
+            table_id: scope_id,
             table_name: table_name.to_string(),
             alias: alias.map(|s| s.to_string()),
             columns,
         });
 
-        Ok(table_id)
+        Ok(scope_id)
     }
 
     /// Resolve a column reference, handling qualified (table.col) and unqualified (col) forms.

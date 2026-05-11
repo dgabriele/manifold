@@ -2,7 +2,7 @@ use crate::binder::JoinType;
 use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::optimizer::statistics;
-use crate::planner::plan::{LogicalPlan, ScalarExpr};
+use crate::planner::plan::{LogicalPlan, PlanSchema, ScalarExpr};
 use crate::types::Value;
 
 /// Cost-based join reordering: for inner joins, put the smaller table on the
@@ -24,19 +24,44 @@ fn reorder_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
             let left = reorder_plan(*left, catalog)?;
             let right = reorder_plan(*right, catalog)?;
 
-            // Only reorder inner and cross joins -- outer joins are order-sensitive
-            if matches!(join_type, JoinType::Inner | JoinType::Cross) {
+            // Only reorder inner and cross joins -- outer joins are order-sensitive.
+            // Only swap when both sides are leaf nodes (not multi-table joins)
+            // so that we don't invalidate column references in parent plan
+            // nodes (Project, etc.) that depend on the join output order.
+            let is_leaf = |p: &LogicalPlan| matches!(
+                p,
+                LogicalPlan::Scan { .. }
+                | LogicalPlan::IndexScan { .. }
+                | LogicalPlan::Values { .. }
+            );
+            let both_leaves = is_leaf(&left) && is_leaf(&right);
+            if both_leaves && matches!(join_type, JoinType::Inner | JoinType::Cross) {
                 let left_cost = estimate_rows(&left, catalog);
                 let right_cost = estimate_rows(&right, catalog);
 
                 if right_cost < left_cost {
-                    // Swap: put smaller table on left
+                    // Swap: put smaller table on left.
+                    // We must also remap column references in the join condition
+                    // because after swapping, what was the left side (columns
+                    // 0..left_width) becomes the right side and vice versa.
+                    let left_width = left
+                        .schema()
+                        .map_or(0, |s| s.len());
+                    let right_width = right
+                        .schema()
+                        .map_or(0, |s| s.len());
+                    let remapped_condition =
+                        condition.map(|c| remap_join_columns(c, left_width, right_width));
+                    let new_schema = PlanSchema::concat(
+                        right.schema().unwrap_or(&PlanSchema::empty()),
+                        left.schema().unwrap_or(&PlanSchema::empty()),
+                    );
                     return Ok(LogicalPlan::Join {
                         join_type,
                         left: Box::new(right),
                         right: Box::new(left),
-                        condition,
-                        schema,
+                        condition: remapped_condition,
+                        schema: new_schema,
                     });
                 }
             }
@@ -171,6 +196,81 @@ fn reorder_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
             })
         }
         other => Ok(other),
+    }
+}
+
+/// Remap column references in a join condition when the left and right sides
+/// are swapped.  Columns in `[0..left_width)` move to `[right_width..)` and
+/// columns in `[left_width..left_width+right_width)` move to `[0..right_width)`.
+fn remap_join_columns(expr: ScalarExpr, left_width: usize, right_width: usize) -> ScalarExpr {
+    match expr {
+        ScalarExpr::ColumnRef { index } => {
+            let new_index = if index < left_width {
+                // Was on the left, now on the right
+                index + right_width
+            } else {
+                // Was on the right, now on the left
+                index - left_width
+            };
+            ScalarExpr::ColumnRef { index: new_index }
+        }
+        ScalarExpr::BinaryOp { op, left, right } => ScalarExpr::BinaryOp {
+            op,
+            left: Box::new(remap_join_columns(*left, left_width, right_width)),
+            right: Box::new(remap_join_columns(*right, left_width, right_width)),
+        },
+        ScalarExpr::UnaryOp { op, operand } => ScalarExpr::UnaryOp {
+            op,
+            operand: Box::new(remap_join_columns(*operand, left_width, right_width)),
+        },
+        ScalarExpr::IsNull { operand, negated } => ScalarExpr::IsNull {
+            operand: Box::new(remap_join_columns(*operand, left_width, right_width)),
+            negated,
+        },
+        ScalarExpr::InList {
+            expr,
+            list,
+            negated,
+        } => ScalarExpr::InList {
+            expr: Box::new(remap_join_columns(*expr, left_width, right_width)),
+            list: list
+                .into_iter()
+                .map(|e| remap_join_columns(e, left_width, right_width))
+                .collect(),
+            negated,
+        },
+        ScalarExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => ScalarExpr::Between {
+            expr: Box::new(remap_join_columns(*expr, left_width, right_width)),
+            low: Box::new(remap_join_columns(*low, left_width, right_width)),
+            high: Box::new(remap_join_columns(*high, left_width, right_width)),
+            negated,
+        },
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => ScalarExpr::Like {
+            expr: Box::new(remap_join_columns(*expr, left_width, right_width)),
+            pattern: Box::new(remap_join_columns(*pattern, left_width, right_width)),
+            negated,
+        },
+        ScalarExpr::Function { name, args } => ScalarExpr::Function {
+            name,
+            args: args
+                .into_iter()
+                .map(|a| remap_join_columns(a, left_width, right_width))
+                .collect(),
+        },
+        ScalarExpr::Cast { expr, target_type } => ScalarExpr::Cast {
+            expr: Box::new(remap_join_columns(*expr, left_width, right_width)),
+            target_type,
+        },
+        other @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)) => other,
     }
 }
 
