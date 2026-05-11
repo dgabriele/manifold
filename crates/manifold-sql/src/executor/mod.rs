@@ -129,6 +129,14 @@ fn build_read_query_executor(
             let scan = scan::TableScan::from_read_txn(txn, catalog, table_name, schema.clone())?;
             Ok(Box::new(scan))
         }
+        // IndexScan falls back to a full table scan until the executor has
+        // native index-scan support.
+        LogicalPlan::IndexScan {
+            table_name, schema, ..
+        } => {
+            let scan = scan::TableScan::from_read_txn(txn, catalog, table_name, schema.clone())?;
+            Ok(Box::new(scan))
+        }
         LogicalPlan::Filter { predicate, input } => {
             let child = build_read_query_executor(txn, catalog, input, params)?;
             let pred = if plan_has_scan_leaf(input) {
@@ -264,6 +272,14 @@ fn build_write_query_executor(
 ) -> Result<Box<dyn Executor>> {
     match plan {
         LogicalPlan::Scan {
+            table_name, schema, ..
+        } => {
+            let scan = scan::TableScan::from_write_txn(txn, catalog, table_name, schema.clone())?;
+            Ok(Box::new(scan))
+        }
+        // IndexScan falls back to a full table scan until the executor has
+        // native index-scan support.
+        LogicalPlan::IndexScan {
             table_name, schema, ..
         } => {
             let scan = scan::TableScan::from_write_txn(txn, catalog, table_name, schema.clone())?;
