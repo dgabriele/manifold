@@ -90,6 +90,10 @@ impl Catalog {
         self.indexes.get(name)
     }
 
+    pub fn get_table_by_id(&self, table_id: TableId) -> Option<&TableSchema> {
+        self.tables.values().find(|t| t.id == table_id)
+    }
+
     pub fn indexes_for_table(&self, table_id: TableId) -> Vec<&IndexDef> {
         self.indexes
             .values()

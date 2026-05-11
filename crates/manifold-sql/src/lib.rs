@@ -30,6 +30,11 @@ pub struct Row {
 }
 
 impl Row {
+    /// Create a new row from a vector of values.
+    pub fn new(values: Vec<Value>) -> Self {
+        Self { values }
+    }
+
     /// Returns all values in this row.
     pub fn values(&self) -> &[Value] {
         &self.values
@@ -141,6 +146,11 @@ pub struct ResultSet {
 }
 
 impl ResultSet {
+    /// Create a new result set from column names and rows.
+    pub fn new(columns: Vec<String>, rows: Vec<Row>) -> Self {
+        Self { columns, rows }
+    }
+
     /// Returns the column names.
     pub fn columns(&self) -> &[String] {
         &self.columns
