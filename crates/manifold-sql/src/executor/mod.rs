@@ -1,3 +1,4 @@
+pub mod aggregate;
 mod filter;
 pub mod join;
 mod limit;
@@ -195,6 +196,40 @@ fn build_read_query_executor(
             condition.as_ref(),
             params,
         ),
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            schema,
+            input,
+        } => {
+            let child = build_read_query_executor(txn, catalog, input, params)?;
+            let has_scan = plan_has_scan_leaf(input);
+            let gb = if has_scan {
+                group_by.iter().map(|e| shift_column_refs(e, 1)).collect()
+            } else {
+                group_by.clone()
+            };
+            let aggs = if has_scan {
+                aggregates
+                    .iter()
+                    .map(|ae| crate::planner::plan::AggregateExpr {
+                        func: ae.func.clone(),
+                        arg: ae.arg.as_ref().map(|a| shift_column_refs(a, 1)),
+                        distinct: ae.distinct,
+                        result_type: ae.result_type.clone(),
+                    })
+                    .collect()
+            } else {
+                aggregates.clone()
+            };
+            Ok(Box::new(aggregate::HashAggregate::new(
+                child,
+                gb,
+                aggs,
+                params,
+                schema.clone(),
+            )))
+        }
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(
             "unsupported plan node in query: {plan:?}"
@@ -288,6 +323,40 @@ fn build_write_query_executor(
             condition.as_ref(),
             params,
         ),
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            schema,
+            input,
+        } => {
+            let child = build_write_query_executor(txn, catalog, input, params)?;
+            let has_scan = plan_has_scan_leaf(input);
+            let gb = if has_scan {
+                group_by.iter().map(|e| shift_column_refs(e, 1)).collect()
+            } else {
+                group_by.clone()
+            };
+            let aggs = if has_scan {
+                aggregates
+                    .iter()
+                    .map(|ae| crate::planner::plan::AggregateExpr {
+                        func: ae.func.clone(),
+                        arg: ae.arg.as_ref().map(|a| shift_column_refs(a, 1)),
+                        distinct: ae.distinct,
+                        result_type: ae.result_type.clone(),
+                    })
+                    .collect()
+            } else {
+                aggregates.clone()
+            };
+            Ok(Box::new(aggregate::HashAggregate::new(
+                child,
+                gb,
+                aggs,
+                params,
+                schema.clone(),
+            )))
+        }
         LogicalPlan::Empty => Ok(Box::new(EmptyExecutor)),
         _ => Err(SqlError::Execute(format!(
             "unsupported plan node in query: {plan:?}"

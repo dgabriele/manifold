@@ -202,3 +202,150 @@ fn right_join() {
     // Second row: r.val is NULL, s.val is 'orphan'
     assert_eq!(result.rows()[1].get::<String>(1).unwrap(), "orphan");
 }
+
+// ---------------------------------------------------------------------------
+// Aggregate tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn count_all() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER, name TEXT)", &[])
+        .unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (1, 'a')", &[])
+        .unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (2, 'b')", &[])
+        .unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (3, 'c')", &[])
+        .unwrap();
+
+    let result = db.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 3);
+}
+
+#[test]
+fn group_by_with_aggregates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.execute(
+        "CREATE TABLE sales (category TEXT, amount INTEGER)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('electronics', 100)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('electronics', 200)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('books', 30)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('books', 20)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('books', 50)",
+        &[],
+    )
+    .unwrap();
+
+    let result = db
+        .query(
+            "SELECT category, SUM(amount), COUNT(*) FROM sales GROUP BY category ORDER BY category",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 2);
+    // books: sum=100, count=3
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "books");
+    assert_eq!(result.rows()[0].get::<i64>(1).unwrap(), 100);
+    assert_eq!(result.rows()[0].get::<i64>(2).unwrap(), 3);
+    // electronics: sum=300, count=2
+    assert_eq!(result.rows()[1].get::<String>(0).unwrap(), "electronics");
+    assert_eq!(result.rows()[1].get::<i64>(1).unwrap(), 300);
+    assert_eq!(result.rows()[1].get::<i64>(2).unwrap(), 2);
+}
+
+#[test]
+fn having_clause() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.execute(
+        "CREATE TABLE sales (category TEXT, amount INTEGER)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('electronics', 100)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('electronics', 200)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('books', 30)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO sales (category, amount) VALUES ('books', 20)",
+        &[],
+    )
+    .unwrap();
+
+    let result = db
+        .query(
+            "SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "electronics");
+    assert_eq!(result.rows()[0].get::<i64>(1).unwrap(), 300);
+}
+
+#[test]
+fn avg_and_min_max() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.execute("CREATE TABLE nums (val INTEGER)", &[]).unwrap();
+    db.execute("INSERT INTO nums (val) VALUES (10)", &[])
+        .unwrap();
+    db.execute("INSERT INTO nums (val) VALUES (20)", &[])
+        .unwrap();
+    db.execute("INSERT INTO nums (val) VALUES (30)", &[])
+        .unwrap();
+
+    let result = db
+        .query("SELECT AVG(val), MIN(val), MAX(val) FROM nums", &[])
+        .unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<f64>(0).unwrap(), 20.0);
+    assert_eq!(result.rows()[0].get::<i64>(1).unwrap(), 10);
+    assert_eq!(result.rows()[0].get::<i64>(2).unwrap(), 30);
+}
+
+#[test]
+fn count_empty_table() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+
+    let result = db.query("SELECT COUNT(*) FROM t", &[]).unwrap();
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 0);
+}
