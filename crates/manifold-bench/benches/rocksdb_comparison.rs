@@ -245,7 +245,7 @@ fn bench_sequential_write(dir: &std::path::Path, n: u64) -> WorkloadResult {
         let txn = cf.begin_write().unwrap();
         let mut t = txn.open_table(TABLE).unwrap();
         for i in batch_start..std::cmp::min(batch_start + BATCH_SIZE as u64, n) {
-            t.insert(&i, make_value(i).as_slice()).unwrap();
+            t.insert_buffered(&i, make_value(i).as_slice()).unwrap();
         }
         drop(t);
         txn.commit().unwrap();
@@ -294,7 +294,7 @@ fn bench_random_write(dir: &std::path::Path, n: u64) -> WorkloadResult {
         let txn = cf.begin_write().unwrap();
         let mut t = txn.open_table(TABLE).unwrap();
         for &k in batch {
-            t.insert(&k, make_value(k).as_slice()).unwrap();
+            t.insert_buffered(&k, make_value(k).as_slice()).unwrap();
         }
         drop(t);
         txn.commit().unwrap();
@@ -600,7 +600,7 @@ fn bench_mixed_50_50(dir: &std::path::Path, n: u64) -> WorkloadResult {
                             let k = prepopulate + counter;
                             let txn = cf.begin_write().unwrap();
                             let mut t = txn.open_table(TABLE).unwrap();
-                            let _ = t.insert(&k, make_value(k).as_slice());
+                            let _ = t.insert_buffered(&k, make_value(k).as_slice());
                             drop(t);
                             let _ = txn.commit();
                         }
@@ -688,7 +688,7 @@ fn bench_durable_write(dir: &std::path::Path, n: u64) -> WorkloadResult {
         txn.set_durability(Durability::Immediate).unwrap();
         let mut t = txn.open_table(TABLE).unwrap();
         for i in batch_start..std::cmp::min(batch_start + durable_batch as u64, n) {
-            t.insert(&i, make_value(i).as_slice()).unwrap();
+            t.insert_buffered(&i, make_value(i).as_slice()).unwrap();
         }
         drop(t);
         txn.commit().unwrap();
@@ -758,7 +758,7 @@ fn bench_concurrent_cf(dir: &std::path::Path, n: u64) -> WorkloadResult {
                     let mut t = txn.open_table(TABLE).unwrap();
                     for i in batch_start..std::cmp::min(batch_start + BATCH_SIZE as u64, per_cf) {
                         let key = cf_id as u64 * per_cf + i;
-                        t.insert(&key, make_value(key).as_slice()).unwrap();
+                        t.insert_buffered(&key, make_value(key).as_slice()).unwrap();
                     }
                     drop(t);
                     txn.commit().unwrap();
