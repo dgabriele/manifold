@@ -282,35 +282,9 @@ impl CheckpointManager {
             return Ok(());
         }
 
-        // If any entries are LogicalOps (deferred flush data), skip checkpoint entirely.
-        // We can't apply LogicalOps to B-tree without type info, so we must keep them
-        // in the WAL + memtable until recovery (close/reopen) handles them.
-        let has_logical_ops = entries.iter().any(|e| {
-            matches!(
-                e.payload,
-                super::entry::WALPayload::LogicalOps(_)
-            )
-        });
-        if has_logical_ops {
-            // Don't checkpoint, don't truncate, don't drain memtable.
-            // The WAL will grow but is bounded by the next close/reopen cycle.
-            pending_sequences.write().unwrap().clear();
-            return Ok(());
-        }
-
         // Apply each Transaction entry to the database
         for entry in &entries {
             Self::apply_wal_entry_to_database(database, entry)?;
-        }
-
-        // No LogicalOps, safe to drain memtable (all data is in B-tree)
-        for cf_name in database.list_column_families() {
-            if let Ok(cf) = database.column_family(&cf_name)
-                && let Some(memtable) = cf.memtable()
-            {
-                let mut mem = memtable.write().unwrap();
-                mem.drain();
-            }
         }
 
         // Flush and durably commit all column families to persist changes
@@ -346,19 +320,8 @@ impl CheckpointManager {
         database: &Arc<ColumnFamilyDatabase>,
         entry: &WALEntry,
     ) -> io::Result<()> {
-        match &entry.payload {
-            WALPayload::LogicalOps(_) => {
-                // LogicalOps entries are handled by the memtable — data is served
-                // from there until recovery (close/reopen) flushes to B-tree.
-                // The checkpoint only needs to process Transaction entries.
-                return Ok(());
-            }
-            WALPayload::Transaction(_) => {}
-        }
-
         let txn_payload = match &entry.payload {
             WALPayload::Transaction(p) => p,
-            WALPayload::LogicalOps(_) => unreachable!(),
         };
 
         // Get the column family

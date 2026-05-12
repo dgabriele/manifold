@@ -28,7 +28,6 @@ const DEFAULT_POOL_SIZE: usize = 64;
 #[cfg(not(target_arch = "wasm32"))]
 pub struct ColumnFamilyDatabaseBuilder {
     pool_size: usize,
-    deferred_flush: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -37,7 +36,6 @@ impl ColumnFamilyDatabaseBuilder {
     pub fn new() -> Self {
         Self {
             pool_size: DEFAULT_POOL_SIZE,
-            deferred_flush: false,
         }
     }
 
@@ -58,19 +56,6 @@ impl ColumnFamilyDatabaseBuilder {
     #[must_use]
     pub fn pool_size(mut self, size: usize) -> Self {
         self.pool_size = size;
-        self
-    }
-
-    /// Enables deferred flush mode for this database.
-    ///
-    /// When enabled, write transactions buffer mutations in an in-memory memtable
-    /// instead of flushing to the storage backend on every commit. A background
-    /// flush merges the memtable into the B-tree periodically.
-    ///
-    /// Default: false (standard flush-on-commit behavior).
-    #[must_use]
-    pub fn deferred_flush(mut self, enabled: bool) -> Self {
-        self.deferred_flush = enabled;
         self
     }
 
@@ -104,7 +89,7 @@ impl ColumnFamilyDatabaseBuilder {
     /// Returns an error if the file cannot be opened or the header is invalid.
     pub fn open(self, path: impl AsRef<Path>) -> Result<ColumnFamilyDatabase, DatabaseError> {
         let path = path.as_ref().to_path_buf();
-        ColumnFamilyDatabase::open_with_builder(path, self.pool_size, self.deferred_flush)
+        ColumnFamilyDatabase::open_with_builder(path, self.pool_size)
     }
 }
 

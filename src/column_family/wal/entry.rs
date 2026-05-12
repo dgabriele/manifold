@@ -2,27 +2,11 @@ use crate::Durability;
 use crate::tree_store::{Checksum, PageNumber};
 use std::io;
 
-/// A single key-value operation for deferred flush WAL entries.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct WALOp {
-    pub(crate) key: Vec<u8>,
-    pub(crate) value: Option<Vec<u8>>, // None = delete
-}
-
-/// Payload for deferred flush: stores logical key-value operations.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct WALLogicalOpsPayload {
-    pub(crate) table_name: String,
-    pub(crate) ops: Vec<WALOp>,
-}
-
 /// Discriminated payload for WAL entries.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WALPayload {
-    /// B-tree state snapshot (existing, used by normal commits and checkpoints)
+    /// B-tree state snapshot (used by normal commits and checkpoints)
     Transaction(WALTransactionPayload),
-    /// Logical operations (new, used by deferred flush commits)
-    LogicalOps(WALLogicalOpsPayload),
 }
 
 /// A single entry in the Write-Ahead Log.
@@ -82,20 +66,6 @@ impl WALEntry {
         }
     }
 
-    pub(crate) fn new_logical_ops(
-        cf_name: String,
-        transaction_id: u64,
-        table_name: String,
-        ops: Vec<WALOp>,
-    ) -> Self {
-        Self {
-            sequence: 0, // Will be assigned by journal
-            cf_name,
-            transaction_id,
-            payload: WALPayload::LogicalOps(WALLogicalOpsPayload { table_name, ops }),
-        }
-    }
-
     /// Serializes the entry to bytes using zero-cost manual serialization.
     ///
     /// Format:
@@ -124,10 +94,6 @@ impl WALEntry {
             WALPayload::Transaction(txn) => {
                 buf.push(0x01);
                 txn.serialize_into(&mut buf);
-            }
-            WALPayload::LogicalOps(ops) => {
-                buf.push(0x02);
-                ops.serialize_into(&mut buf);
             }
         }
 
@@ -198,11 +164,6 @@ impl WALEntry {
                 let (txn, len) = WALTransactionPayload::deserialize_from(&data[offset..])?;
                 offset += len;
                 WALPayload::Transaction(txn)
-            }
-            0x02 => {
-                let (ops, len) = WALLogicalOpsPayload::deserialize_from(&data[offset..])?;
-                offset += len;
-                WALPayload::LogicalOps(ops)
             }
             other => {
                 return Err(io::Error::new(
@@ -420,146 +381,6 @@ impl WALTransactionPayload {
     }
 }
 
-impl WALLogicalOpsPayload {
-    /// Serializes the logical ops payload into the given buffer.
-    ///
-    /// Format:
-    /// - `name_len`: u16 (2 bytes)
-    /// - `name_bytes`: [u8; `name_len`] (variable)
-    /// - `op_count`: u32 (4 bytes)
-    /// - for each op:
-    ///   - `key_len`: u32 (4 bytes)
-    ///   - `key`: [u8; `key_len`] (variable)
-    ///   - `has_value`: u8 (0 = delete, 1 = insert/update)
-    ///   - if `has_value`:
-    ///     - `value_len`: u32 (4 bytes)
-    ///     - `value`: [u8; `value_len`] (variable)
-    fn serialize_into(&self, buf: &mut Vec<u8>) {
-        // Table name
-        let name_bytes = self.table_name.as_bytes();
-        #[allow(clippy::cast_possible_truncation)]
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        buf.extend_from_slice(name_bytes);
-
-        // Ops
-        #[allow(clippy::cast_possible_truncation)]
-        buf.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
-        for op in &self.ops {
-            #[allow(clippy::cast_possible_truncation)]
-            buf.extend_from_slice(&(op.key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&op.key);
-
-            if let Some(value) = &op.value {
-                buf.push(1);
-                #[allow(clippy::cast_possible_truncation)]
-                buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                buf.extend_from_slice(value);
-            } else {
-                buf.push(0);
-            }
-        }
-    }
-
-    /// Deserializes the logical ops payload from bytes.
-    ///
-    /// Returns the payload and the number of bytes consumed.
-    fn deserialize_from(data: &[u8]) -> io::Result<(Self, usize)> {
-        let mut offset = 0;
-
-        // Table name
-        if data.len() < offset + 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated table_name length",
-            ));
-        }
-        let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-        offset += 2;
-
-        if data.len() < offset + name_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated table_name",
-            ));
-        }
-        let table_name =
-            String::from_utf8(data[offset..offset + name_len].to_vec()).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8: {e}"))
-            })?;
-        offset += name_len;
-
-        // Op count
-        if data.len() < offset + 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated op_count",
-            ));
-        }
-        let op_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-
-        let mut ops = Vec::with_capacity(op_count);
-        for _ in 0..op_count {
-            // Key
-            if data.len() < offset + 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated key_len",
-                ));
-            }
-            let key_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += 4;
-
-            if data.len() < offset + key_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated key",
-                ));
-            }
-            let key = data[offset..offset + key_len].to_vec();
-            offset += key_len;
-
-            // has_value
-            if data.len() < offset + 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated has_value",
-                ));
-            }
-            let has_value = data[offset];
-            offset += 1;
-
-            let value = if has_value == 1 {
-                if data.len() < offset + 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated value_len",
-                    ));
-                }
-                let value_len =
-                    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                offset += 4;
-
-                if data.len() < offset + value_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated value",
-                    ));
-                }
-                let v = data[offset..offset + value_len].to_vec();
-                offset += value_len;
-                Some(v)
-            } else {
-                None
-            };
-
-            ops.push(WALOp { key, value });
-        }
-
-        Ok((Self { table_name, ops }, offset))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,61 +451,5 @@ mod tests {
         let (decoded, _) = WALTransactionPayload::deserialize_from(&buf).unwrap();
 
         assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn test_logical_ops_serialization_round_trip() {
-        let ops_payload = WALLogicalOpsPayload {
-            table_name: "my_table".to_string(),
-            ops: vec![
-                WALOp {
-                    key: b"key1".to_vec(),
-                    value: Some(b"value1".to_vec()),
-                },
-                WALOp {
-                    key: b"key2".to_vec(),
-                    value: None, // delete
-                },
-                WALOp {
-                    key: b"key3".to_vec(),
-                    value: Some(vec![]),
-                },
-            ],
-        };
-
-        let mut buf = Vec::new();
-        ops_payload.serialize_into(&mut buf);
-
-        let (decoded, len) = WALLogicalOpsPayload::deserialize_from(&buf).unwrap();
-        assert_eq!(len, buf.len());
-        assert_eq!(decoded, ops_payload);
-    }
-
-    #[test]
-    fn test_logical_ops_entry_round_trip() {
-        let entry = WALEntry::new_logical_ops(
-            "test_cf".to_string(),
-            42,
-            "my_table".to_string(),
-            vec![
-                WALOp {
-                    key: b"hello".to_vec(),
-                    value: Some(b"world".to_vec()),
-                },
-                WALOp {
-                    key: b"delete_me".to_vec(),
-                    value: None,
-                },
-            ],
-        );
-
-        let bytes = entry.to_bytes();
-        let (decoded, len) = WALEntry::from_bytes(&bytes).unwrap();
-
-        assert_eq!(len, bytes.len());
-        assert_eq!(decoded.sequence, entry.sequence);
-        assert_eq!(decoded.cf_name, entry.cf_name);
-        assert_eq!(decoded.transaction_id, entry.transaction_id);
-        assert_eq!(decoded.payload, entry.payload);
     }
 }

@@ -52,7 +52,6 @@ pub(crate) mod database;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod file_handle_pool;
 pub(crate) mod header;
-pub(crate) mod memtable;
 pub(crate) mod partitioned_backend;
 pub(crate) mod state;
 #[cfg(not(target_arch = "wasm32"))]

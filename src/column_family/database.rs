@@ -171,7 +171,6 @@ pub struct ColumnFamilyDatabase {
     header: Arc<RwLock<MasterHeader>>,
     wal_journal: Option<Arc<WALJournal>>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
-    deferred_flush: bool,
 }
 
 impl ColumnFamilyDatabase {
@@ -307,7 +306,6 @@ impl ColumnFamilyDatabase {
             header,
             wal_journal,
             checkpoint_manager,
-            deferred_flush: false,
         })
     }
 
@@ -391,27 +389,8 @@ impl ColumnFamilyDatabase {
             let mem = db.get_memory();
 
             for entry in entries_for_cf {
-                match &entry.payload {
-                    super::wal::entry::WALPayload::LogicalOps(payload) => {
-                        // Replay LogicalOps into the shared memtable.
-                        if let Some(cf_state) = column_families.get(cf_name)
-                            && let Some(memtable) = &cf_state.memtable
-                        {
-                            let mut mem = memtable.write().unwrap();
-                            let table_mem =
-                                mem.tables.entry(payload.table_name.clone()).or_default();
-                            for op in &payload.ops {
-                                table_mem.insert(op.key.clone(), op.value.clone());
-                            }
-                        }
-                        continue;
-                    }
-                    super::wal::entry::WALPayload::Transaction(_) => {}
-                }
-
                 let txn_payload = match &entry.payload {
                     super::wal::entry::WALPayload::Transaction(p) => p,
-                    super::wal::entry::WALPayload::LogicalOps(_) => unreachable!(),
                 };
 
                 // Convert WAL payload to BtreeHeader format
@@ -497,17 +476,11 @@ impl ColumnFamilyDatabase {
         Ok(())
     }
 
-    /// Returns whether deferred flush mode is enabled.
-    pub fn is_deferred_flush(&self) -> bool {
-        self.deferred_flush
-    }
-
     /// Internal implementation of open, called by the builder (native platforms).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open_with_builder(
         path: PathBuf,
         pool_size: usize,
-        deferred_flush: bool,
     ) -> Result<Self, DatabaseError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -553,11 +526,7 @@ impl ColumnFamilyDatabase {
 
         let mut column_families = HashMap::new();
         for cf_meta in &header.read().unwrap().column_families {
-            let state = if deferred_flush {
-                ColumnFamilyState::new_with_memtable(cf_meta.name.clone(), cf_meta.segments.clone())
-            } else {
-                ColumnFamilyState::new(cf_meta.name.clone(), cf_meta.segments.clone())
-            };
+            let state = ColumnFamilyState::new(cf_meta.name.clone(), cf_meta.segments.clone());
             column_families.insert(cf_meta.name.clone(), Arc::new(state));
         }
 
@@ -573,7 +542,7 @@ impl ColumnFamilyDatabase {
                 .read_from(0)
                 .map_err(|e| DatabaseError::Storage(StorageError::from(e)))?;
 
-                if !entries.is_empty() {
+            if !entries.is_empty() {
                 Self::perform_wal_recovery(&column_families, &handle_pool, &journal)?;
             }
 
@@ -601,7 +570,6 @@ impl ColumnFamilyDatabase {
                 header: Arc::clone(&header),
                 wal_journal: Some(Arc::clone(journal_arc)),
                 checkpoint_manager: None,
-                deferred_flush,
             });
 
             let manager = CheckpointManager::start(Arc::clone(journal_arc), db_arc, config);
@@ -619,7 +587,6 @@ impl ColumnFamilyDatabase {
             header,
             wal_journal,
             checkpoint_manager,
-            deferred_flush,
         })
     }
 
@@ -684,14 +651,8 @@ impl ColumnFamilyDatabase {
             (metadata.segments, metadata.name.clone())
         };
 
-        let state = if self.deferred_flush {
-            Arc::new(ColumnFamilyState::new_with_memtable(name.clone(), segments))
-        } else {
-            Arc::new(ColumnFamilyState::new(name.clone(), segments))
-        };
+        let state = Arc::new(ColumnFamilyState::new(name.clone(), segments));
         cfs.insert(name.clone(), Arc::clone(&state));
-
-        let memtable = state.memtable.clone();
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -704,7 +665,6 @@ impl ColumnFamilyDatabase {
                 header_backend: self.header_backend.clone(),
                 wal_journal: self.wal_journal.clone(),
                 checkpoint_manager: self.checkpoint_manager.clone(),
-                memtable,
             })
         }
         #[cfg(target_arch = "wasm32")]
@@ -718,7 +678,6 @@ impl ColumnFamilyDatabase {
                 file_growth_lock: self.file_growth_lock.clone(),
                 wal_journal: self.wal_journal.clone(),
                 checkpoint_manager: self.checkpoint_manager.clone(),
-                memtable,
             })
         }
     }
@@ -735,8 +694,6 @@ impl ColumnFamilyDatabase {
 
         match cfs.get(name) {
             Some(state) => {
-                let memtable = state.memtable.clone();
-
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     Ok(ColumnFamily {
@@ -748,7 +705,6 @@ impl ColumnFamilyDatabase {
                         header_backend: self.header_backend.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
-                        memtable,
                     })
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -762,7 +718,6 @@ impl ColumnFamilyDatabase {
                         file_growth_lock: self.file_growth_lock.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
-                        memtable,
                     })
                 }
             }
@@ -798,8 +753,6 @@ impl ColumnFamilyDatabase {
         {
             let cfs = self.column_families.read().unwrap();
             if let Some(state) = cfs.get(name) {
-                let memtable = state.memtable.clone();
-
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     return Ok(ColumnFamily {
@@ -811,7 +764,6 @@ impl ColumnFamilyDatabase {
                         header_backend: self.header_backend.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
-                        memtable,
                     });
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -824,7 +776,6 @@ impl ColumnFamilyDatabase {
                         header_backend: self.header_backend.clone(),
                         wal_journal: self.wal_journal.clone(),
                         checkpoint_manager: self.checkpoint_manager.clone(),
-                        memtable,
                     });
                 }
             }
@@ -1105,18 +1056,12 @@ pub struct ColumnFamily {
     header: Arc<RwLock<MasterHeader>>,
     wal_journal: Option<Arc<WALJournal>>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
-    memtable: Option<crate::column_family::memtable::SharedMemtable>,
 }
 
 impl ColumnFamily {
     /// Returns the name of this column family.
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Returns a reference to the shared memtable, if deferred flush is enabled.
-    pub(crate) fn memtable(&self) -> Option<&crate::column_family::memtable::SharedMemtable> {
-        self.memtable.as_ref()
     }
 
     /// Begins a write transaction for this column family.
@@ -1148,11 +1093,6 @@ impl ColumnFamily {
             );
         }
 
-        // Enable deferred flush if memtable is present (set by ColumnFamilyDatabase when deferred_flush=true)
-        if let Some(memtable) = &self.memtable {
-            txn.set_deferred_flush_context(std::sync::Arc::clone(memtable));
-        }
-
         Ok(txn)
     }
 
@@ -1167,13 +1107,7 @@ impl ColumnFamily {
             )))),
         })?;
 
-        let mut txn = db.begin_read()?;
-
-        // Pass memtable snapshot if deferred flush is enabled
-        if let Some(memtable) = &self.memtable {
-            let snapshot = memtable.read().unwrap().snapshot();
-            txn.set_memtable_snapshot(snapshot);
-        }
+        let txn = db.begin_read()?;
 
         Ok(txn)
     }

@@ -24,9 +24,6 @@ pub(crate) struct ColumnFamilyState {
     pub segments: Arc<RwLock<Vec<Segment>>>,
     /// Lazily initialized Database instance.
     pub db: Arc<RwLock<Option<Arc<Database>>>>,
-    /// Shared memtable for deferred flush mode. Created once, shared across all
-    /// `ColumnFamily` handles for this CF so that read-after-write is visible.
-    pub memtable: Option<super::memtable::SharedMemtable>,
 }
 
 impl ColumnFamilyState {
@@ -36,34 +33,9 @@ impl ColumnFamilyState {
             name,
             segments: Arc::new(RwLock::new(segments)),
             db: Arc::new(RwLock::new(None)),
-            memtable: None,
         }
     }
 
-    pub fn new_with_memtable(name: String, segments: Vec<Segment>) -> Self {
-        Self {
-            name,
-            segments: Arc::new(RwLock::new(segments)),
-            db: Arc::new(RwLock::new(None)),
-            memtable: Some(super::memtable::new_shared_memtable()),
-        }
-    }
-
-    /// Ensures the Database instance exists, creating it if necessary (native platforms).
-    ///
-    /// This acquires a file handle from the pool and initializes the Database
-    /// on first call. Subsequent calls reuse the cached instance and touch the
-    /// pool to prevent eviction.
-    ///
-    /// # Arguments
-    ///
-    /// * `pool` - File handle pool to acquire backend from
-    /// * `path` - Path to database file
-    /// * `expansion_callback` - Callback to request new segments when needed
-    ///
-    /// # Returns
-    ///
-    /// An Arc-wrapped Database instance ready for use.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn ensure_database(
         &self,
@@ -103,19 +75,6 @@ impl ColumnFamilyState {
         Ok(db)
     }
 
-    /// Ensures the Database instance exists, creating it if necessary (WASM).
-    ///
-    /// This creates a Database using the provided WASM backend on first call.
-    /// Subsequent calls reuse the cached instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `backend` - WASM storage backend to use
-    /// * `expansion_callback` - Callback to request new segments when needed
-    ///
-    /// # Returns
-    ///
-    /// An Arc-wrapped Database instance ready for use.
     #[cfg(target_arch = "wasm32")]
     pub fn ensure_database_wasm(
         &self,
@@ -151,10 +110,6 @@ impl ColumnFamilyState {
         Ok(db)
     }
 
-    /// Drops the Database instance, releasing its file handle back to the pool.
-    ///
-    /// This is called by the pool during LRU eviction. The next access will
-    /// re-acquire a handle and recreate the Database.
     #[allow(dead_code)]
     pub fn evict_database(&self) {
         let mut db_guard = self.db.write().unwrap();
