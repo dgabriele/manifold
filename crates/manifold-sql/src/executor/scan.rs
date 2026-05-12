@@ -10,23 +10,25 @@ use crate::expr::eval::evaluate;
 use crate::planner::plan::{PlanSchema, ScalarExpr};
 use crate::storage::index::encode_index_key;
 use crate::storage::row_format::decode_row;
-use crate::types::Value;
+use crate::types::{SqlType, Value};
 
-/// Table scan operator: materializes all rows from a Manifold data table.
+/// Table scan operator: stores raw bytes from the B-tree and decodes lazily.
 ///
 /// Each output row is prefixed with the rowid (as Value::Integer) so that
 /// UPDATE/DELETE can identify which physical row to modify.
+///
+/// Raw bytes are copied from B-tree pages during construction (cheap memcpy).
+/// Row decoding (String allocation, Value construction) happens on demand in
+/// `next()`, so rows that are filtered out never pay the decode cost.
 pub struct TableScan {
-    rows: Vec<Vec<Value>>,
+    raw_rows: Vec<(u64, Vec<u8>)>,
+    col_types: Vec<SqlType>,
     position: usize,
     #[allow(dead_code)]
     schema: PlanSchema,
 }
 
 impl TableScan {
-    /// Create a new TableScan by reading all rows from the given table.
-    ///
-    /// This works with a `ReadTransaction`.
     pub fn from_read_txn(
         txn: &manifold::ReadTransaction,
         catalog: &Catalog,
@@ -41,34 +43,27 @@ impl TableScan {
         let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
 
-        let mut rows = Vec::new();
+        let mut raw_rows = Vec::new();
         match txn.open_table(def) {
             Ok(table) => {
                 let iter = table.iter().map_err(SqlError::Storage)?;
                 for entry in iter {
                     let (key_guard, value_guard) = entry.map_err(SqlError::Storage)?;
-                    let rowid = key_guard.value();
-                    let bytes = value_guard.value();
-                    let mut row = vec![Value::Integer(rowid as i64)];
-                    let decoded = decode_row(&col_types, bytes)?;
-                    row.extend(decoded);
-                    rows.push(row);
+                    raw_rows.push((key_guard.value(), value_guard.value().to_vec()));
                 }
             }
-            Err(manifold::TableError::TableDoesNotExist(_)) => {
-                // Table has no data yet (never had an insert) — return empty
-            }
+            Err(manifold::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(SqlError::TableError(e)),
         }
 
         Ok(Self {
-            rows,
+            raw_rows,
+            col_types,
             position: 0,
             schema,
         })
     }
 
-    /// Create a new TableScan by reading all rows within a write transaction.
     pub fn from_write_txn(
         txn: &manifold::WriteTransaction,
         catalog: &Catalog,
@@ -83,23 +78,19 @@ impl TableScan {
         let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
 
-        let mut rows = Vec::new();
+        let mut raw_rows = Vec::new();
         let table = txn.open_table(def)?;
         {
             let iter = table.iter().map_err(SqlError::Storage)?;
             for entry in iter {
                 let (key_guard, value_guard) = entry.map_err(SqlError::Storage)?;
-                let rowid = key_guard.value();
-                let bytes = value_guard.value();
-                let mut row = vec![Value::Integer(rowid as i64)];
-                let decoded = decode_row(&col_types, bytes)?;
-                row.extend(decoded);
-                rows.push(row);
+                raw_rows.push((key_guard.value(), value_guard.value().to_vec()));
             }
         }
 
         Ok(Self {
-            rows,
+            raw_rows,
+            col_types,
             position: 0,
             schema,
         })
@@ -113,13 +104,14 @@ impl TableScan {
 
 impl super::Executor for TableScan {
     fn next(&mut self) -> Result<Option<Vec<Value>>> {
-        if self.position < self.rows.len() {
-            let row = self.rows[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
+        if self.position >= self.raw_rows.len() {
+            return Ok(None);
         }
+        let (rowid, bytes) = &self.raw_rows[self.position];
+        self.position += 1;
+        let mut row = vec![Value::Integer(*rowid as i64)];
+        row.extend(decode_row(&self.col_types, bytes)?);
+        Ok(Some(row))
     }
 }
 
@@ -422,8 +414,10 @@ impl super::Executor for RowidLookupScan {
 // ---------------------------------------------------------------------------
 
 /// Rowid range scan: reads a contiguous range of rows using B-tree range lookup.
+/// Stores raw bytes, decodes lazily in next().
 pub struct RowidRangeScan {
-    rows: Vec<Vec<Value>>,
+    raw_rows: Vec<(u64, Vec<u8>)>,
+    col_types: Vec<SqlType>,
     position: usize,
 }
 
@@ -455,23 +449,24 @@ impl RowidRangeScan {
         let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
 
-        let mut rows = Vec::new();
+        let mut raw_rows = Vec::new();
         match txn.open_table(def) {
             Ok(table) => {
                 let iter = table.range(start..=end).map_err(SqlError::Storage)?;
                 for entry in iter {
                     let (key_guard, value_guard) = entry.map_err(SqlError::Storage)?;
-                    let rowid = key_guard.value();
-                    let mut row = vec![Value::Integer(rowid as i64)];
-                    row.extend(decode_row(&col_types, value_guard.value())?);
-                    rows.push(row);
+                    raw_rows.push((key_guard.value(), value_guard.value().to_vec()));
                 }
             }
             Err(manifold::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(SqlError::TableError(e)),
         }
 
-        Ok(Self { rows, position: 0 })
+        Ok(Self {
+            raw_rows,
+            col_types,
+            position: 0,
+        })
     }
 
     pub fn from_write_txn(
@@ -493,30 +488,32 @@ impl RowidRangeScan {
         let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
 
-        let mut rows = Vec::new();
+        let mut raw_rows = Vec::new();
         let table = txn.open_table(def)?;
         let iter = table.range(start..=end).map_err(SqlError::Storage)?;
         for entry in iter {
             let (key_guard, value_guard) = entry.map_err(SqlError::Storage)?;
-            let rowid = key_guard.value();
-            let mut row = vec![Value::Integer(rowid as i64)];
-            row.extend(decode_row(&col_types, value_guard.value())?);
-            rows.push(row);
+            raw_rows.push((key_guard.value(), value_guard.value().to_vec()));
         }
 
-        Ok(Self { rows, position: 0 })
+        Ok(Self {
+            raw_rows,
+            col_types,
+            position: 0,
+        })
     }
 }
 
 impl super::Executor for RowidRangeScan {
     fn next(&mut self) -> Result<Option<Vec<Value>>> {
-        if self.position < self.rows.len() {
-            let row = self.rows[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
+        if self.position >= self.raw_rows.len() {
+            return Ok(None);
         }
+        let (rowid, bytes) = &self.raw_rows[self.position];
+        self.position += 1;
+        let mut row = vec![Value::Integer(*rowid as i64)];
+        row.extend(decode_row(&self.col_types, bytes)?);
+        Ok(Some(row))
     }
 }
 

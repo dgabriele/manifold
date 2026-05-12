@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "api_workload"
 harness = false
+
+[[bench]]
+name = "raw_manifold_workload"
+harness = false
