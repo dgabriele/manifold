@@ -90,10 +90,7 @@ pub enum ScalarExpr {
         negated: bool,
     },
     /// Scalar function call.
-    Function {
-        name: String,
-        args: Vec<ScalarExpr>,
-    },
+    Function { name: String, args: Vec<ScalarExpr> },
     /// CAST.
     Cast {
         expr: Box<ScalarExpr>,
@@ -111,9 +108,7 @@ pub enum ScalarExpr {
         negated: bool,
     },
     /// Scalar subquery: `(SELECT ...)` producing a single value.
-    ScalarSubquery {
-        subquery: Box<LogicalPlan>,
-    },
+    ScalarSubquery { subquery: Box<LogicalPlan> },
 }
 
 // ---------------------------------------------------------------------------
@@ -190,9 +185,7 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
     },
     /// DISTINCT.
-    Distinct {
-        input: Box<LogicalPlan>,
-    },
+    Distinct { input: Box<LogicalPlan> },
     /// UNION / UNION ALL.
     Union {
         left: Box<LogicalPlan>,
@@ -233,10 +226,7 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
     /// DROP TABLE.
-    DropTable {
-        name: String,
-        if_exists: bool,
-    },
+    DropTable { name: String, if_exists: bool },
     /// ALTER TABLE.
     AlterTable {
         table_name: String,
@@ -251,18 +241,11 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
     /// DROP INDEX.
-    DropIndex {
-        name: String,
-        if_exists: bool,
-    },
+    DropIndex { name: String, if_exists: bool },
     /// EXPLAIN.
-    Explain {
-        input: Box<LogicalPlan>,
-    },
+    Explain { input: Box<LogicalPlan> },
     /// ANALYZE.
-    Analyze {
-        table_name: Option<String>,
-    },
+    Analyze { table_name: Option<String> },
     /// Index scan (used by optimizer, not produced by planner).
     IndexScan {
         table_id: TableId,
@@ -271,6 +254,31 @@ pub enum LogicalPlan {
         /// The values to look up in the index (equality predicate).
         lookup_values: Vec<ScalarExpr>,
         schema: PlanSchema,
+    },
+    /// Direct rowid lookup — skips the index entirely.
+    /// Used when the predicate is on an INTEGER PRIMARY KEY column,
+    /// which maps directly to the manifold table's u64 key.
+    RowidLookup {
+        table_name: String,
+        /// Expression that evaluates to the rowid (literal or parameter).
+        rowid_expr: ScalarExpr,
+        schema: PlanSchema,
+    },
+    /// Rowid range scan — reads a contiguous range of rows by rowid.
+    /// Used when the predicate is `pk BETWEEN $1 AND $2` on an INTEGER PRIMARY KEY.
+    RowidRangeScan {
+        table_name: String,
+        /// Inclusive lower bound expression.
+        start_expr: ScalarExpr,
+        /// Inclusive upper bound expression.
+        end_expr: ScalarExpr,
+        schema: PlanSchema,
+    },
+    /// Direct rowid UPDATE — finds the row by PK, applies SET expressions, re-inserts.
+    RowidUpdate {
+        table_name: String,
+        rowid_expr: ScalarExpr,
+        assignments: Vec<(usize, ScalarExpr)>,
     },
     /// An empty plan (no rows, no schema).
     Empty,
@@ -302,10 +310,13 @@ impl LogicalPlan {
             LogicalPlan::Distinct { input } => input.schema(),
             LogicalPlan::Union { schema, .. } => Some(schema),
             LogicalPlan::Values { schema, .. } => Some(schema),
-            LogicalPlan::IndexScan { schema, .. } => Some(schema),
+            LogicalPlan::IndexScan { schema, .. }
+            | LogicalPlan::RowidLookup { schema, .. }
+            | LogicalPlan::RowidRangeScan { schema, .. } => Some(schema),
             LogicalPlan::Insert { .. }
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
+            | LogicalPlan::RowidUpdate { .. }
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }

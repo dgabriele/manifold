@@ -35,6 +35,38 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
                 vals.join(", ")
             ));
         }
+        LogicalPlan::RowidLookup {
+            table_name,
+            rowid_expr,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pfx}RowidLookup {table_name} [{}]\n",
+                format_expr_brief(rowid_expr)
+            ));
+        }
+        LogicalPlan::RowidRangeScan {
+            table_name,
+            start_expr,
+            end_expr,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pfx}RowidRangeScan {table_name} [{}..={}]\n",
+                format_expr_brief(start_expr),
+                format_expr_brief(end_expr)
+            ));
+        }
+        LogicalPlan::RowidUpdate {
+            table_name,
+            rowid_expr,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pfx}RowidUpdate {table_name} [{}]\n",
+                format_expr_brief(rowid_expr)
+            ));
+        }
         LogicalPlan::Filter { predicate, input } => {
             out.push_str(&format!("{pfx}Filter ({})\n", format_expr_brief(predicate)));
             format_node(input, depth + 1, out);
@@ -71,10 +103,7 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
                 JoinType::Cross => "CROSS",
             };
             if let Some(cond) = condition {
-                out.push_str(&format!(
-                    "{pfx}Join {jt} on {}\n",
-                    format_expr_brief(cond)
-                ));
+                out.push_str(&format!("{pfx}Join {jt} on {}\n", format_expr_brief(cond)));
             } else {
                 out.push_str(&format!("{pfx}Join {jt}\n"));
             }
@@ -141,7 +170,9 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
             out.push_str(&format!("{pfx}Distinct\n"));
             format_node(input, depth + 1, out);
         }
-        LogicalPlan::Union { left, right, all, .. } => {
+        LogicalPlan::Union {
+            left, right, all, ..
+        } => {
             let kind = if *all { "UNION ALL" } else { "UNION" };
             out.push_str(&format!("{pfx}{kind}\n"));
             format_node(left, depth + 1, out);
@@ -261,7 +292,11 @@ fn format_expr_brief(expr: &crate::planner::plan::ScalarExpr) -> String {
             negated,
         } => {
             let kw = if *negated { "NOT LIKE" } else { "LIKE" };
-            format!("({} {kw} {})", format_expr_brief(expr), format_expr_brief(pattern))
+            format!(
+                "({} {kw} {})",
+                format_expr_brief(expr),
+                format_expr_brief(pattern)
+            )
         }
         ScalarExpr::Function { name, args } => {
             let arg_str = args

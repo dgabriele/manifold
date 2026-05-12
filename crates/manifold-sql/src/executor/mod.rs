@@ -106,8 +106,10 @@ pub fn execute_in_txn_buffered(
             dirty_tables.insert(table_name.clone());
             Ok(result)
         }
-        // For UPDATE/DELETE, flush the target table first (need to read rows).
-        LogicalPlan::Update { table_name, .. } | LogicalPlan::Delete { table_name, .. } => {
+        // For UPDATE/DELETE/RowidUpdate, flush the target table first (need to read rows).
+        LogicalPlan::Update { table_name, .. }
+        | LogicalPlan::Delete { table_name, .. }
+        | LogicalPlan::RowidUpdate { table_name, .. } => {
             flush_table(txn, dirty_tables, table_name)?;
             execute_plan_mut(txn, catalog, &plan, params)
         }
@@ -818,6 +820,12 @@ fn execute_plan_mut(
         LogicalPlan::Delete {
             table_name, input, ..
         } => execute_delete(txn, catalog, table_name, input, params),
+
+        LogicalPlan::RowidUpdate {
+            table_name,
+            rowid_expr,
+            assignments,
+        } => execute_rowid_update(txn, catalog, table_name, rowid_expr, assignments, params),
 
         LogicalPlan::Analyze { table_name } => execute_analyze(txn, catalog, table_name.as_deref()),
 
@@ -2112,6 +2120,75 @@ fn execute_analyze(
     }
 
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// DML: ROWID UPDATE
+// ---------------------------------------------------------------------------
+
+fn execute_rowid_update(
+    txn: &manifold::WriteTransaction,
+    catalog: &mut Catalog,
+    table_name: &str,
+    rowid_expr: &ScalarExpr,
+    assignments: &[(usize, ScalarExpr)],
+    params: &[Value],
+) -> Result<u64> {
+    let schema = catalog
+        .get_table(table_name)
+        .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?
+        .clone();
+    let col_types = schema.column_types();
+
+    let rowid = match evaluate(rowid_expr, &[], params)? {
+        Value::Integer(i) if i > 0 => i as u64,
+        _ => return Ok(0),
+    };
+
+    let data_name = data_table_name(table_name);
+    let def = TableDefinition::<u64, &[u8]>::new(data_name);
+    let mut data_table = txn.open_table(def)?;
+
+    // Decode existing row (with rowid prefix for expression evaluation).
+    // Use a nested scope so the AccessGuard is dropped before the mutable insert.
+    let row_opt: Option<Vec<Value>> = {
+        let existing = data_table.get(rowid).map_err(SqlError::Storage)?;
+        match existing {
+            None => None,
+            Some(guard) => {
+                let mut row = vec![Value::Integer(rowid as i64)];
+                row.extend(decode_row(&col_types, guard.value())?);
+                Some(row)
+            }
+        }
+    };
+    let Some(row) = row_opt else {
+        return Ok(0);
+    };
+
+    // Apply assignments (column indices are 0-based in plan, but row has rowid at [0])
+    let mut new_row = row.clone();
+    for (col_idx, expr) in assignments {
+        new_row[col_idx + 1] = evaluate(expr, &row, params)?;
+    }
+
+    // Run constraint checks on the new row values.
+    check_insert_constraints(txn, catalog, &schema, &new_row[1..])?;
+
+    // Update indexes: remove old entries, add new
+    let indexes: Vec<_> = catalog
+        .indexes_for_table(schema.id)
+        .into_iter()
+        .cloned()
+        .collect();
+    update_indexes_delete(txn, table_name, &indexes, &row[1..], rowid)?;
+    update_indexes_insert(txn, table_name, &indexes, &new_row[1..], rowid)?;
+
+    // Re-encode and insert
+    let encoded = encode_row(&col_types, &new_row[1..])?;
+    data_table.insert(rowid, encoded.as_slice())?;
+
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------------

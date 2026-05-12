@@ -3,7 +3,6 @@ use crate::catalog::Catalog;
 use crate::error::Result;
 use crate::planner::plan::{LogicalPlan, ScalarExpr};
 
-
 /// For `Filter(col = literal, Scan)` patterns, replace with `IndexScan` when
 /// an index covers the filtered column.
 pub fn select_indexes(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
@@ -14,26 +13,47 @@ fn select_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
     match plan {
         LogicalPlan::Filter { predicate, input } => {
             let input = select_plan(*input, catalog)?;
-            // Check for Filter(col = literal, Scan) pattern.
-            // Replace with IndexScan that carries the lookup value.
-            // For simple equality predicates, the Filter is removed since
-            // the index enforces it.
             if let LogicalPlan::Scan {
                 table_id,
                 ref table_name,
                 ref schema,
             } = input
-                && let Some((index_name, lookup_value)) =
-                    find_index_for_predicate(&predicate, table_id, table_name, catalog)
             {
-                let index_scan = LogicalPlan::IndexScan {
-                    table_id,
-                    table_name: table_name.clone(),
-                    index_name,
-                    lookup_values: vec![lookup_value],
-                    schema: schema.clone(),
-                };
-                return Ok(index_scan);
+                // Fast path: direct rowid lookup for INTEGER PRIMARY KEY equality.
+                if let Some(rowid_expr) = find_rowid_predicate(&predicate, table_name, catalog) {
+                    return Ok(LogicalPlan::RowidLookup {
+                        table_name: table_name.clone(),
+                        rowid_expr,
+                        schema: schema.clone(),
+                    });
+                }
+
+                // Fast path: rowid range scan for PK BETWEEN.
+                if let Some((start, end)) =
+                    find_rowid_range_predicate(&predicate, table_name, catalog)
+                {
+                    return Ok(LogicalPlan::RowidRangeScan {
+                        table_name: table_name.clone(),
+                        start_expr: start,
+                        end_expr: end,
+                        schema: schema.clone(),
+                    });
+                }
+
+                // Check for Filter(col = literal, Scan) pattern.
+                // Replace with IndexScan that carries the lookup value.
+                if let Some((index_name, lookup_value)) =
+                    find_index_for_predicate(&predicate, table_id, table_name, catalog)
+                {
+                    let index_scan = LogicalPlan::IndexScan {
+                        table_id,
+                        table_name: table_name.clone(),
+                        index_name,
+                        lookup_values: vec![lookup_value],
+                        schema: schema.clone(),
+                    };
+                    return Ok(index_scan);
+                }
             }
             Ok(LogicalPlan::Filter {
                 predicate,
@@ -146,6 +166,13 @@ fn select_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
             input,
         } => {
             let input = select_plan(*input, catalog)?;
+            if let LogicalPlan::RowidLookup { rowid_expr, .. } = &input {
+                return Ok(LogicalPlan::RowidUpdate {
+                    table_name,
+                    rowid_expr: rowid_expr.clone(),
+                    assignments,
+                });
+            }
             Ok(LogicalPlan::Update {
                 table_id,
                 table_name,
@@ -178,6 +205,65 @@ fn select_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
 /// Check if the predicate is an equality comparison `col = literal` (or `col = $param`)
 /// and if there is an index on that column. Returns the index name and the lookup
 /// expression if found.
+/// Check if predicate is `pk_col = expr` where pk_col is an INTEGER PRIMARY KEY.
+/// Returns the value expression if so. Only matches column 0 when it's declared
+/// as a PK (which makes it the manifold table's u64 rowid key).
+fn find_rowid_predicate(
+    predicate: &ScalarExpr,
+    table_name: &str,
+    catalog: &Catalog,
+) -> Option<ScalarExpr> {
+    let table = catalog.get_table(table_name)?;
+    // Column 0 must be the primary key
+    if table.columns.is_empty() || !table.columns[0].is_primary_key {
+        return None;
+    }
+    if let ScalarExpr::BinaryOp {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = predicate
+    {
+        match (left.as_ref(), right.as_ref()) {
+            (
+                ScalarExpr::ColumnRef { index: 0 },
+                val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)),
+            ) => Some(val.clone()),
+            (
+                val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)),
+                ScalarExpr::ColumnRef { index: 0 },
+            ) => Some(val.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Check if predicate is `pk_col BETWEEN low AND high` on an INTEGER PRIMARY KEY.
+fn find_rowid_range_predicate(
+    predicate: &ScalarExpr,
+    table_name: &str,
+    catalog: &Catalog,
+) -> Option<(ScalarExpr, ScalarExpr)> {
+    let table = catalog.get_table(table_name)?;
+    if table.columns.is_empty() || !table.columns[0].is_primary_key {
+        return None;
+    }
+    if let ScalarExpr::Between {
+        expr,
+        low,
+        high,
+        negated: false,
+    } = predicate
+    {
+        if matches!(expr.as_ref(), ScalarExpr::ColumnRef { index: 0 }) {
+            return Some((*low.clone(), *high.clone()));
+        }
+    }
+    None
+}
+
 fn find_index_for_predicate(
     predicate: &ScalarExpr,
     _plan_table_id: u32,
@@ -197,12 +283,14 @@ fn find_index_for_predicate(
     } = predicate
     {
         let (col_index, value_expr) = match (left.as_ref(), right.as_ref()) {
-            (ScalarExpr::ColumnRef { index }, val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_))) => {
-                (Some(*index), Some(val.clone()))
-            }
-            (val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)), ScalarExpr::ColumnRef { index }) => {
-                (Some(*index), Some(val.clone()))
-            }
+            (
+                ScalarExpr::ColumnRef { index },
+                val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)),
+            ) => (Some(*index), Some(val.clone())),
+            (
+                val @ (ScalarExpr::Literal(_) | ScalarExpr::Parameter(_)),
+                ScalarExpr::ColumnRef { index },
+            ) => (Some(*index), Some(val.clone())),
             _ => (None, None),
         };
 
@@ -292,19 +380,20 @@ mod tests {
         };
 
         let result = select_indexes(filter, &catalog).unwrap();
-        // Should be IndexScan directly -- the filter is removed for equality predicates
-        if let LogicalPlan::IndexScan {
-            index_name,
+        // Column 0 is the PK/rowid — should produce RowidLookup (direct key access)
+        if let LogicalPlan::RowidLookup {
             table_name,
-            lookup_values,
+            rowid_expr,
             ..
         } = &result
         {
-            assert_eq!(index_name, "idx_users_id");
             assert_eq!(table_name, "users");
-            assert_eq!(lookup_values.len(), 1);
+            assert!(matches!(
+                rowid_expr,
+                ScalarExpr::Literal(Value::Integer(42))
+            ));
         } else {
-            panic!("expected IndexScan, got {:?}", result);
+            panic!("expected RowidLookup, got {:?}", result);
         }
     }
 
