@@ -973,6 +973,13 @@ fn execute_create_table(
     let def = TableDefinition::<u64, &[u8]>::new(data_name);
     txn.open_table(def)?;
 
+    // True when column 0 is an INTEGER/BIGINT PRIMARY KEY — in that case the
+    // data table itself IS the PK index (PK value == rowid), so no secondary
+    // PK index is needed.
+    let has_pk_rowid = !columns.is_empty()
+        && columns[0].is_primary_key
+        && matches!(columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+
     // Create index tables for PK and UNIQUE constraints.
     for constraint in &owned_constraints {
         match constraint {
@@ -981,6 +988,11 @@ fn execute_create_table(
                 columns: cols,
                 ..
             } => {
+                // Skip the PK index for PK=rowid tables — the data table IS the index.
+                if has_pk_rowid && cols == &[0usize] {
+                    continue;
+                }
+
                 let idx_name = index_table_name(name, &format!("pk_{cname}"), true);
                 let idx_def = TableDefinition::<&[u8], u64>::new(idx_name);
                 txn.open_table(idx_def)?;
@@ -1481,11 +1493,18 @@ fn execute_insert_inner(
     let def = TableDefinition::<u64, &[u8]>::new(data_name);
     let mut data_table = txn.open_table(def)?;
 
-    // Get indexes for this table.
+    // Whether PK=rowid applies (column 0 is INTEGER/BIGINT PRIMARY KEY).
+    let has_pk_rowid = !schema.columns.is_empty()
+        && schema.columns[0].is_primary_key
+        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+
+    // Get indexes for this table, skipping the redundant PK index when PK=rowid
+    // (uniqueness is already enforced by the duplicate-rowid check below).
     let indexes: Vec<IndexDef> = catalog
         .indexes_for_table(schema.id)
         .into_iter()
         .cloned()
+        .filter(|idx| !(has_pk_rowid && idx.columns == [0] && idx.unique))
         .collect();
 
     let mut next_rowid = schema.next_rowid;
@@ -1638,10 +1657,15 @@ fn execute_update(
     let def = TableDefinition::<u64, &[u8]>::new(data_name);
     let mut data_table = txn.open_table(def)?;
 
+    let has_pk_rowid = !schema.columns.is_empty()
+        && schema.columns[0].is_primary_key
+        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+
     let indexes: Vec<IndexDef> = catalog
         .indexes_for_table(schema.id)
         .into_iter()
         .cloned()
+        .filter(|idx| !(has_pk_rowid && idx.columns == [0] && idx.unique))
         .collect();
 
     let mut count = 0u64;
@@ -1712,10 +1736,15 @@ fn execute_delete(
     let def = TableDefinition::<u64, &[u8]>::new(data_name);
     let mut data_table = txn.open_table(def)?;
 
+    let has_pk_rowid = !schema.columns.is_empty()
+        && schema.columns[0].is_primary_key
+        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+
     let indexes: Vec<IndexDef> = catalog
         .indexes_for_table(schema.id)
         .into_iter()
         .cloned()
+        .filter(|idx| !(has_pk_rowid && idx.columns == [0] && idx.unique))
         .collect();
 
     let mut count = 0u64;
@@ -2251,10 +2280,14 @@ fn execute_rowid_update(
     check_insert_constraints(txn, catalog, &schema, &new_row[1..])?;
 
     // Update indexes: remove old entries, add new
+    let has_pk_rowid = !schema.columns.is_empty()
+        && schema.columns[0].is_primary_key
+        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
     let indexes: Vec<_> = catalog
         .indexes_for_table(schema.id)
         .into_iter()
         .cloned()
+        .filter(|idx| !(has_pk_rowid && idx.columns == [0] && idx.unique))
         .collect();
     update_indexes_delete(txn, table_name, &indexes, &row[1..], rowid)?;
     update_indexes_insert(txn, table_name, &indexes, &new_row[1..], rowid)?;
@@ -2313,10 +2346,14 @@ fn execute_rowid_delete(
     data_table.remove(rowid).map_err(SqlError::Storage)?;
 
     // Update indexes
+    let has_pk_rowid = !schema.columns.is_empty()
+        && schema.columns[0].is_primary_key
+        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
     let indexes: Vec<_> = catalog
         .indexes_for_table(schema.id)
         .into_iter()
         .cloned()
+        .filter(|idx| !(has_pk_rowid && idx.columns == [0] && idx.unique))
         .collect();
     update_indexes_delete(txn, table_name, &indexes, &row[1..], rowid)?;
 
