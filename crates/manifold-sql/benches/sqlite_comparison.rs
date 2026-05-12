@@ -43,12 +43,12 @@ fn manifold_populated(n: usize) -> (ManifoldDb, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("bench.db");
     {
+        // Use Immediate durability for population so WAL is fsynced before close
         let db = ManifoldDb::open(&path).unwrap();
-        db.set_durability(manifold_sql::Durability::None);
         manifold_create_table(&db);
         manifold_populate(&db, n);
     }
-    // Reopen: WAL recovery flushes data to B-tree
+    // Reopen: WAL recovery replays data. Use None durability for bench iterations.
     let db = ManifoldDb::open(&path).unwrap();
     db.set_durability(manifold_sql::Durability::None);
     (db, dir)

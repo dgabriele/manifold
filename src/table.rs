@@ -376,16 +376,17 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
             return Err(StorageError::ValueTooLarge(value_len + key_len));
         }
 
-        if self.transaction.is_deferred_flush() {
+        // Deferred flush only for data tables (name starts with "data_").
+        // Metadata/catalog/index tables must go through the normal B-tree path
+        // so that table definitions are durable and visible after recovery.
+        if self.transaction.is_deferred_flush() && self.name.starts_with("data_") {
             let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
             let value_bytes = V::as_bytes(value.borrow()).as_ref().to_vec();
-            // Push to transaction's deferred ops for WAL + memtable on commit
             self.transaction.push_deferred_op(
                 &self.name,
                 key_bytes.clone(),
                 Some(value_bytes.clone()),
             );
-            // Also insert into overlay for read-your-own-writes within this transaction
             self.overlay.insert(key_bytes, Some(value_bytes));
             return Ok(None);
         }
@@ -400,7 +401,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
     ) -> Result<Option<AccessGuard<'_, V>>> {
-        if self.transaction.is_deferred_flush() {
+        if self.transaction.is_deferred_flush() && self.name.starts_with("data_") {
             let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
             self.transaction
                 .push_deferred_op(&self.name, key_bytes.clone(), None);
