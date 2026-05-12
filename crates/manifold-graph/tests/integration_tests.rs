@@ -424,18 +424,26 @@ fn test_full_graph_iteration() {
     assert_eq!(all_edges.len(), 4);
 
     // Verify we can find specific edges
-    assert!(all_edges
-        .iter()
-        .any(|e| e.source == u1 && e.target == u2 && e.edge_type == "follows"));
-    assert!(all_edges
-        .iter()
-        .any(|e| e.source == u1 && e.target == u3 && e.edge_type == "follows"));
-    assert!(all_edges
-        .iter()
-        .any(|e| e.source == u2 && e.target == u3 && e.edge_type == "follows"));
-    assert!(all_edges
-        .iter()
-        .any(|e| e.source == u3 && e.target == u1 && e.edge_type == "knows"));
+    assert!(
+        all_edges
+            .iter()
+            .any(|e| e.source == u1 && e.target == u2 && e.edge_type == "follows")
+    );
+    assert!(
+        all_edges
+            .iter()
+            .any(|e| e.source == u1 && e.target == u3 && e.edge_type == "follows")
+    );
+    assert!(
+        all_edges
+            .iter()
+            .any(|e| e.source == u2 && e.target == u3 && e.edge_type == "follows")
+    );
+    assert!(
+        all_edges
+            .iter()
+            .any(|e| e.source == u3 && e.target == u1 && e.edge_type == "knows")
+    );
 }
 
 #[test]

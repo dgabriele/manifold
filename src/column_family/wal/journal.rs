@@ -1,7 +1,7 @@
 use super::entry::WALEntry;
+use crate::StorageBackend;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::tree_store::file_backend::FileBackend;
-use crate::StorageBackend;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
 use std::io;

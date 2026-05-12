@@ -11,11 +11,7 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn new(
-        input: Box<dyn super::Executor>,
-        predicate: ScalarExpr,
-        params: &[Value],
-    ) -> Self {
+    pub fn new(input: Box<dyn super::Executor>, predicate: ScalarExpr, params: &[Value]) -> Self {
         Self {
             input,
             predicate,

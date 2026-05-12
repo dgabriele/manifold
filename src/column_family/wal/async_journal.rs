@@ -29,7 +29,7 @@
 #![allow(dead_code)] // Phase 1 core implementation - will be used in integration
 
 use super::entry::WALEntry;
-use super::journal::{WALHeader, WAL_HEADER_SIZE};
+use super::journal::{WAL_HEADER_SIZE, WALHeader};
 use crate::StorageBackend;
 use std::collections::BTreeSet;
 use std::io;

@@ -262,10 +262,7 @@ fn type_enforcement_strict() {
         .execute("INSERT INTO t (id, count) VALUES (1, 'not a number')", &[])
         .unwrap_err();
     let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("type"),
-        "expected type error, got: {err}"
-    );
+    assert!(msg.contains("type"), "expected type error, got: {err}");
 }
 
 #[test]
@@ -287,7 +284,10 @@ fn varchar_length() {
         .unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("varchar") || msg.contains("exceeds") || msg.contains("constraint") || msg.contains("length"),
+        msg.contains("varchar")
+            || msg.contains("exceeds")
+            || msg.contains("constraint")
+            || msg.contains("length"),
         "expected VARCHAR length error, got: {err}"
     );
 }

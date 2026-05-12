@@ -1,14 +1,14 @@
-use manifold::backends::InMemoryBackend;
-use rand::random;
 #[cfg(not(target_os = "wasi"))]
 use manifold::CommitError;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use manifold::DatabaseError;
+use manifold::backends::InMemoryBackend;
 use manifold::{
     Database, Key, MultimapTableDefinition, MultimapTableHandle, Range, ReadOnlyDatabase,
     ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableError,
     TableHandle, TypeName, Value,
 };
+use rand::random;
 use std::cmp::Ordering;
 #[cfg(not(target_os = "wasi"))]
 use std::sync;

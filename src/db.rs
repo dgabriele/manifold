@@ -19,9 +19,9 @@ use std::{io, thread};
 use crate::error::TransactionError;
 use crate::sealed::Sealed;
 use crate::transactions::{
-    AllocatorStateKey, AllocatorStateTree, PageList, SystemTableDefinition,
-    TransactionIdWithPagination, ALLOCATOR_STATE_TABLE_NAME, DATA_ALLOCATED_TABLE,
-    DATA_FREED_TABLE, SYSTEM_FREED_TABLE,
+    ALLOCATOR_STATE_TABLE_NAME, AllocatorStateKey, AllocatorStateTree, DATA_ALLOCATED_TABLE,
+    DATA_FREED_TABLE, PageList, SYSTEM_FREED_TABLE, SystemTableDefinition,
+    TransactionIdWithPagination,
 };
 use crate::tree_store::file_backend::FileBackend;
 #[cfg(feature = "logging")]
@@ -1329,8 +1329,8 @@ mod test {
     };
     use std::fs::File;
     use std::io::{ErrorKind, Read, Seek, SeekFrom};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Debug)]
     struct FailingBackend {
@@ -1358,11 +1358,7 @@ mod test {
             if self
                 .countdown
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
-                    if x > 0 {
-                        Some(x - 1)
-                    } else {
-                        None
-                    }
+                    if x > 0 { Some(x - 1) } else { None }
                 })
                 .is_err()
             {

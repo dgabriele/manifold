@@ -473,8 +473,7 @@ impl WALLogicalOpsPayload {
                 "truncated table_name length",
             ));
         }
-        let name_len =
-            u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
 
         if data.len() < offset + name_len {
@@ -496,8 +495,7 @@ impl WALLogicalOpsPayload {
                 "truncated op_count",
             ));
         }
-        let op_count =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let op_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         let mut ops = Vec::with_capacity(op_count);
@@ -509,8 +507,7 @@ impl WALLogicalOpsPayload {
                     "truncated key_len",
                 ));
             }
-            let key_len =
-                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            let key_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
             if data.len() < offset + key_len {

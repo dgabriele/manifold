@@ -22,7 +22,9 @@ fn parameterized_prevents_injection() {
     .unwrap();
 
     // Table should still exist and contain the literal string.
-    let result = db.query("SELECT name FROM users WHERE id = 1", &[]).unwrap();
+    let result = db
+        .query("SELECT name FROM users WHERE id = 1", &[])
+        .unwrap();
     assert_eq!(result.row_count(), 1);
     assert_eq!(result.rows()[0].get::<String>(0).unwrap(), evil);
 
@@ -134,11 +136,8 @@ fn large_in_list() {
 
     // Insert a few rows.
     for i in 0..10 {
-        db.execute(
-            "INSERT INTO t (id) VALUES ($1)",
-            &[Value::Integer(i)],
-        )
-        .unwrap();
+        db.execute("INSERT INTO t (id) VALUES ($1)", &[Value::Integer(i)])
+            .unwrap();
     }
 
     // Build WHERE id IN (1, 2, 3, ..., 1000).

@@ -16,8 +16,8 @@
 
 use std::env::current_dir;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{fs, process};
@@ -68,7 +68,9 @@ fn shuffled_keys(n: u64, seed: u64) -> Vec<u64> {
     let mut keys: Vec<u64> = (0..n).collect();
     let mut rng = seed;
     for i in (1..keys.len()).rev() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (rng >> 33) as usize % (i + 1);
         keys.swap(i, j);
     }
@@ -188,19 +190,14 @@ fn open_rocksdb(dir: &std::path::Path) -> (TempDir, Arc<rocksdb::OptimisticTrans
     let mut opts = rocksdb::Options::default();
     opts.set_block_based_table_factory(&bb);
     opts.create_if_missing(true);
-    opts.increase_parallelism(
-        std::thread::available_parallelism().map_or(4, |n| n.get()) as i32,
-    );
+    opts.increase_parallelism(std::thread::available_parallelism().map_or(4, |n| n.get()) as i32);
 
     let db = rocksdb::OptimisticTransactionDB::open(&opts, tmpdir.path().join("db")).unwrap();
     (tmpdir, Arc::new(db))
 }
 
-fn open_rocksdb_cf(
-    dir: &std::path::Path,
-    cf_names: &[String],
-) -> (TempDir, Arc<rocksdb::DB>) {
-    use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+fn open_rocksdb_cf(dir: &std::path::Path, cf_names: &[String]) -> (TempDir, Arc<rocksdb::DB>) {
+    use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 
     let tmpdir = TempDir::new_in(dir).unwrap();
 
@@ -214,9 +211,7 @@ fn open_rocksdb_cf(
     opts.set_block_based_table_factory(&bb);
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
-    opts.increase_parallelism(
-        std::thread::available_parallelism().map_or(4, |n| n.get()) as i32,
-    );
+    opts.increase_parallelism(std::thread::available_parallelism().map_or(4, |n| n.get()) as i32);
 
     let mut cfs = vec![ColumnFamilyDescriptor::new("default", Options::default())];
     for name in cf_names {
@@ -741,7 +736,13 @@ fn bench_concurrent_cf(dir: &std::path::Path, n: u64) -> WorkloadResult {
     }
     // rename "default" usage to cf_0 pattern
     let cf_names_m: Vec<String> = (0..NUM_CFS)
-        .map(|i| if i == 0 { "default".to_string() } else { format!("cf_{}", i) })
+        .map(|i| {
+            if i == 0 {
+                "default".to_string()
+            } else {
+                format!("cf_{}", i)
+            }
+        })
         .collect();
 
     let start = Instant::now();

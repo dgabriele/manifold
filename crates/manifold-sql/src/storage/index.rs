@@ -155,7 +155,10 @@ mod tests {
         let alice = encode_index_key(&[Value::Text("alice".to_string())]);
         let bob = encode_index_key(&[Value::Text("bob".to_string())]);
 
-        assert!(alice < bob, "encode(\"alice\") should be less than encode(\"bob\")");
+        assert!(
+            alice < bob,
+            "encode(\"alice\") should be less than encode(\"bob\")"
+        );
     }
 
     #[test]

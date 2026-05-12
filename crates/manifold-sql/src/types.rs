@@ -127,18 +127,29 @@ impl Value {
             Value::Boolean(_) => matches!(ty, SqlType::Boolean),
             Value::SmallInt(_) => matches!(
                 ty,
-                SqlType::SmallInt | SqlType::Integer | SqlType::BigInt | SqlType::Real | SqlType::Decimal { .. }
+                SqlType::SmallInt
+                    | SqlType::Integer
+                    | SqlType::BigInt
+                    | SqlType::Real
+                    | SqlType::Decimal { .. }
             ),
             Value::Integer(_) => matches!(
                 ty,
-                SqlType::SmallInt | SqlType::Integer | SqlType::BigInt | SqlType::Real | SqlType::Decimal { .. }
+                SqlType::SmallInt
+                    | SqlType::Integer
+                    | SqlType::BigInt
+                    | SqlType::Real
+                    | SqlType::Decimal { .. }
             ),
             Value::Real(_) => matches!(ty, SqlType::Real | SqlType::Decimal { .. }),
             Value::Decimal(_) => matches!(ty, SqlType::Decimal { .. } | SqlType::Real),
             Value::Text(_) => matches!(ty, SqlType::Text | SqlType::Varchar(_)),
             Value::Blob(_) => matches!(ty, SqlType::Blob),
             Value::Uuid(_) => matches!(ty, SqlType::Uuid),
-            Value::Date(_) => matches!(ty, SqlType::Date | SqlType::Timestamp | SqlType::TimestampTz),
+            Value::Date(_) => matches!(
+                ty,
+                SqlType::Date | SqlType::Timestamp | SqlType::TimestampTz
+            ),
             Value::Timestamp(_) => matches!(ty, SqlType::Timestamp | SqlType::TimestampTz),
             Value::TimestampTz(_) => matches!(ty, SqlType::TimestampTz | SqlType::Timestamp),
             Value::Json(_) => matches!(ty, SqlType::Json),

@@ -21,7 +21,9 @@ pub fn call_function(name: &str, args: &[Value]) -> Result<Value> {
 /// COALESCE(v1, v2, ...) — return the first non-NULL argument.
 fn coalesce(args: &[Value]) -> Result<Value> {
     if args.is_empty() {
-        return Err(SqlError::Execute("COALESCE requires at least one argument".to_string()));
+        return Err(SqlError::Execute(
+            "COALESCE requires at least one argument".to_string(),
+        ));
     }
     for v in args {
         if !v.is_null() {
@@ -37,7 +39,10 @@ fn upper(args: &[Value]) -> Result<Value> {
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::Text(s) => Ok(Value::Text(s.to_uppercase())),
-        other => Err(SqlError::TypeError(format!("UPPER requires text argument, got {}", other))),
+        other => Err(SqlError::TypeError(format!(
+            "UPPER requires text argument, got {}",
+            other
+        ))),
     }
 }
 
@@ -47,7 +52,10 @@ fn lower(args: &[Value]) -> Result<Value> {
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::Text(s) => Ok(Value::Text(s.to_lowercase())),
-        other => Err(SqlError::TypeError(format!("LOWER requires text argument, got {}", other))),
+        other => Err(SqlError::TypeError(format!(
+            "LOWER requires text argument, got {}",
+            other
+        ))),
     }
 }
 
@@ -58,7 +66,10 @@ fn length(args: &[Value]) -> Result<Value> {
         Value::Null => Ok(Value::Null),
         Value::Text(s) => Ok(Value::Integer(s.chars().count() as i64)),
         Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
-        other => Err(SqlError::TypeError(format!("LENGTH requires text or blob argument, got {}", other))),
+        other => Err(SqlError::TypeError(format!(
+            "LENGTH requires text or blob argument, got {}",
+            other
+        ))),
     }
 }
 
@@ -71,7 +82,10 @@ fn abs(args: &[Value]) -> Result<Value> {
         Value::SmallInt(i) => Ok(Value::SmallInt(i.abs())),
         Value::Real(f) => Ok(Value::Real(f.abs())),
         Value::Decimal(d) => Ok(Value::Decimal(d.abs())),
-        other => Err(SqlError::TypeError(format!("ABS requires numeric argument, got {}", other))),
+        other => Err(SqlError::TypeError(format!(
+            "ABS requires numeric argument, got {}",
+            other
+        ))),
     }
 }
 

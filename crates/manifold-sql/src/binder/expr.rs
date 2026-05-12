@@ -1,7 +1,9 @@
-use sqlparser::ast::{self, DataType, DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArguments};
+use sqlparser::ast::{
+    self, DataType, DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArguments,
+};
 
-use crate::catalog::schema::TableId;
 use crate::catalog::Catalog;
+use crate::catalog::schema::TableId;
 use crate::error::{Result, SqlError};
 use crate::types::{SqlType, Value};
 
@@ -86,11 +88,7 @@ impl Scope {
     /// Resolve a column reference, handling qualified (table.col) and unqualified (col) forms.
     /// Column matching is case-insensitive. Detects ambiguity when multiple tables have the
     /// same column name.
-    pub fn resolve_column(
-        &self,
-        qualifier: Option<&str>,
-        col_name: &str,
-    ) -> Result<ColumnRef> {
+    pub fn resolve_column(&self, qualifier: Option<&str>, col_name: &str) -> Result<ColumnRef> {
         let col_lower = col_name.to_lowercase();
 
         if let Some(qual) = qualifier {
@@ -106,18 +104,14 @@ impl Scope {
                         .unwrap_or(false)
                         || t.table_name.to_lowercase() == qual_lower
                 })
-                .ok_or_else(|| {
-                    SqlError::TableNotFound(qual.to_string())
-                })?;
+                .ok_or_else(|| SqlError::TableNotFound(qual.to_string()))?;
 
             let (col_idx, col) = table
                 .columns
                 .iter()
                 .enumerate()
                 .find(|(_, c)| c.name.to_lowercase() == col_lower)
-                .ok_or_else(|| {
-                    SqlError::ColumnNotFound(format!("{}.{}", qual, col_name))
-                })?;
+                .ok_or_else(|| SqlError::ColumnNotFound(format!("{}.{}", qual, col_name)))?;
 
             Ok(ColumnRef {
                 table_id: table.table_id,
@@ -236,11 +230,7 @@ impl Scope {
 // bind_expr — convert sqlparser Expr to BoundExpr
 // ---------------------------------------------------------------------------
 
-pub fn bind_expr(
-    scope: &Scope,
-    expr: &ast::Expr,
-    params: &[Value],
-) -> Result<BoundExpr> {
+pub fn bind_expr(scope: &Scope, expr: &ast::Expr, params: &[Value]) -> Result<BoundExpr> {
     bind_expr_inner(scope, None, expr, params)
 }
 
@@ -267,21 +257,16 @@ fn bind_expr_inner(
         }
 
         // Qualified identifier, e.g. table.col
-        ast::Expr::CompoundIdentifier(parts) => {
-            match parts.len() {
-                2 => {
-                    let col_ref = scope.resolve_column(
-                        Some(&parts[0].value),
-                        &parts[1].value,
-                    )?;
-                    Ok(BoundExpr::Column(col_ref))
-                }
-                _ => Err(SqlError::Bind(format!(
-                    "unsupported compound identifier with {} parts",
-                    parts.len()
-                ))),
+        ast::Expr::CompoundIdentifier(parts) => match parts.len() {
+            2 => {
+                let col_ref = scope.resolve_column(Some(&parts[0].value), &parts[1].value)?;
+                Ok(BoundExpr::Column(col_ref))
             }
-        }
+            _ => Err(SqlError::Bind(format!(
+                "unsupported compound identifier with {} parts",
+                parts.len()
+            ))),
+        },
 
         // Value literals
         ast::Expr::Value(val_with_span) => bind_value(&val_with_span.value, params),
@@ -466,9 +451,8 @@ fn bind_expr_inner(
             subquery,
             negated,
         } => {
-            let cat = catalog.ok_or_else(|| {
-                SqlError::Bind("subqueries require catalog context".to_string())
-            })?;
+            let cat = catalog
+                .ok_or_else(|| SqlError::Bind("subqueries require catalog context".to_string()))?;
             let bound_expr = bind_expr_inner(scope, catalog, expr, params)?;
             let subselect = crate::binder::statement::bind_subquery(cat, subquery, params)?;
             Ok(BoundExpr::InSubquery {
@@ -480,9 +464,8 @@ fn bind_expr_inner(
 
         // EXISTS (SELECT ...)
         ast::Expr::Exists { subquery, negated } => {
-            let cat = catalog.ok_or_else(|| {
-                SqlError::Bind("subqueries require catalog context".to_string())
-            })?;
+            let cat = catalog
+                .ok_or_else(|| SqlError::Bind("subqueries require catalog context".to_string()))?;
             let subselect = crate::binder::statement::bind_subquery(cat, subquery, params)?;
             Ok(BoundExpr::Exists {
                 subquery: Box::new(subselect),
@@ -492,18 +475,15 @@ fn bind_expr_inner(
 
         // Scalar subquery: (SELECT ...)
         ast::Expr::Subquery(subquery) => {
-            let cat = catalog.ok_or_else(|| {
-                SqlError::Bind("subqueries require catalog context".to_string())
-            })?;
+            let cat = catalog
+                .ok_or_else(|| SqlError::Bind("subqueries require catalog context".to_string()))?;
             let subselect = crate::binder::statement::bind_subquery(cat, subquery, params)?;
             Ok(BoundExpr::ScalarSubquery {
                 subquery: Box::new(subselect),
             })
         }
 
-        other => Err(SqlError::Bind(format!(
-            "unsupported expression: {other}"
-        ))),
+        other => Err(SqlError::Bind(format!("unsupported expression: {other}"))),
     }
 }
 
@@ -511,10 +491,7 @@ fn bind_expr_inner(
 // Value binding (including parameter placeholders)
 // ---------------------------------------------------------------------------
 
-fn bind_value(
-    val: &ast::Value,
-    params: &[Value],
-) -> Result<BoundExpr> {
+fn bind_value(val: &ast::Value, params: &[Value]) -> Result<BoundExpr> {
     match val {
         ast::Value::Number(s, _) => {
             let s_str = s.to_string();
@@ -530,12 +507,8 @@ fn bind_value(
                 Ok(BoundExpr::Literal(Value::Integer(i)))
             }
         }
-        ast::Value::SingleQuotedString(s) => {
-            Ok(BoundExpr::Literal(Value::Text(s.clone())))
-        }
-        ast::Value::Boolean(b) => {
-            Ok(BoundExpr::Literal(Value::Boolean(*b)))
-        }
+        ast::Value::SingleQuotedString(s) => Ok(BoundExpr::Literal(Value::Text(s.clone()))),
+        ast::Value::Boolean(b) => Ok(BoundExpr::Literal(Value::Boolean(*b))),
         ast::Value::Null => Ok(BoundExpr::Literal(Value::Null)),
         ast::Value::Placeholder(p) => {
             // $1, $2, etc. — convert to 0-based index
@@ -544,9 +517,7 @@ fn bind_value(
                 .parse::<usize>()
                 .map_err(|_| SqlError::Bind(format!("invalid placeholder: {p}")))?;
             if idx == 0 {
-                return Err(SqlError::Bind(
-                    "placeholder index must be >= 1".to_string(),
-                ));
+                return Err(SqlError::Bind("placeholder index must be >= 1".to_string()));
             }
             let zero_based = idx - 1;
             if zero_based >= params.len() {
@@ -557,12 +528,8 @@ fn bind_value(
             }
             Ok(BoundExpr::Parameter(zero_based))
         }
-        ast::Value::DoubleQuotedString(s) => {
-            Ok(BoundExpr::Literal(Value::Text(s.clone())))
-        }
-        other => Err(SqlError::Bind(format!(
-            "unsupported value type: {other}"
-        ))),
+        ast::Value::DoubleQuotedString(s) => Ok(BoundExpr::Literal(Value::Text(s.clone()))),
+        other => Err(SqlError::Bind(format!("unsupported value type: {other}"))),
     }
 }
 
@@ -570,11 +537,7 @@ fn bind_value(
 // Function binding
 // ---------------------------------------------------------------------------
 
-fn bind_function(
-    scope: &Scope,
-    func: &ast::Function,
-    params: &[Value],
-) -> Result<BoundExpr> {
+fn bind_function(scope: &Scope, func: &ast::Function, params: &[Value]) -> Result<BoundExpr> {
     let name_upper = func.name.to_string().to_uppercase();
 
     // Check if it is an aggregate function
@@ -635,12 +598,10 @@ fn bind_function(
                     None => SqlType::BigInt,
                 }
             }
-            AggregateFunc::Min | AggregateFunc::Max => {
-                match &arg {
-                    Some(a) => expr_type(a).unwrap_or(SqlType::Integer),
-                    None => SqlType::Integer,
-                }
-            }
+            AggregateFunc::Min | AggregateFunc::Max => match &arg {
+                Some(a) => expr_type(a).unwrap_or(SqlType::Integer),
+                None => SqlType::Integer,
+            },
         };
 
         Ok(BoundExpr::Aggregate {
@@ -660,11 +621,7 @@ fn bind_function(
     }
 }
 
-fn bind_function_arg(
-    scope: &Scope,
-    arg: &FunctionArg,
-    params: &[Value],
-) -> Result<BoundExpr> {
+fn bind_function_arg(scope: &Scope, arg: &FunctionArg, params: &[Value]) -> Result<BoundExpr> {
     match arg {
         FunctionArg::Unnamed(arg_expr) => match arg_expr {
             FunctionArgExpr::Expr(expr) => bind_expr(scope, expr, params),
@@ -697,7 +654,7 @@ fn infer_scalar_function_type(name: &str, _args: &[BoundExpr]) -> SqlType {
         "NOW" | "CURRENT_TIMESTAMP" => SqlType::Timestamp,
         "CURRENT_DATE" => SqlType::Date,
         "NULLIF" | "IFNULL" => SqlType::Text, // approximate
-        _ => SqlType::Text, // fallback
+        _ => SqlType::Text,                   // fallback
     }
 }
 
@@ -834,14 +791,19 @@ pub fn sql_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType> {
 
         DataType::SmallInt(_) | DataType::Int2(_) => Ok(SqlType::SmallInt),
 
-        DataType::Int(None) | DataType::Int(Some(_))
-        | DataType::Integer(None) | DataType::Integer(Some(_))
+        DataType::Int(None)
+        | DataType::Int(Some(_))
+        | DataType::Integer(None)
+        | DataType::Integer(Some(_))
         | DataType::Int4(_) => Ok(SqlType::Integer),
 
         DataType::BigInt(_) | DataType::Int8(_) => Ok(SqlType::BigInt),
 
-        DataType::Real | DataType::Float(None) | DataType::Float(Some(_))
-        | DataType::Float4 | DataType::Float8 => Ok(SqlType::Real),
+        DataType::Real
+        | DataType::Float(None)
+        | DataType::Float(Some(_))
+        | DataType::Float4
+        | DataType::Float8 => Ok(SqlType::Real),
 
         DataType::Double(_) | DataType::DoublePrecision => Ok(SqlType::Real),
 
@@ -866,36 +828,29 @@ pub fn sql_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType> {
             }
         }
 
-        DataType::Char(len) | DataType::Character(len) => {
-            match len {
-                Some(char_len) => Ok(SqlType::Varchar(char_length_to_u32(char_len))),
-                None => Ok(SqlType::Text),
-            }
-        }
+        DataType::Char(len) | DataType::Character(len) => match len {
+            Some(char_len) => Ok(SqlType::Varchar(char_length_to_u32(char_len))),
+            None => Ok(SqlType::Text),
+        },
 
-        DataType::Blob(_) | DataType::Binary(_) | DataType::Varbinary(_)
-        | DataType::Bytea => Ok(SqlType::Blob),
+        DataType::Blob(_) | DataType::Binary(_) | DataType::Varbinary(_) | DataType::Bytea => {
+            Ok(SqlType::Blob)
+        }
 
         DataType::Uuid => Ok(SqlType::Uuid),
 
         DataType::Date => Ok(SqlType::Date),
 
-        DataType::Timestamp(_, tz_info) => {
-            match tz_info {
-                ast::TimezoneInfo::Tz | ast::TimezoneInfo::WithTimeZone => {
-                    Ok(SqlType::TimestampTz)
-                }
-                _ => Ok(SqlType::Timestamp),
-            }
-        }
+        DataType::Timestamp(_, tz_info) => match tz_info {
+            ast::TimezoneInfo::Tz | ast::TimezoneInfo::WithTimeZone => Ok(SqlType::TimestampTz),
+            _ => Ok(SqlType::Timestamp),
+        },
 
         DataType::JSON | DataType::JSONB => Ok(SqlType::Json),
 
         DataType::String(_) => Ok(SqlType::Text),
 
-        other => Err(SqlError::Bind(format!(
-            "unsupported data type: {other}"
-        ))),
+        other => Err(SqlError::Bind(format!("unsupported data type: {other}"))),
     }
 }
 

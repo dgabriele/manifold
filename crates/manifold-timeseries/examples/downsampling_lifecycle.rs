@@ -9,9 +9,7 @@
 //! Run with: cargo run --example downsampling_lifecycle
 
 use manifold::column_family::ColumnFamilyDatabase;
-use manifold_timeseries::{
-    AbsoluteEncoding, Granularity, TimeSeriesTable, TimeSeriesTableRead,
-};
+use manifold_timeseries::{AbsoluteEncoding, Granularity, TimeSeriesTable, TimeSeriesTableRead};
 use tempfile::tempdir;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_time = 1609459200000u64; // 2021-01-01 00:00:00 UTC
 
     println!("Step 1: Writing high-resolution raw data\n");
-    
+
     // Write 2 hours of data at 10-second intervals (720 data points)
     {
         let write_txn = cf.begin_write()?;
@@ -33,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for i in 0..720 {
             let timestamp = base_time + (i * 10_000); // 10 second intervals
-            
+
             // Simulate CPU usage with daily pattern
             let hour_of_day = (i * 10) as f32 / 3600.0;
             let base_load = 30.0 + (hour_of_day * 0.5).sin() * 15.0;
@@ -44,13 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("Wrote 720 raw data points (2 hours at 10s intervals)\n");
-        
+
         drop(ts);
         write_txn.commit()?;
     }
 
     println!("Step 2: Downsampling to minute aggregates\n");
-    
+
     // Downsample to 1-minute aggregates
     {
         let write_txn = cf.begin_write()?;
@@ -59,20 +57,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start_time = base_time;
         let end_time = base_time + (2 * 60 * 60 * 1000); // 2 hours
 
-        let downsampled = ts.downsample_to_minute(
-            "server1",
-            start_time,
-            end_time,
-        )?;
+        let downsampled = ts.downsample_to_minute("server1", start_time, end_time)?;
 
         println!("Created {} minute aggregates\n", downsampled);
-        
+
         drop(ts);
         write_txn.commit()?;
     }
 
     println!("Step 3: Downsampling to hour aggregates\n");
-    
+
     // Downsample from minutes to hours
     {
         let write_txn = cf.begin_write()?;
@@ -81,20 +75,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start_time = base_time;
         let end_time = base_time + (2 * 60 * 60 * 1000);
 
-        let downsampled = ts.downsample_minute_to_hour(
-            "server1",
-            start_time,
-            end_time,
-        )?;
+        let downsampled = ts.downsample_minute_to_hour("server1", start_time, end_time)?;
 
         println!("Created {} hour aggregates\n", downsampled);
-        
+
         drop(ts);
         write_txn.commit()?;
     }
 
     println!("Step 4: Querying aggregates at different granularities\n");
-    
+
     {
         let read_txn = cf.begin_read()?;
         let ts_read = TimeSeriesTableRead::<AbsoluteEncoding>::open(&read_txn, "cpu")?;
@@ -103,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Raw data (first 5 samples):");
         let raw_start = base_time;
         let raw_end = base_time + 60_000; // First minute
-        
+
         let mut count = 0;
         for result in ts_read.range("server1", raw_start, raw_end)? {
             let (timestamp, value) = result?;
@@ -119,13 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Minute aggregates (first 5 minutes):");
         let minute_start = base_time;
         let minute_end = base_time + (5 * 60 * 1000); // 5 minutes
-        
-        for result in ts_read.range_aggregates(
-            Granularity::Minute,
-            "server1",
-            minute_start,
-            minute_end,
-        )? {
+
+        for result in
+            ts_read.range_aggregates(Granularity::Minute, "server1", minute_start, minute_end)?
+        {
             let (timestamp, agg) = result?;
             let offset_min = (timestamp - base_time) / 60_000;
             println!(
@@ -143,13 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Hour aggregates:");
         let hour_start = base_time;
         let hour_end = base_time + (2 * 60 * 60 * 1000); // 2 hours
-        
-        for result in ts_read.range_aggregates(
-            Granularity::Hour,
-            "server1",
-            hour_start,
-            hour_end,
-        )? {
+
+        for result in
+            ts_read.range_aggregates(Granularity::Hour, "server1", hour_start, hour_end)?
+        {
             let (timestamp, agg) = result?;
             let offset_hour = (timestamp - base_time) / 3_600_000;
             println!(
@@ -164,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("\nStep 5: Applying retention policies\n");
-    
+
     // Apply retention: keep only last hour of raw data
     {
         let write_txn = cf.begin_write()?;
@@ -176,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("Deleted {} old raw data points", deleted);
         println!("   (kept only last hour of raw data)\n");
-        
+
         drop(ts);
         write_txn.commit()?;
     }

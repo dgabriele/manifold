@@ -319,7 +319,7 @@ impl MasterHeader {
 
         // Compute CRC32 over all data before the checksum
         let crc = crc32fast::hash(&bytes);
-        
+
         // Append CRC32 at the end
         bytes.extend_from_slice(&crc.to_le_bytes());
 
@@ -355,7 +355,9 @@ impl MasterHeader {
         if stored_crc != computed_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("header checksum mismatch: expected {stored_crc:#x}, got {computed_crc:#x}"),
+                format!(
+                    "header checksum mismatch: expected {stored_crc:#x}, got {computed_crc:#x}"
+                ),
             ));
         }
 

@@ -63,7 +63,7 @@ pub trait TimeSeriesSource<'a> {
 
     /// Returns the number of raw data points in a time range.
     fn count_raw(&self, series_id: &str, start_ms: u64, end_ms: u64)
-        -> Result<usize, StorageError>;
+    -> Result<usize, StorageError>;
 }
 
 /// Iterator over raw time series data points.

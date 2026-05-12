@@ -114,9 +114,7 @@ fn reopen_database() {
         let result = db.query("SELECT COUNT(*) FROM t", &[]).unwrap();
         assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 2);
 
-        let result = db
-            .query("SELECT val FROM t WHERE id = 2", &[])
-            .unwrap();
+        let result = db.query("SELECT val FROM t WHERE id = 2", &[]).unwrap();
         assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "world");
 
         // Can still insert into the reopened DB.
@@ -146,11 +144,8 @@ fn schema_evolution() {
         .unwrap();
 
     // Insert with new column.
-    db.execute(
-        "INSERT INTO t (id, name, age) VALUES (2, 'bob', 30)",
-        &[],
-    )
-    .unwrap();
+    db.execute("INSERT INTO t (id, name, age) VALUES (2, 'bob', 30)", &[])
+        .unwrap();
 
     // Old row should have NULL for age; verify both rows.
     let result = db.query("SELECT id, name FROM t ORDER BY id", &[]).unwrap();
@@ -187,9 +182,7 @@ fn error_messages_are_clear() {
     );
 
     // Column not found.
-    let err = db
-        .query("SELECT no_such_col FROM t", &[])
-        .unwrap_err();
+    let err = db.query("SELECT no_such_col FROM t", &[]).unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("no_such_col"),
@@ -198,11 +191,10 @@ fn error_messages_are_clear() {
 
     // Type mismatch (insert string where integer expected via wrong param type).
     // This depends on type checking implementation; just verify we get a meaningful error.
-    let err = db
-        .execute(
-            "INSERT INTO t (id, name) VALUES ($1, $2)",
-            &[Value::Text("not_a_number".into()), Value::Integer(42)],
-        );
+    let err = db.execute(
+        "INSERT INTO t (id, name) VALUES ($1, $2)",
+        &[Value::Text("not_a_number".into()), Value::Integer(42)],
+    );
     if let Err(e) = err {
         // Should have some meaningful message, not just a generic error.
         assert!(

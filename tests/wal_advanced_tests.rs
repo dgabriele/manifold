@@ -1,7 +1,7 @@
 // Advanced WAL tests covering error conditions, recovery, and edge cases
 
-use manifold::column_family::ColumnFamilyDatabase;
 use manifold::TableDefinition;
+use manifold::column_family::ColumnFamilyDatabase;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use tempfile::NamedTempFile;
@@ -52,22 +52,21 @@ fn test_wal_invalid_magic_number() {
     // The system should either:
     // 1. Detect corruption and refuse to open (correct behavior)
     // 2. Detect corruption and recreate/ignore the WAL (also acceptable)
-    let db_result = ColumnFamilyDatabase::builder()
-        .pool_size(64)
-        .open(&db_path);
+    let db_result = ColumnFamilyDatabase::builder().pool_size(64).open(&db_path);
 
     // If the database opens, the previously committed data should still be accessible
     // (it was flushed before we corrupted the WAL)
     if let Ok(db) = db_result
-        && let Ok(cf) = db.column_family("test_cf") {
-            let read_txn = cf.begin_read().unwrap();
-            let table = read_txn.open_table(TEST_TABLE).unwrap();
-            // Data committed before corruption should be readable
-            assert_eq!(
-                table.get(&1).unwrap().unwrap().value(),
-                "persisted_before_corruption"
-            );
-        }
+        && let Ok(cf) = db.column_family("test_cf")
+    {
+        let read_txn = cf.begin_read().unwrap();
+        let table = read_txn.open_table(TEST_TABLE).unwrap();
+        // Data committed before corruption should be readable
+        assert_eq!(
+            table.get(&1).unwrap().unwrap().value(),
+            "persisted_before_corruption"
+        );
+    }
     // If the database refuses to open due to corruption, that's also valid behavior
 }
 
@@ -114,20 +113,16 @@ fn test_wal_unsupported_version() {
     }
 
     // System should handle unsupported version
-    let db_result = ColumnFamilyDatabase::builder()
-        .pool_size(64)
-        .open(&db_path);
+    let db_result = ColumnFamilyDatabase::builder().pool_size(64).open(&db_path);
 
     // If opens, previously persisted data should be accessible
     if let Ok(db) = db_result
-        && let Ok(cf) = db.column_family("test_cf") {
-            let read_txn = cf.begin_read().unwrap();
-            let table = read_txn.open_table(TEST_TABLE).unwrap();
-            assert_eq!(
-                table.get(&2).unwrap().unwrap().value(),
-                "persisted_data"
-            );
-        }
+        && let Ok(cf) = db.column_family("test_cf")
+    {
+        let read_txn = cf.begin_read().unwrap();
+        let table = read_txn.open_table(TEST_TABLE).unwrap();
+        assert_eq!(table.get(&2).unwrap().unwrap().value(), "persisted_data");
+    }
     // Refusing to open is also acceptable
 }
 
@@ -177,20 +172,16 @@ fn test_wal_header_crc_mismatch() {
     }
 
     // System should detect CRC mismatch
-    let db_result = ColumnFamilyDatabase::builder()
-        .pool_size(64)
-        .open(&db_path);
+    let db_result = ColumnFamilyDatabase::builder().pool_size(64).open(&db_path);
 
     // If opens, verify data integrity
     if let Ok(db) = db_result
-        && let Ok(cf) = db.column_family("test_cf") {
-            let read_txn = cf.begin_read().unwrap();
-            let table = read_txn.open_table(TEST_TABLE).unwrap();
-            assert_eq!(
-                table.get(&3).unwrap().unwrap().value(),
-                "crc_test_data"
-            );
-        }
+        && let Ok(cf) = db.column_family("test_cf")
+    {
+        let read_txn = cf.begin_read().unwrap();
+        let table = read_txn.open_table(TEST_TABLE).unwrap();
+        assert_eq!(table.get(&3).unwrap().unwrap().value(), "crc_test_data");
+    }
     // Refusing to open due to CRC failure is also valid
 }
 
@@ -287,10 +278,7 @@ fn test_wal_manual_checkpoint() {
     let read_txn = cf.begin_read().unwrap();
     let table = read_txn.open_table(TEST_TABLE).unwrap();
     for i in 0..20 {
-        assert_eq!(
-            table.get(&i).unwrap().unwrap().value(),
-            "checkpoint_test"
-        );
+        assert_eq!(table.get(&i).unwrap().unwrap().value(), "checkpoint_test");
     }
 }
 
@@ -330,11 +318,7 @@ fn test_wal_crash_recovery() {
     let table = read_txn.open_table(TEST_TABLE).unwrap();
     for i in 0..50 {
         let value = table.get(&i).unwrap();
-        assert!(
-            value.is_some(),
-            "Key {} should exist after recovery",
-            i
-        );
+        assert!(value.is_some(), "Key {} should exist after recovery", i);
         assert_eq!(value.unwrap().value(), "crash_recovery_test");
     }
 }
@@ -525,10 +509,7 @@ fn test_wal_truncation_after_checkpoint() {
         let read_txn = cf.begin_read().unwrap();
         let table = read_txn.open_table(TEST_TABLE).unwrap();
         for i in 0..100 {
-            assert_eq!(
-                table.get(&i).unwrap().unwrap().value(),
-                "truncation_test"
-            );
+            assert_eq!(table.get(&i).unwrap().unwrap().value(), "truncation_test");
         }
     }
 }

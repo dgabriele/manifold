@@ -1,5 +1,3 @@
-use rand::RngExt;
-use rand::prelude::SliceRandom;
 use manifold::backends::FileBackend;
 use manifold::{
     AccessGuard, Builder, CompactionError, Database, Durability, Key, MultimapRange,
@@ -8,6 +6,8 @@ use manifold::{
     TransactionError, Value, WriteTransaction,
 };
 use manifold::{DatabaseError, ReadableMultimapTable, SavepointError, StorageError, TableError};
+use rand::RngExt;
+use rand::prelude::SliceRandom;
 use std::borrow::Borrow;
 use std::fs;
 use std::io::{ErrorKind, Write};

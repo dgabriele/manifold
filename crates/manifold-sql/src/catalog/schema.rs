@@ -27,9 +27,7 @@ impl TableSchema {
     /// Returns a reference to the column with the given name (case-insensitive).
     pub fn column_by_name(&self, name: &str) -> Option<&ColumnDef> {
         let lower = name.to_lowercase();
-        self.columns
-            .iter()
-            .find(|c| c.name.to_lowercase() == lower)
+        self.columns.iter().find(|c| c.name.to_lowercase() == lower)
     }
 
     /// Returns the SQL types of all columns in order.

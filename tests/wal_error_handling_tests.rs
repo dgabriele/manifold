@@ -36,16 +36,17 @@ fn test_partial_wal_entry_recovery() {
 
     // Reopen - even with potentially truncated WAL, should not panic
     // The critical requirement: no panic during recovery
-    let db_result = ColumnFamilyDatabase::builder()
-        .pool_size(64)
-        .open(&db_path);
+    let db_result = ColumnFamilyDatabase::builder().pool_size(64).open(&db_path);
 
     // Should either succeed or fail with clear error
-    assert!(db_result.is_ok() || {
-        let e = db_result.as_ref().err().unwrap();
-        let msg = format!("{}", e);
-        !msg.is_empty()
-    }, "Should handle WAL state gracefully");
+    assert!(
+        db_result.is_ok() || {
+            let e = db_result.as_ref().err().unwrap();
+            let msg = format!("{}", e);
+            !msg.is_empty()
+        },
+        "Should handle WAL state gracefully"
+    );
 }
 
 /// Test WAL with corrupted entry CRC

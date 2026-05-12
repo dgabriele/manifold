@@ -158,10 +158,7 @@ pub fn decode_column(types: &[SqlType], data: &[u8], col_index: usize) -> Result
             .count();
 
         // Fixed region total size.
-        let fixed_total: usize = types
-            .iter()
-            .filter_map(|t| t.fixed_width())
-            .sum();
+        let fixed_total: usize = types.iter().filter_map(|t| t.fixed_width()).sum();
 
         let var_col_count = types.iter().filter(|t| t.is_variable_width()).count();
 
@@ -356,25 +353,21 @@ fn decode_fixed_value(ty: &SqlType, data: &[u8]) -> Result<Value> {
         SqlType::Date => {
             let days = i32::from_le_bytes(data[..4].try_into().unwrap());
             let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let date = epoch
-                + chrono::Duration::days(days as i64);
+            let date = epoch + chrono::Duration::days(days as i64);
             Ok(Value::Date(date))
         }
         SqlType::Timestamp => {
             let micros = i64::from_le_bytes(data[..8].try_into().unwrap());
-            let ts = DateTime::<Utc>::UNIX_EPOCH.naive_utc()
-                + chrono::Duration::microseconds(micros);
+            let ts =
+                DateTime::<Utc>::UNIX_EPOCH.naive_utc() + chrono::Duration::microseconds(micros);
             Ok(Value::Timestamp(ts))
         }
         SqlType::TimestampTz => {
             let micros = i64::from_le_bytes(data[..8].try_into().unwrap());
-            let ts = DateTime::<Utc>::UNIX_EPOCH
-                + chrono::Duration::microseconds(micros);
+            let ts = DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::microseconds(micros);
             Ok(Value::TimestampTz(ts))
         }
-        _ => Err(SqlError::Internal(format!(
-            "type {ty} is not fixed-width"
-        ))),
+        _ => Err(SqlError::Internal(format!("type {ty} is not fixed-width"))),
     }
 }
 
@@ -497,8 +490,7 @@ mod tests {
             .and_hms_opt(12, 30, 45)
             .unwrap();
         let test_tstz = Utc.with_ymd_and_hms(2025, 6, 15, 12, 30, 45).unwrap();
-        let test_json: serde_json::Value =
-            serde_json::json!({"key": "value", "num": 42});
+        let test_json: serde_json::Value = serde_json::json!({"key": "value", "num": 42});
         let test_decimal = Decimal::new(12345, 2); // 123.45
 
         let values = vec![

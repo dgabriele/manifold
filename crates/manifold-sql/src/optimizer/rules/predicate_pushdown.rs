@@ -446,10 +446,7 @@ fn remap_columns(expr: ScalarExpr, offset: usize) -> ScalarExpr {
             negated,
         } => ScalarExpr::InList {
             expr: Box::new(remap_columns(*expr, offset)),
-            list: list
-                .into_iter()
-                .map(|e| remap_columns(e, offset))
-                .collect(),
+            list: list.into_iter().map(|e| remap_columns(e, offset)).collect(),
             negated,
         },
         ScalarExpr::Between {
@@ -474,10 +471,7 @@ fn remap_columns(expr: ScalarExpr, offset: usize) -> ScalarExpr {
         },
         ScalarExpr::Function { name, args } => ScalarExpr::Function {
             name,
-            args: args
-                .into_iter()
-                .map(|e| remap_columns(e, offset))
-                .collect(),
+            args: args.into_iter().map(|e| remap_columns(e, offset)).collect(),
         },
         ScalarExpr::Cast { expr, target_type } => ScalarExpr::Cast {
             expr: Box::new(remap_columns(*expr, offset)),

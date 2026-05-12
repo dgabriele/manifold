@@ -617,7 +617,13 @@ fn test_mixed_read_write_contention() {
     let read_txn = cf.begin_read().unwrap();
     let table = read_txn.open_table(TEST_TABLE).unwrap();
     // Verify initial data exists
-    assert!(table.get(&0).unwrap().is_some(), "Initial data should exist");
+    assert!(
+        table.get(&0).unwrap().is_some(),
+        "Initial data should exist"
+    );
     // Verify some written data exists
-    assert!(table.get(&1000).unwrap().is_some(), "Written data should exist");
+    assert!(
+        table.get(&1000).unwrap().is_some(),
+        "Written data should exist"
+    );
 }

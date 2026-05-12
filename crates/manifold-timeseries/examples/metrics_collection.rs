@@ -63,8 +63,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Print progress every 10 seconds
             if (i + 1) % 10 == 0 {
-                println!("  [{}/60] CPU: {:.1}%, Memory: {:.1}% used, {:.1}% available",
-                    i + 1, cpu_usage, memory_usage, mem_available_pct);
+                println!(
+                    "  [{}/60] CPU: {:.1}%, Memory: {:.1}% used, {:.1}% available",
+                    i + 1,
+                    cpu_usage,
+                    memory_usage,
+                    mem_available_pct
+                );
             }
 
             // Sleep for remaining time to hit 1 second interval
@@ -133,7 +138,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut detail_points = Vec::new();
         for result in ts_read.range("system.cpu.usage", detail_start, detail_end)? {
             let (timestamp, cpu) = result?;
-            let mem = ts_read.get("system.memory.usage_pct", timestamp)?.unwrap_or(0.0);
+            let mem = ts_read
+                .get("system.memory.usage_pct", timestamp)?
+                .unwrap_or(0.0);
             detail_points.push((timestamp, cpu, mem));
         }
 

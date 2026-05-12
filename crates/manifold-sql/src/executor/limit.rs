@@ -11,11 +11,7 @@ pub struct Limit {
 }
 
 impl Limit {
-    pub fn new(
-        input: Box<dyn super::Executor>,
-        count: Option<usize>,
-        offset: usize,
-    ) -> Self {
+    pub fn new(input: Box<dyn super::Executor>, count: Option<usize>, offset: usize) -> Self {
         Self {
             input,
             count,

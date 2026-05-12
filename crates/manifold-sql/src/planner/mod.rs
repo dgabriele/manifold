@@ -3,13 +3,11 @@ pub mod plan;
 
 use std::collections::HashMap;
 
-use plan::{
-    AggregateExpr, LogicalPlan, OrderByExpr, PlanColumn, PlanSchema, ScalarExpr,
-};
+use plan::{AggregateExpr, LogicalPlan, OrderByExpr, PlanColumn, PlanSchema, ScalarExpr};
 
 use crate::binder::{BoundExpr, BoundSelect, BoundStatement, InsertSource};
-use crate::catalog::schema::TableId;
 use crate::catalog::Catalog;
+use crate::catalog::schema::TableId;
 use crate::error::{Result, SqlError};
 use crate::types::SqlType;
 
@@ -209,7 +207,10 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
     }
 
     // 4. Check if we need aggregation (GROUP BY or aggregate functions in projection/having)
-    let has_aggregates = select.projection.iter().any(|item| has_aggregate(&item.expr))
+    let has_aggregates = select
+        .projection
+        .iter()
+        .any(|item| has_aggregate(&item.expr))
         || select.having.as_ref().is_some_and(has_aggregate)
         || !select.group_by.is_empty();
 
@@ -262,12 +263,8 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
 
         // 5. HAVING filter (post-aggregation)
         if let Some(having_expr) = &select.having {
-            let predicate = lower_post_agg_expr(
-                having_expr,
-                &select.group_by,
-                &aggregates,
-                &offsets,
-            )?;
+            let predicate =
+                lower_post_agg_expr(having_expr, &select.group_by, &aggregates, &offsets)?;
             current = LogicalPlan::Filter {
                 predicate,
                 input: Box::new(current),
@@ -275,12 +272,8 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
         }
 
         // 6. Project (post-aggregation)
-        let (expressions, aliases, proj_schema) = build_post_agg_projection(
-            &select.projection,
-            &select.group_by,
-            &aggregates,
-            &offsets,
-        )?;
+        let (expressions, aliases, proj_schema) =
+            build_post_agg_projection(&select.projection, &select.group_by, &aggregates, &offsets)?;
 
         current = LogicalPlan::Project {
             expressions,
@@ -339,11 +332,7 @@ fn plan_select(catalog: &Catalog, select: &BoundSelect) -> Result<LogicalPlan> {
             .order_by
             .iter()
             .map(|ob| {
-                let expr = lower_order_by_expr(
-                    &ob.expr,
-                    &select.projection,
-                    &offsets,
-                )?;
+                let expr = lower_order_by_expr(&ob.expr, &select.projection, &offsets)?;
                 Ok(OrderByExpr {
                     expr,
                     asc: ob.asc,
@@ -572,10 +561,7 @@ fn lower_expr_inner(
             list,
             negated,
         } => {
-            let lowered_list = list
-                .iter()
-                .map(&recurse)
-                .collect::<Result<Vec<_>>>()?;
+            let lowered_list = list.iter().map(&recurse).collect::<Result<Vec<_>>>()?;
             Ok(ScalarExpr::InList {
                 expr: Box::new(recurse(expr)?),
                 list: lowered_list,
@@ -603,10 +589,7 @@ fn lower_expr_inner(
             negated: *negated,
         }),
         BoundExpr::Function { name, args, .. } => {
-            let lowered_args = args
-                .iter()
-                .map(&recurse)
-                .collect::<Result<Vec<_>>>()?;
+            let lowered_args = args.iter().map(&recurse).collect::<Result<Vec<_>>>()?;
             Ok(ScalarExpr::Function {
                 name: name.clone(),
                 args: lowered_args,
@@ -706,14 +689,10 @@ fn lower_post_agg_expr(
             // Find this aggregate's position in the collected aggregates list
             let n_group = group_by.len();
             for (i, agg) in aggregates.iter().enumerate() {
-                if std::ptr::eq(
-                    expr as *const BoundExpr,
-                    agg as *const BoundExpr,
-                ) || aggregates_match(expr, agg)
+                if std::ptr::eq(expr as *const BoundExpr, agg as *const BoundExpr)
+                    || aggregates_match(expr, agg)
                 {
-                    return Ok(ScalarExpr::ColumnRef {
-                        index: n_group + i,
-                    });
+                    return Ok(ScalarExpr::ColumnRef { index: n_group + i });
                 }
             }
             // Not found in collected aggregates — shouldn't happen
@@ -792,11 +771,11 @@ fn lower_post_agg_expr(
         BoundExpr::Wildcard => Err(SqlError::Plan(
             "unexpected wildcard in post-aggregation expression".to_string(),
         )),
-        BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } | BoundExpr::ScalarSubquery { .. } => {
-            Err(SqlError::Plan(
-                "subquery expressions not yet supported in post-aggregation context".to_string(),
-            ))
-        }
+        BoundExpr::InSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::ScalarSubquery { .. } => Err(SqlError::Plan(
+            "subquery expressions not yet supported in post-aggregation context".to_string(),
+        )),
     }
 }
 
@@ -968,9 +947,7 @@ fn lower_aggregate(expr: &BoundExpr, offsets: &ColumnOffsets) -> Result<Aggregat
                 result_type: result_type.clone(),
             })
         }
-        _ => Err(SqlError::Plan(
-            "expected aggregate expression".to_string(),
-        )),
+        _ => Err(SqlError::Plan("expected aggregate expression".to_string())),
     }
 }
 

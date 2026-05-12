@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use manifold_sql::{Database, Value};
 use rand::Rng;
 
@@ -336,11 +336,8 @@ fn bench_delete_by_pk(c: &mut Criterion) {
         b.iter(|| {
             let id = rng.random_range(1..=10_000_i64);
             // Delete (may be a no-op if already deleted, but that's fine)
-            db.execute(
-                "DELETE FROM t WHERE id = $1",
-                &[Value::Integer(id)],
-            )
-            .unwrap();
+            db.execute("DELETE FROM t WHERE id = $1", &[Value::Integer(id)])
+                .unwrap();
             // Re-insert to maintain table size
             let _ = db.execute(
                 "INSERT INTO t (id, name, value, category) VALUES ($1, $2, $3, $4)",

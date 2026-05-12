@@ -152,8 +152,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             relationships.push((rdj.id(), "acted_in", oppenheimer.id(), true, 0.95, now));
             relationships.push((matt.id(), "acted_in", oppenheimer.id(), true, 0.7, now));
             relationships.push((florence.id(), "acted_in", oppenheimer.id(), true, 0.8, now));
-            relationships.push((oppenheimer.id(), "produced_by", universal.id(), true, 1.0, now));
-            relationships.push((oppenheimer.id(), "produced_by", syncopy.id(), true, 1.0, now));
+            relationships.push((
+                oppenheimer.id(),
+                "produced_by",
+                universal.id(),
+                true,
+                1.0,
+                now,
+            ));
+            relationships.push((
+                oppenheimer.id(),
+                "produced_by",
+                syncopy.id(),
+                true,
+                1.0,
+                now,
+            ));
             relationships.push((oppenheimer.id(), "genre_of", drama.id(), true, 1.0, now));
             relationships.push((oppenheimer.id(), "genre_of", history.id(), true, 1.0, now));
             relationships.push((oppenheimer.id(), "genre_of", thriller.id(), true, 0.8, now));
@@ -169,8 +183,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Interstellar relationships
             relationships.push((nolan.id(), "directed", interstellar.id(), true, 1.0, now));
             relationships.push((matt.id(), "acted_in", interstellar.id(), true, 1.0, now));
-            relationships.push((interstellar.id(), "produced_by", warner.id(), true, 1.0, now));
-            relationships.push((interstellar.id(), "produced_by", syncopy.id(), true, 1.0, now));
+            relationships.push((
+                interstellar.id(),
+                "produced_by",
+                warner.id(),
+                true,
+                1.0,
+                now,
+            ));
+            relationships.push((
+                interstellar.id(),
+                "produced_by",
+                syncopy.id(),
+                true,
+                1.0,
+                now,
+            ));
             relationships.push((interstellar.id(), "genre_of", scifi.id(), true, 1.0, now));
             relationships.push((interstellar.id(), "genre_of", drama.id(), true, 0.8, now));
 

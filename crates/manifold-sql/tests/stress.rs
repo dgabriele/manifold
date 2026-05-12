@@ -19,10 +19,7 @@ fn large_table_insert_and_scan() {
         for i in batch_start..batch_start + 500 {
             db.execute(
                 "INSERT INTO big (id, val) VALUES ($1, $2)",
-                &[
-                    Value::Integer(i),
-                    Value::Text(format!("row_{i}")),
-                ],
+                &[Value::Integer(i), Value::Text(format!("row_{i}"))],
             )
             .unwrap();
         }
@@ -116,11 +113,8 @@ fn transaction_heavy() {
 
     for i in 0..100 {
         db.execute("BEGIN", &[]).unwrap();
-        db.execute(
-            "INSERT INTO t (id) VALUES ($1)",
-            &[Value::Integer(i)],
-        )
-        .unwrap();
+        db.execute("INSERT INTO t (id) VALUES ($1)", &[Value::Integer(i)])
+            .unwrap();
         db.execute("COMMIT", &[]).unwrap();
     }
 
@@ -155,9 +149,7 @@ fn crash_recovery() {
         let result = db.query("SELECT COUNT(*) FROM t", &[]).unwrap();
         assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 2);
 
-        let result = db
-            .query("SELECT val FROM t WHERE id = 1", &[])
-            .unwrap();
+        let result = db.query("SELECT val FROM t WHERE id = 1", &[]).unwrap();
         assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "survived");
     }
 }

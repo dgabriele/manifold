@@ -61,7 +61,10 @@ fn create_table_with_primary_key() {
         .unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("unique") || msg.contains("primary") || msg.contains("duplicate") || msg.contains("constraint"),
+        msg.contains("unique")
+            || msg.contains("primary")
+            || msg.contains("duplicate")
+            || msg.contains("constraint"),
         "expected PK violation error, got: {err}"
     );
 }
@@ -129,7 +132,10 @@ fn create_table_with_composite_primary_key() {
         .unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("unique") || msg.contains("primary") || msg.contains("duplicate") || msg.contains("constraint"),
+        msg.contains("unique")
+            || msg.contains("primary")
+            || msg.contains("duplicate")
+            || msg.contains("constraint"),
         "expected composite PK violation, got: {err}"
     );
 }
@@ -249,7 +255,9 @@ fn create_nonunique_index() {
         .unwrap();
     db.execute("INSERT INTO t (id, name) VALUES (2, 'a')", &[])
         .unwrap(); // duplicates OK
-    let result = db.query("SELECT COUNT(*) FROM t WHERE name = 'a'", &[]).unwrap();
+    let result = db
+        .query("SELECT COUNT(*) FROM t WHERE name = 'a'", &[])
+        .unwrap();
     assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 2);
 }
 
@@ -280,7 +288,9 @@ fn create_composite_index() {
     db.execute("CREATE INDEX idx_ab ON t (a, b)", &[]).unwrap();
     db.execute("INSERT INTO t (a, b, c) VALUES (1, 2, 'x')", &[])
         .unwrap();
-    let result = db.query("SELECT c FROM t WHERE a = 1 AND b = 2", &[]).unwrap();
+    let result = db
+        .query("SELECT c FROM t WHERE a = 1 AND b = 2", &[])
+        .unwrap();
     assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "x");
 }
 

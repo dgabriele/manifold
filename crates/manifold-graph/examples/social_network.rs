@@ -49,10 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eve = User::new("eve");
 
     let users = vec![&alice, &bob, &charlie, &diana, &eve];
-    let user_map: HashMap<Uuid, &str> = users
-        .iter()
-        .map(|u| (u.id, u.username.as_str()))
-        .collect();
+    let user_map: HashMap<Uuid, &str> = users.iter().map(|u| (u.id, u.username.as_str())).collect();
 
     println!("Created {} users:", users.len());
     for user in &users {
@@ -108,10 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for edge in &following {
         let username = user_map.get(&edge.target).unwrap_or(&"unknown");
-        println!(
-            "  → {} (weight: {:.1})",
-            username, edge.weight
-        );
+        println!("  → {} (weight: {:.1})", username, edge.weight);
     }
     println!("  Total: {} users\n", following.len());
 
@@ -126,20 +120,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for edge in &followers {
         let username = user_map.get(&edge.source).unwrap_or(&"unknown");
-        println!(
-            "  ← {} (weight: {:.1})",
-            username, edge.weight
-        );
+        println!("  ← {} (weight: {:.1})", username, edge.weight);
     }
     println!("  Total: {} followers\n", followers.len());
 
     // 3. Mutual follows (Alice follows them AND they follow Alice)
     println!("─────────────────────────────────────────");
     println!("Alice's mutual connections:");
-    let alice_following: HashMap<Uuid, f32> = following
-        .iter()
-        .map(|e| (e.target, e.weight))
-        .collect();
+    let alice_following: HashMap<Uuid, f32> =
+        following.iter().map(|e| (e.target, e.weight)).collect();
 
     for edge in &followers {
         if alice_following.contains_key(&edge.source) {
@@ -172,9 +161,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (user_id, count) in follower_counts.iter().take(3) {
         let username = user_map.get(user_id).unwrap_or(&"unknown");
-        println!("  {}. {} - {} followers", 
-            follower_counts.iter().position(|(id, _)| id == user_id).unwrap() + 1,
-            username, 
+        println!(
+            "  {}. {} - {} followers",
+            follower_counts
+                .iter()
+                .position(|(id, _)| id == user_id)
+                .unwrap()
+                + 1,
+            username,
             count
         );
     }
@@ -213,14 +207,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("─────────────────────────────────────────");
     println!("Demonstrating edge update:");
     println!("  Alice unfollows Charlie...");
-    
+
     {
         let write_txn = cf.begin_write()?;
         let mut graph_write = GraphTable::open(&write_txn, "connections")?;
-        
+
         // Set is_active to false to indicate unfollowed
         graph_write.update_edge(&alice.id, "follows", &charlie.id, false, 0.0)?;
-        
+
         drop(graph_write);
         write_txn.commit()?;
     }
@@ -228,14 +222,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Re-query to show the update
     let read_txn2 = cf.begin_read()?;
     let graph2 = GraphTableRead::open(&read_txn2, "connections")?;
-    
+
     let alice_following_updated: Vec<Edge> = graph2
         .outgoing_edges(&alice.id)?
         .filter_map(|r| r.ok())
         .filter(|e| e.edge_type == "follows" && e.is_active)
         .collect();
 
-    println!("  Alice now follows {} users", alice_following_updated.len());
+    println!(
+        "  Alice now follows {} users",
+        alice_following_updated.len()
+    );
     for edge in &alice_following_updated {
         let username = user_map.get(&edge.target).unwrap_or(&"unknown");
         println!("    → {}", username);
@@ -245,12 +242,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Statistics
     println!("─────────────────────────────────────────");
     println!("Graph Statistics:");
-    
+
     let total_edges = graph2.len()?;
     println!("  Total edges: {}", total_edges);
-    
+
     println!("  Edge types used: follows, blocks, mutes");
-    println!("  Average edges per user: {:.1}", total_edges as f64 / users.len() as f64);
+    println!(
+        "  Average edges per user: {:.1}",
+        total_edges as f64 / users.len() as f64
+    );
     println!();
 
     println!("─────────────────────────────────────────");

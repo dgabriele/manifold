@@ -1,6 +1,6 @@
 //! Graph table implementation with bidirectional edge storage.
 
-use crate::edge::{current_timestamp_nanos, Edge};
+use crate::edge::{Edge, current_timestamp_nanos};
 use manifold::{
     ReadOnlyTable, ReadTransaction, ReadableTable, ReadableTableMetadata, StorageError, Table,
     TableDefinition, TableError, WriteTransaction,
@@ -143,7 +143,14 @@ impl<'txn> GraphTable<'txn> {
         };
 
         // Use add_edge with preserved created_at
-        self.add_edge(source, edge_type, target, is_active, weight, Some(created_at))
+        self.add_edge(
+            source,
+            edge_type,
+            target,
+            is_active,
+            weight,
+            Some(created_at),
+        )
     }
 
     /// Adds multiple edges to the graph in a single batch operation.
@@ -204,23 +211,27 @@ impl<'txn> GraphTable<'txn> {
         // Prepare forward table items: (source, edge_type, target) -> (is_active, weight, created_at, deleted_at)
         let forward_items: Vec<((Uuid, &str, Uuid), (bool, f32, u64, u64))> = edges
             .iter()
-            .map(|(source, edge_type, target, is_active, weight, created_at)| {
-                (
-                    (*source, *edge_type, *target),
-                    (*is_active, *weight, *created_at, 0),
-                )
-            })
+            .map(
+                |(source, edge_type, target, is_active, weight, created_at)| {
+                    (
+                        (*source, *edge_type, *target),
+                        (*is_active, *weight, *created_at, 0),
+                    )
+                },
+            )
             .collect();
 
         // Prepare reverse table items: (target, edge_type, source) -> (is_active, weight, created_at, deleted_at)
         let reverse_items: Vec<((Uuid, &str, Uuid), (bool, f32, u64, u64))> = edges
             .iter()
-            .map(|(source, edge_type, target, is_active, weight, created_at)| {
-                (
-                    (*target, *edge_type, *source),
-                    (*is_active, *weight, *created_at, 0),
-                )
-            })
+            .map(
+                |(source, edge_type, target, is_active, weight, created_at)| {
+                    (
+                        (*target, *edge_type, *source),
+                        (*is_active, *weight, *created_at, 0),
+                    )
+                },
+            )
             .collect();
 
         // Note: reverse items are NOT sorted even if forward items are,
@@ -291,13 +302,7 @@ impl GraphTableRead {
                 // Only return if not deleted
                 if deleted_at == 0 {
                     Some(Edge::with_timestamps(
-                        *source,
-                        edge_type,
-                        *target,
-                        is_active,
-                        weight,
-                        created_at,
-                        deleted_at,
+                        *source, edge_type, *target, is_active, weight, created_at, deleted_at,
                     ))
                 } else {
                     None
@@ -322,13 +327,7 @@ impl GraphTableRead {
             .and_then(|guard| {
                 let (is_active, weight, created_at, deleted_at) = guard.value();
                 let edge = Edge::with_timestamps(
-                    *source,
-                    edge_type,
-                    *target,
-                    is_active,
-                    weight,
-                    created_at,
-                    deleted_at,
+                    *source, edge_type, *target, is_active, weight, created_at, deleted_at,
                 );
 
                 if edge.is_active_at(timestamp) {
@@ -450,13 +449,7 @@ impl Iterator for OutgoingEdgeIter<'_> {
                     }
 
                     return Some(Ok(Edge::with_timestamps(
-                        source,
-                        edge_type,
-                        target,
-                        is_active,
-                        weight,
-                        created_at,
-                        deleted_at,
+                        source, edge_type, target, is_active, weight, created_at, deleted_at,
                     )));
                 }
                 Err(e) => return Some(Err(e)),
@@ -491,13 +484,7 @@ impl Iterator for AllEdgesIter<'_> {
                     }
 
                     return Some(Ok(Edge::with_timestamps(
-                        source,
-                        edge_type,
-                        target,
-                        is_active,
-                        weight,
-                        created_at,
-                        deleted_at,
+                        source, edge_type, target, is_active, weight, created_at, deleted_at,
                     )));
                 }
                 Err(e) => return Some(Err(e)),
@@ -533,13 +520,7 @@ impl Iterator for IncomingEdgeIter<'_> {
 
                     // Note: In reverse table, first UUID is target, third is source
                     return Some(Ok(Edge::with_timestamps(
-                        source,
-                        edge_type,
-                        target,
-                        is_active,
-                        weight,
-                        created_at,
-                        deleted_at,
+                        source, edge_type, target, is_active, weight, created_at, deleted_at,
                     )));
                 }
                 Err(e) => return Some(Err(e)),

@@ -78,11 +78,8 @@ fn where_not_in_subquery() {
 #[test]
 fn in_subquery_empty_result() {
     let (db, _dir) = test_db();
-    db.execute(
-        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)",
-        &[],
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)", &[])
+        .unwrap();
     db.execute(
         "CREATE TABLE t2 (id INTEGER PRIMARY KEY, ref_id INTEGER)",
         &[],
@@ -197,11 +194,8 @@ fn where_exists_empty_subquery() {
 #[test]
 fn derived_table_basic() {
     let (db, _dir) = test_db();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
-        &[],
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", &[])
+        .unwrap();
     db.execute("INSERT INTO t (id, val) VALUES (1, 10)", &[])
         .unwrap();
     db.execute("INSERT INTO t (id, val) VALUES (2, 20)", &[])
@@ -223,11 +217,8 @@ fn derived_table_basic() {
 #[test]
 fn derived_table_with_filter() {
     let (db, _dir) = test_db();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
-        &[],
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", &[])
+        .unwrap();
     db.execute("INSERT INTO t (id, val) VALUES (1, 10)", &[])
         .unwrap();
     db.execute("INSERT INTO t (id, val) VALUES (2, 20)", &[])
@@ -249,19 +240,13 @@ fn derived_table_with_filter() {
 #[test]
 fn derived_table_with_alias_columns() {
     let (db, _dir) = test_db();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
-        &[],
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", &[])
+        .unwrap();
     db.execute("INSERT INTO t (id, val) VALUES (1, 42)", &[])
         .unwrap();
 
     let result = db
-        .query(
-            "SELECT s.v FROM (SELECT val AS v FROM t) AS s",
-            &[],
-        )
+        .query("SELECT s.v FROM (SELECT val AS v FROM t) AS s", &[])
         .unwrap();
     assert_eq!(result.row_count(), 1);
     assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 42);
@@ -313,11 +298,8 @@ fn where_exists_correlated() {
 #[ignore = "scalar subquery in SELECT not yet supported"]
 fn scalar_subquery_in_select() {
     let (db, _dir) = test_db();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
-        &[],
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", &[])
+        .unwrap();
     db.execute("INSERT INTO t (id, val) VALUES (1, 10)", &[])
         .unwrap();
     db.execute("INSERT INTO t (id, val) VALUES (2, 20)", &[])

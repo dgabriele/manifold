@@ -50,10 +50,7 @@ pub struct UnionDistinct {
 }
 
 impl UnionDistinct {
-    pub fn new(
-        mut left: Box<dyn Executor>,
-        mut right: Box<dyn Executor>,
-    ) -> Result<Self> {
+    pub fn new(mut left: Box<dyn Executor>, mut right: Box<dyn Executor>) -> Result<Self> {
         let mut all: Vec<Vec<Value>> = Vec::new();
 
         while let Some(row) = left.next()? {
@@ -73,7 +70,10 @@ impl UnionDistinct {
             }
         }
 
-        Ok(Self { rows: deduped, pos: 0 })
+        Ok(Self {
+            rows: deduped,
+            pos: 0,
+        })
     }
 }
 

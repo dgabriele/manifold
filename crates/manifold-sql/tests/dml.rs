@@ -10,8 +10,11 @@ use manifold_sql::Value;
 #[test]
 fn insert_single_row_all_values() {
     let (db, _dir) = test_db();
-    db.execute("CREATE TABLE t (id INTEGER, name TEXT, active BOOLEAN)", &[])
-        .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER, name TEXT, active BOOLEAN)",
+        &[],
+    )
+    .unwrap();
     db.execute(
         "INSERT INTO t (id, name, active) VALUES (1, 'alice', TRUE)",
         &[],

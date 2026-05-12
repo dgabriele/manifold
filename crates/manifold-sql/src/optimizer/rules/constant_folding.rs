@@ -308,9 +308,7 @@ fn eval_binary(op: &BinaryOp, left: &Value, right: &Value) -> Option<Value> {
         (BinaryOp::Add, Value::Real(a), Value::Real(b)) => Some(Value::Real(a + b)),
         (BinaryOp::Sub, Value::Real(a), Value::Real(b)) => Some(Value::Real(a - b)),
         (BinaryOp::Mul, Value::Real(a), Value::Real(b)) => Some(Value::Real(a * b)),
-        (BinaryOp::Div, Value::Real(a), Value::Real(b)) if *b != 0.0 => {
-            Some(Value::Real(a / b))
-        }
+        (BinaryOp::Div, Value::Real(a), Value::Real(b)) if *b != 0.0 => Some(Value::Real(a / b)),
 
         // Integer comparisons
         (BinaryOp::Eq, Value::Integer(a), Value::Integer(b)) => Some(Value::Boolean(a == b)),
@@ -329,9 +327,7 @@ fn eval_binary(op: &BinaryOp, left: &Value, right: &Value) -> Option<Value> {
         (BinaryOp::Or, Value::Boolean(a), Value::Boolean(b)) => Some(Value::Boolean(*a || *b)),
 
         // String concatenation
-        (BinaryOp::Add, Value::Text(a), Value::Text(b)) => {
-            Some(Value::Text(format!("{}{}", a, b)))
-        }
+        (BinaryOp::Add, Value::Text(a), Value::Text(b)) => Some(Value::Text(format!("{}{}", a, b))),
 
         _ => None,
     }

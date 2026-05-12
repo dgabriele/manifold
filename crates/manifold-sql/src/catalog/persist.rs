@@ -1,7 +1,7 @@
 use manifold::{ReadableTable, TableError};
 
-use crate::catalog::schema::{ConstraintDef, IndexDef, IndexId, TableId, TableSchema};
 use crate::catalog::Catalog;
+use crate::catalog::schema::{ConstraintDef, IndexDef, IndexId, TableId, TableSchema};
 use crate::error::{Result, SqlError};
 use crate::storage::catalog_tables::*;
 
@@ -77,9 +77,8 @@ pub fn load_catalog(txn: &manifold::ReadTransaction) -> Result<Catalog> {
             let index_id = key_guard.value();
             let json_bytes = value_guard.value();
 
-            let index: IndexDef = serde_json::from_slice(json_bytes).map_err(|e| {
-                SqlError::Internal(format!("failed to deserialize index def: {e}"))
-            })?;
+            let index: IndexDef = serde_json::from_slice(json_bytes)
+                .map_err(|e| SqlError::Internal(format!("failed to deserialize index def: {e}")))?;
 
             if index_id > max_index_id {
                 max_index_id = index_id;
@@ -146,7 +145,11 @@ pub fn save_table(txn: &manifold::WriteTransaction, schema: &TableSchema) -> Res
 
 /// Persist only the sequence counter (next_rowid) for a table.
 /// Use this for DML operations (INSERT) that only change the rowid counter.
-pub fn save_sequence(txn: &manifold::WriteTransaction, table_id: TableId, next_rowid: u64) -> Result<()> {
+pub fn save_sequence(
+    txn: &manifold::WriteTransaction,
+    table_id: TableId,
+    next_rowid: u64,
+) -> Result<()> {
     let mut sequences = txn.open_table(SEQUENCES_TABLE)?;
     sequences.insert(table_id, next_rowid)?;
     Ok(())

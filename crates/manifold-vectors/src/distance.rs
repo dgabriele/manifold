@@ -18,11 +18,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
         norm_b += b[i] * b[i];
     }
     let mag = (norm_a * norm_b).sqrt();
-    if mag == 0.0 {
-        0.0
-    } else {
-        dot / mag
-    }
+    if mag == 0.0 { 0.0 } else { dot / mag }
 }
 
 /// Computes the Euclidean (L2) distance between two vectors

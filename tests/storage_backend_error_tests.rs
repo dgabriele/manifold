@@ -128,29 +128,30 @@ fn test_corrupted_storage_detection() {
 
     // If database opens, try to access the data
     if let Ok(db) = db_result
-        && let Ok(cf) = db.column_family("test_cf") {
-            let read_result = cf.begin_read();
+        && let Ok(cf) = db.column_family("test_cf")
+    {
+        let read_result = cf.begin_read();
 
-            // Some level of corruption detection should occur
-            // Either at read time or when opening tables
-            if let Ok(read_txn) = read_result {
-                let table_result = read_txn.open_table(TEST_TABLE);
+        // Some level of corruption detection should occur
+        // Either at read time or when opening tables
+        if let Ok(read_txn) = read_result {
+            let table_result = read_txn.open_table(TEST_TABLE);
 
-                // Access may fail or succeed depending on corruption location
-                if let Ok(table) = table_result {
-                    let value_result = table.get("important_key");
+            // Access may fail or succeed depending on corruption location
+            if let Ok(table) = table_result {
+                let value_result = table.get("important_key");
 
-                    // If we get an error, verify it has context
-                    if let Err(e) = value_result {
-                        let error_msg = format!("{}", e);
-                        assert!(
-                            !error_msg.is_empty(),
-                            "Corruption error should have clear message"
-                        );
-                    }
+                // If we get an error, verify it has context
+                if let Err(e) = value_result {
+                    let error_msg = format!("{}", e);
+                    assert!(
+                        !error_msg.is_empty(),
+                        "Corruption error should have clear message"
+                    );
                 }
             }
         }
+    }
     // Database may refuse to open, which is also acceptable
 }
 

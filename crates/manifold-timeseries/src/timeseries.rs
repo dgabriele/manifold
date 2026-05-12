@@ -210,7 +210,7 @@ impl<E: TimestampEncoding> TimeSeriesTableRead<E> {
                 return Err(StorageError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Cannot get aggregate for Raw granularity",
-                )))
+                )));
             }
             Granularity::Minute => &self.minute,
             Granularity::Hour => &self.hour,
@@ -235,7 +235,7 @@ impl<E: TimestampEncoding> TimeSeriesTableRead<E> {
                 return Err(StorageError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Cannot iterate aggregates for Raw granularity",
-                )))
+                )));
             }
             Granularity::Minute => &self.minute,
             Granularity::Hour => &self.hour,

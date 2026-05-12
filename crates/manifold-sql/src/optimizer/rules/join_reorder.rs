@@ -28,12 +28,14 @@ fn reorder_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
             // Only swap when both sides are leaf nodes (not multi-table joins)
             // so that we don't invalidate column references in parent plan
             // nodes (Project, etc.) that depend on the join output order.
-            let is_leaf = |p: &LogicalPlan| matches!(
-                p,
-                LogicalPlan::Scan { .. }
-                | LogicalPlan::IndexScan { .. }
-                | LogicalPlan::Values { .. }
-            );
+            let is_leaf = |p: &LogicalPlan| {
+                matches!(
+                    p,
+                    LogicalPlan::Scan { .. }
+                        | LogicalPlan::IndexScan { .. }
+                        | LogicalPlan::Values { .. }
+                )
+            };
             let both_leaves = is_leaf(&left) && is_leaf(&right);
             if both_leaves && matches!(join_type, JoinType::Inner | JoinType::Cross) {
                 let left_cost = estimate_rows(&left, catalog);
@@ -44,12 +46,8 @@ fn reorder_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
                     // We must also remap column references in the join condition
                     // because after swapping, what was the left side (columns
                     // 0..left_width) becomes the right side and vice versa.
-                    let left_width = left
-                        .schema()
-                        .map_or(0, |s| s.len());
-                    let right_width = right
-                        .schema()
-                        .map_or(0, |s| s.len());
+                    let left_width = left.schema().map_or(0, |s| s.len());
+                    let right_width = right.schema().map_or(0, |s| s.len());
                     let remapped_condition =
                         condition.map(|c| remap_join_columns(c, left_width, right_width));
                     let new_schema = PlanSchema::concat(
@@ -281,9 +279,7 @@ fn remap_join_columns(expr: ScalarExpr, left_width: usize, right_width: usize) -
 /// Estimate the number of rows produced by a plan node.
 fn estimate_rows(plan: &LogicalPlan, catalog: &Catalog) -> u64 {
     match plan {
-        LogicalPlan::Scan { table_name, .. } => {
-            statistics::estimate_row_count(table_name, catalog)
-        }
+        LogicalPlan::Scan { table_name, .. } => statistics::estimate_row_count(table_name, catalog),
         LogicalPlan::IndexScan { table_name, .. } => {
             // Index scan is typically more selective; estimate 10% of table
             statistics::estimate_row_count(table_name, catalog) / 10

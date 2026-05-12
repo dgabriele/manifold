@@ -1,13 +1,11 @@
 use sqlparser::ast::{self, ObjectType, SetExpr, SetOperator, TableFactor};
 
-use crate::catalog::schema::{
-    self as schema, ColumnDef, ConstraintDef, ForeignKeyAction,
-};
 use crate::catalog::Catalog;
+use crate::catalog::schema::{self as schema, ColumnDef, ConstraintDef, ForeignKeyAction};
 use crate::error::{Result, SqlError};
 use crate::types::Value;
 
-use super::expr::{bind_expr, bind_expr_with_catalog, sql_data_type_to_sql_type, Scope};
+use super::expr::{Scope, bind_expr, bind_expr_with_catalog, sql_data_type_to_sql_type};
 use super::{
     AlterTableOp, BoundAssignment, BoundExpr, BoundJoin, BoundOrderBy, BoundSelect,
     BoundSelectItem, BoundStatement, BoundTableRef, InsertSource, JoinType,
@@ -56,10 +54,7 @@ pub fn bind_statement(
             Ok(BoundStatement::Explain(Box::new(inner)))
         }
 
-        ast::Statement::Analyze {
-            table_name,
-            ..
-        } => {
+        ast::Statement::Analyze { table_name, .. } => {
             let name = table_name.to_string();
             let table_name = if name.is_empty() { None } else { Some(name) };
             Ok(BoundStatement::Analyze { table_name })
@@ -98,42 +93,52 @@ pub fn bind_statement(
 // SELECT / Query
 // ---------------------------------------------------------------------------
 
-fn bind_query(
-    catalog: &Catalog,
-    query: &ast::Query,
-    params: &[Value],
-) -> Result<BoundStatement> {
+fn bind_query(catalog: &Catalog, query: &ast::Query, params: &[Value]) -> Result<BoundStatement> {
     // Handle UNION / INTERSECT / EXCEPT at the top level before ORDER BY / LIMIT.
-    if let SetExpr::SetOperation { op, set_quantifier, left, right } = query.body.as_ref() {
+    if let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = query.body.as_ref()
+    {
         let all = matches!(set_quantifier, ast::SetQuantifier::All);
         match op {
             SetOperator::Union => {
-                let left_stmt = bind_query(catalog, &ast::Query {
-                    with: None,
-                    body: left.clone(),
-                    order_by: None,
-                    limit: None,
-                    limit_by: vec![],
-                    offset: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                }, params)?;
-                let right_stmt = bind_query(catalog, &ast::Query {
-                    with: None,
-                    body: right.clone(),
-                    order_by: None,
-                    limit: None,
-                    limit_by: vec![],
-                    offset: None,
-                    fetch: None,
-                    locks: vec![],
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                }, params)?;
+                let left_stmt = bind_query(
+                    catalog,
+                    &ast::Query {
+                        with: None,
+                        body: left.clone(),
+                        order_by: None,
+                        limit: None,
+                        limit_by: vec![],
+                        offset: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                        settings: None,
+                        format_clause: None,
+                    },
+                    params,
+                )?;
+                let right_stmt = bind_query(
+                    catalog,
+                    &ast::Query {
+                        with: None,
+                        body: right.clone(),
+                        order_by: None,
+                        limit: None,
+                        limit_by: vec![],
+                        offset: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                        settings: None,
+                        format_clause: None,
+                    },
+                    params,
+                )?;
                 return Ok(BoundStatement::Union {
                     left: Box::new(left_stmt),
                     right: Box::new(right_stmt),
@@ -180,11 +185,7 @@ fn bind_query(
     Ok(BoundStatement::Select(Box::new(select)))
 }
 
-fn bind_query_body(
-    catalog: &Catalog,
-    body: &SetExpr,
-    params: &[Value],
-) -> Result<BoundSelect> {
+fn bind_query_body(catalog: &Catalog, body: &SetExpr, params: &[Value]) -> Result<BoundSelect> {
     match body {
         SetExpr::Select(sel) => bind_select_body(catalog, sel, params),
         SetExpr::Query(q) => {
@@ -266,14 +267,11 @@ fn bind_select_body(
                 ast::JoinOperator::CrossJoin => (JoinType::Cross, None),
                 ast::JoinOperator::FullOuter(c) => (JoinType::Left, Some(c)), // approximate
                 other => {
-                    return Err(SqlError::Bind(format!(
-                        "unsupported join type: {other:?}"
-                    )));
+                    return Err(SqlError::Bind(format!("unsupported join type: {other:?}")));
                 }
             };
 
-            let join_table =
-                bind_table_factor(catalog, &mut scope, &join.relation)?;
+            let join_table = bind_table_factor(catalog, &mut scope, &join.relation)?;
 
             let condition = match constraint {
                 Some(ast::JoinConstraint::On(expr)) => {
@@ -377,8 +375,7 @@ fn bind_table_factor(
         TableFactor::Table { name, alias, .. } => {
             let table_name = name.to_string();
             let alias_str = alias.as_ref().map(|a| a.name.value.clone());
-            let table_id =
-                scope.add_table(catalog, &table_name, alias_str.as_deref())?;
+            let table_id = scope.add_table(catalog, &table_name, alias_str.as_deref())?;
             Ok(BoundTableRef {
                 table_id,
                 table_name,
@@ -420,9 +417,7 @@ fn bind_table_factor(
                 subquery: Some(Box::new(bound_select)),
             })
         }
-        other => Err(SqlError::Bind(format!(
-            "unsupported table factor: {other}"
-        ))),
+        other => Err(SqlError::Bind(format!("unsupported table factor: {other}"))),
     }
 }
 
@@ -455,10 +450,7 @@ fn add_table_ref_to_scope(
 ) -> Result<()> {
     if let Some(subquery) = &table_ref.subquery {
         // Derived table: reconstruct the columns from the subquery's projection.
-        let alias = table_ref
-            .alias
-            .as_deref()
-            .unwrap_or("__derived");
+        let alias = table_ref.alias.as_deref().unwrap_or("__derived");
         let columns: Vec<(String, crate::types::SqlType, bool)> = subquery
             .projection
             .iter()
@@ -492,7 +484,7 @@ fn bind_insert(
         _ => {
             return Err(SqlError::Bind(
                 "unsupported INSERT table object".to_string(),
-            ))
+            ));
         }
     };
     let schema = catalog
@@ -509,10 +501,7 @@ fn bind_insert(
             .iter()
             .map(|ident| {
                 schema.column_index(&ident.value).ok_or_else(|| {
-                    SqlError::ColumnNotFound(format!(
-                        "{}.{}",
-                        table_name, ident.value
-                    ))
+                    SqlError::ColumnNotFound(format!("{}.{}", table_name, ident.value))
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -551,7 +540,7 @@ fn bind_insert(
         None => {
             return Err(SqlError::Bind(
                 "INSERT without VALUES or SELECT source".to_string(),
-            ))
+            ));
         }
     };
 
@@ -579,7 +568,7 @@ fn bind_update(
         other => {
             return Err(SqlError::Bind(format!(
                 "unsupported table in UPDATE: {other}"
-            )))
+            )));
         }
     };
 
@@ -597,14 +586,12 @@ fn bind_update(
             let col_name = match &a.target {
                 ast::AssignmentTarget::ColumnName(name) => name.to_string(),
                 ast::AssignmentTarget::Tuple(_) => {
-                    return Err(SqlError::Bind(
-                        "tuple assignment not supported".to_string(),
-                    ))
+                    return Err(SqlError::Bind("tuple assignment not supported".to_string()));
                 }
             };
-            let col_idx = schema.column_index(&col_name).ok_or_else(|| {
-                SqlError::ColumnNotFound(format!("{table_name}.{col_name}"))
-            })?;
+            let col_idx = schema
+                .column_index(&col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(format!("{table_name}.{col_name}")))?;
             let value = bind_expr(&scope, &a.value, params)?;
             Ok(BoundAssignment {
                 column_index: col_idx,
@@ -649,7 +636,7 @@ fn bind_delete(
         other => {
             return Err(SqlError::Bind(format!(
                 "unsupported table in DELETE: {other}"
-            )))
+            )));
         }
     };
 
@@ -714,10 +701,7 @@ fn bind_create_table(ct: &ast::CreateTable) -> Result<BoundStatement> {
                     } else {
                         constraints.push(ConstraintDef::Unique {
                             id: next_id(),
-                            name: format!(
-                                "uq_{name}_{}",
-                                col_def.name.value
-                            ),
+                            name: format!("uq_{name}_{}", col_def.name.value),
                             columns: vec![col_idx],
                         });
                     }
@@ -734,16 +718,10 @@ fn bind_create_table(ct: &ast::CreateTable) -> Result<BoundStatement> {
                 } => {
                     constraints.push(ConstraintDef::ForeignKey {
                         id: next_id(),
-                        name: format!(
-                            "fk_{name}_{}_{}",
-                            col_def.name.value, foreign_table
-                        ),
+                        name: format!("fk_{name}_{}_{}", col_def.name.value, foreign_table),
                         columns: vec![col_idx],
                         ref_table: foreign_table.to_string(),
-                        ref_columns: referred_columns
-                            .iter()
-                            .map(|c| c.value.clone())
-                            .collect(),
+                        ref_columns: referred_columns.iter().map(|c| c.value.clone()).collect(),
                         on_delete: on_delete
                             .as_ref()
                             .map(map_referential_action)
@@ -757,10 +735,7 @@ fn bind_create_table(ct: &ast::CreateTable) -> Result<BoundStatement> {
                 ast::ColumnOption::Check(expr) => {
                     constraints.push(ConstraintDef::Check {
                         id: next_id(),
-                        name: format!(
-                            "ck_{name}_{}",
-                            col_def.name.value
-                        ),
+                        name: format!("ck_{name}_{}", col_def.name.value),
                         expression: expr.to_string(),
                     });
                 }
@@ -841,7 +816,10 @@ fn bind_create_table(ct: &ast::CreateTable) -> Result<BoundStatement> {
                         .unwrap_or_default(),
                 });
             }
-            ast::TableConstraint::Check { name: tc_name, expr } => {
+            ast::TableConstraint::Check {
+                name: tc_name,
+                expr,
+            } => {
                 constraints.push(ConstraintDef::Check {
                     id: next_id(),
                     name: tc_name
@@ -865,10 +843,7 @@ fn bind_create_table(ct: &ast::CreateTable) -> Result<BoundStatement> {
     })
 }
 
-fn resolve_constraint_columns(
-    columns: &[ColumnDef],
-    idents: &[ast::Ident],
-) -> Result<Vec<usize>> {
+fn resolve_constraint_columns(columns: &[ColumnDef], idents: &[ast::Ident]) -> Result<Vec<usize>> {
     idents
         .iter()
         .map(|ident| {
@@ -908,9 +883,7 @@ fn bind_default_value(expr: &ast::Expr) -> schema::DefaultValue {
             ast::Value::SingleQuotedString(s) => {
                 schema::DefaultValue::Literal(Value::Text(s.clone()))
             }
-            ast::Value::Boolean(b) => {
-                schema::DefaultValue::Literal(Value::Boolean(*b))
-            }
+            ast::Value::Boolean(b) => schema::DefaultValue::Literal(Value::Boolean(*b)),
             ast::Value::Null => schema::DefaultValue::Null,
             _ => schema::DefaultValue::Literal(Value::Text(expr.to_string())),
         },
@@ -941,11 +914,7 @@ fn bind_create_index(ci: &ast::CreateIndex) -> Result<BoundStatement> {
 
     let table_name = ci.table_name.to_string();
 
-    let columns: Vec<String> = ci
-        .columns
-        .iter()
-        .map(|col| col.expr.to_string())
-        .collect();
+    let columns: Vec<String> = ci.columns.iter().map(|col| col.expr.to_string()).collect();
 
     Ok(BoundStatement::CreateIndex {
         index_name,
@@ -1025,9 +994,9 @@ fn bind_alter_table(
                 is_primary_key,
             })
         }
-        ast::AlterTableOperation::DropColumn {
-            column_name, ..
-        } => AlterTableOp::DropColumn(column_name.value.clone()),
+        ast::AlterTableOperation::DropColumn { column_name, .. } => {
+            AlterTableOp::DropColumn(column_name.value.clone())
+        }
         ast::AlterTableOperation::RenameColumn {
             old_column_name,
             new_column_name,

@@ -66,14 +66,13 @@
 )]
 
 pub mod aggregate;
-pub mod encoding;
-pub mod timeseries;
 pub mod downsampling;
-pub mod retention;
+pub mod encoding;
 pub mod integration;
+pub mod retention;
+pub mod timeseries;
 
 pub use aggregate::{Aggregate, Granularity};
 pub use encoding::{AbsoluteEncoding, DeltaEncoding, EncodingError, TimestampEncoding};
-pub use timeseries::{TimeSeriesTable, TimeSeriesTableRead};
 pub use integration::TimeSeriesSource;
-
+pub use timeseries::{TimeSeriesTable, TimeSeriesTableRead};

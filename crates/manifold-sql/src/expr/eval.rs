@@ -11,19 +11,21 @@ use crate::types::{SqlType, Value};
 /// Evaluate a scalar expression against a single row, with query parameters.
 pub fn evaluate(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Value> {
     match expr {
-        ScalarExpr::ColumnRef { index } => {
-            row.get(*index)
-                .cloned()
-                .ok_or_else(|| SqlError::Execute(format!("column index {index} out of bounds (row has {} columns)", row.len())))
-        }
+        ScalarExpr::ColumnRef { index } => row.get(*index).cloned().ok_or_else(|| {
+            SqlError::Execute(format!(
+                "column index {index} out of bounds (row has {} columns)",
+                row.len()
+            ))
+        }),
 
         ScalarExpr::Literal(v) => Ok(v.clone()),
 
-        ScalarExpr::Parameter(i) => {
-            params.get(*i)
-                .cloned()
-                .ok_or_else(|| SqlError::Execute(format!("parameter index {i} out of bounds ({} parameters provided)", params.len())))
-        }
+        ScalarExpr::Parameter(i) => params.get(*i).cloned().ok_or_else(|| {
+            SqlError::Execute(format!(
+                "parameter index {i} out of bounds ({} parameters provided)",
+                params.len()
+            ))
+        }),
 
         ScalarExpr::BinaryOp { op, left, right } => {
             let lv = evaluate(left, row, params)?;
@@ -42,7 +44,11 @@ pub fn evaluate(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Va
             Ok(Value::Boolean(if *negated { !is_null } else { is_null }))
         }
 
-        ScalarExpr::InList { expr, list, negated } => {
+        ScalarExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let val = evaluate(expr, row, params)?;
             if val.is_null() {
                 return Ok(Value::Null);
@@ -66,7 +72,12 @@ pub fn evaluate(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Va
             }
         }
 
-        ScalarExpr::Between { expr, low, high, negated } => {
+        ScalarExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let val = evaluate(expr, row, params)?;
             let lo = evaluate(low, row, params)?;
             let hi = evaluate(high, row, params)?;
@@ -79,7 +90,11 @@ pub fn evaluate(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Va
             Ok(Value::Boolean(if *negated { !result } else { result }))
         }
 
-        ScalarExpr::Like { expr, pattern, negated } => {
+        ScalarExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
             let val = evaluate(expr, row, params)?;
             let pat = evaluate(pattern, row, params)?;
             if val.is_null() || pat.is_null() {
@@ -87,11 +102,21 @@ pub fn evaluate(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Va
             }
             let text = match &val {
                 Value::Text(s) => s.as_str(),
-                _ => return Err(SqlError::TypeError(format!("LIKE requires text operand, got {}", val))),
+                _ => {
+                    return Err(SqlError::TypeError(format!(
+                        "LIKE requires text operand, got {}",
+                        val
+                    )));
+                }
             };
             let pattern_str = match &pat {
                 Value::Text(s) => s.as_str(),
-                _ => return Err(SqlError::TypeError(format!("LIKE requires text pattern, got {}", pat))),
+                _ => {
+                    return Err(SqlError::TypeError(format!(
+                        "LIKE requires text pattern, got {}",
+                        pat
+                    )));
+                }
             };
             let matched = like_match(text, pattern_str);
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
@@ -112,9 +137,9 @@ pub fn evaluate(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Va
 
         ScalarExpr::InSubquery { .. }
         | ScalarExpr::Exists { .. }
-        | ScalarExpr::ScalarSubquery { .. } => {
-            Err(SqlError::Execute("subquery evaluation not supported in this context".to_string()))
-        }
+        | ScalarExpr::ScalarSubquery { .. } => Err(SqlError::Execute(
+            "subquery evaluation not supported in this context".to_string(),
+        )),
     }
 }
 
@@ -128,10 +153,14 @@ fn apply_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<Value> {
     match op {
         BinaryOp::And => {
             return match (&left, &right) {
-                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
+                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => {
+                    Ok(Value::Boolean(false))
+                }
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(*l && *r)),
-                _ => Err(SqlError::TypeError("AND requires boolean operands".to_string())),
+                _ => Err(SqlError::TypeError(
+                    "AND requires boolean operands".to_string(),
+                )),
             };
         }
         BinaryOp::Or => {
@@ -139,7 +168,9 @@ fn apply_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<Value> {
                 (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(*l || *r)),
-                _ => Err(SqlError::TypeError("OR requires boolean operands".to_string())),
+                _ => Err(SqlError::TypeError(
+                    "OR requires boolean operands".to_string(),
+                )),
             };
         }
         _ => {}
@@ -158,10 +189,18 @@ fn apply_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<Value> {
         BinaryOp::Mod => numeric_arith(left, right, "%"),
         BinaryOp::Eq => Ok(Value::Boolean(values_equal(&left, &right))),
         BinaryOp::Neq => Ok(Value::Boolean(!values_equal(&left, &right))),
-        BinaryOp::Lt => Ok(Value::Boolean(compare_values(&left, &right) == Ordering::Less)),
-        BinaryOp::Gt => Ok(Value::Boolean(compare_values(&left, &right) == Ordering::Greater)),
-        BinaryOp::Lte => Ok(Value::Boolean(compare_values(&left, &right) != Ordering::Greater)),
-        BinaryOp::Gte => Ok(Value::Boolean(compare_values(&left, &right) != Ordering::Less)),
+        BinaryOp::Lt => Ok(Value::Boolean(
+            compare_values(&left, &right) == Ordering::Less,
+        )),
+        BinaryOp::Gt => Ok(Value::Boolean(
+            compare_values(&left, &right) == Ordering::Greater,
+        )),
+        BinaryOp::Lte => Ok(Value::Boolean(
+            compare_values(&left, &right) != Ordering::Greater,
+        )),
+        BinaryOp::Gte => Ok(Value::Boolean(
+            compare_values(&left, &right) != Ordering::Less,
+        )),
         BinaryOp::And | BinaryOp::Or => unreachable!("handled above"),
     }
 }
@@ -184,7 +223,10 @@ fn coerce_numeric(left: Value, right: Value) -> Result<(NumericPair, bool)> {
             let r = to_f64(&right)?;
             Ok((NumericPair::Real(l, r), false))
         }
-        _ => Err(SqlError::TypeError(format!("arithmetic requires numeric operands, got {} and {}", left, right))),
+        _ => Err(SqlError::TypeError(format!(
+            "arithmetic requires numeric operands, got {} and {}",
+            left, right
+        ))),
     }
 }
 
@@ -290,11 +332,17 @@ fn apply_unary_op(op: UnaryOp, val: Value) -> Result<Value> {
             Value::SmallInt(i) => Ok(Value::SmallInt(-i)),
             Value::Real(f) => Ok(Value::Real(-f)),
             Value::Decimal(d) => Ok(Value::Decimal(-d)),
-            _ => Err(SqlError::TypeError(format!("unary minus requires numeric operand, got {}", val))),
+            _ => Err(SqlError::TypeError(format!(
+                "unary minus requires numeric operand, got {}",
+                val
+            ))),
         },
         UnaryOp::Not => match val {
             Value::Boolean(b) => Ok(Value::Boolean(!b)),
-            _ => Err(SqlError::TypeError(format!("NOT requires boolean operand, got {}", val))),
+            _ => Err(SqlError::TypeError(format!(
+                "NOT requires boolean operand, got {}",
+                val
+            ))),
         },
     }
 }
@@ -434,42 +482,53 @@ pub fn cast_value(val: &Value, target: &SqlType) -> Result<Value> {
                 Value::Date(d) => d.to_string(),
                 Value::Timestamp(t) => t.to_string(),
                 Value::TimestampTz(t) => t.to_string(),
-                other => return Err(SqlError::TypeError(format!("cannot cast {} to TEXT", other))),
+                other => {
+                    return Err(SqlError::TypeError(format!(
+                        "cannot cast {} to TEXT",
+                        other
+                    )));
+                }
             };
             Ok(Value::Text(s))
         }
 
-        SqlType::Integer => {
-            match val {
-                Value::Integer(i) => Ok(Value::Integer(*i)),
-                Value::SmallInt(i) => Ok(Value::Integer(*i as i64)),
-                Value::Real(f) => Ok(Value::Integer(*f as i64)),
-                Value::Decimal(d) => {
-                    use rust_decimal::prelude::ToPrimitive;
-                    d.to_i64()
-                        .map(Value::Integer)
-                        .ok_or_else(|| SqlError::TypeError(format!("cannot cast {d} to INTEGER")))
-                }
-                Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-                Value::Text(s) => s.trim().parse::<i64>()
+        SqlType::Integer => match val {
+            Value::Integer(i) => Ok(Value::Integer(*i)),
+            Value::SmallInt(i) => Ok(Value::Integer(*i as i64)),
+            Value::Real(f) => Ok(Value::Integer(*f as i64)),
+            Value::Decimal(d) => {
+                use rust_decimal::prelude::ToPrimitive;
+                d.to_i64()
                     .map(Value::Integer)
-                    .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to INTEGER"))),
-                other => Err(SqlError::TypeError(format!("cannot cast {} to INTEGER", other))),
+                    .ok_or_else(|| SqlError::TypeError(format!("cannot cast {d} to INTEGER")))
             }
-        }
+            Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(Value::Integer)
+                .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to INTEGER"))),
+            other => Err(SqlError::TypeError(format!(
+                "cannot cast {} to INTEGER",
+                other
+            ))),
+        },
 
-        SqlType::SmallInt => {
-            match val {
-                Value::SmallInt(i) => Ok(Value::SmallInt(*i)),
-                Value::Integer(i) => Ok(Value::SmallInt(*i as i16)),
-                Value::Real(f) => Ok(Value::SmallInt(*f as i16)),
-                Value::Boolean(b) => Ok(Value::SmallInt(if *b { 1 } else { 0 })),
-                Value::Text(s) => s.trim().parse::<i16>()
-                    .map(Value::SmallInt)
-                    .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to SMALLINT"))),
-                other => Err(SqlError::TypeError(format!("cannot cast {} to SMALLINT", other))),
-            }
-        }
+        SqlType::SmallInt => match val {
+            Value::SmallInt(i) => Ok(Value::SmallInt(*i)),
+            Value::Integer(i) => Ok(Value::SmallInt(*i as i16)),
+            Value::Real(f) => Ok(Value::SmallInt(*f as i16)),
+            Value::Boolean(b) => Ok(Value::SmallInt(if *b { 1 } else { 0 })),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i16>()
+                .map(Value::SmallInt)
+                .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to SMALLINT"))),
+            other => Err(SqlError::TypeError(format!(
+                "cannot cast {} to SMALLINT",
+                other
+            ))),
+        },
 
         SqlType::BigInt => {
             // BigInt stored as Integer(i64) — same as INTEGER cast
@@ -478,59 +537,73 @@ pub fn cast_value(val: &Value, target: &SqlType) -> Result<Value> {
                 Value::SmallInt(i) => Ok(Value::Integer(*i as i64)),
                 Value::Real(f) => Ok(Value::Integer(*f as i64)),
                 Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-                Value::Text(s) => s.trim().parse::<i64>()
+                Value::Text(s) => s
+                    .trim()
+                    .parse::<i64>()
                     .map(Value::Integer)
                     .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to BIGINT"))),
-                other => Err(SqlError::TypeError(format!("cannot cast {} to BIGINT", other))),
+                other => Err(SqlError::TypeError(format!(
+                    "cannot cast {} to BIGINT",
+                    other
+                ))),
             }
         }
 
-        SqlType::Real => {
-            match val {
-                Value::Real(f) => Ok(Value::Real(*f)),
-                Value::Integer(i) => Ok(Value::Real(*i as f64)),
-                Value::SmallInt(i) => Ok(Value::Real(*i as f64)),
-                Value::Decimal(d) => {
-                    use rust_decimal::prelude::ToPrimitive;
-                    Ok(Value::Real(d.to_f64().unwrap_or(f64::NAN)))
-                }
-                Value::Text(s) => s.trim().parse::<f64>()
-                    .map(Value::Real)
-                    .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to REAL"))),
-                other => Err(SqlError::TypeError(format!("cannot cast {} to REAL", other))),
+        SqlType::Real => match val {
+            Value::Real(f) => Ok(Value::Real(*f)),
+            Value::Integer(i) => Ok(Value::Real(*i as f64)),
+            Value::SmallInt(i) => Ok(Value::Real(*i as f64)),
+            Value::Decimal(d) => {
+                use rust_decimal::prelude::ToPrimitive;
+                Ok(Value::Real(d.to_f64().unwrap_or(f64::NAN)))
             }
-        }
+            Value::Text(s) => s
+                .trim()
+                .parse::<f64>()
+                .map(Value::Real)
+                .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to REAL"))),
+            other => Err(SqlError::TypeError(format!(
+                "cannot cast {} to REAL",
+                other
+            ))),
+        },
 
-        SqlType::Decimal { .. } => {
-            match val {
-                Value::Decimal(d) => Ok(Value::Decimal(*d)),
-                Value::Integer(i) => Ok(Value::Decimal(Decimal::from(*i))),
-                Value::SmallInt(i) => Ok(Value::Decimal(Decimal::from(*i))),
-                Value::Real(f) => Decimal::try_from(*f)
-                    .map(Value::Decimal)
-                    .map_err(|e| SqlError::TypeError(e.to_string())),
-                Value::Text(s) => s.trim().parse::<Decimal>()
-                    .map(Value::Decimal)
-                    .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to DECIMAL"))),
-                other => Err(SqlError::TypeError(format!("cannot cast {} to DECIMAL", other))),
-            }
-        }
+        SqlType::Decimal { .. } => match val {
+            Value::Decimal(d) => Ok(Value::Decimal(*d)),
+            Value::Integer(i) => Ok(Value::Decimal(Decimal::from(*i))),
+            Value::SmallInt(i) => Ok(Value::Decimal(Decimal::from(*i))),
+            Value::Real(f) => Decimal::try_from(*f)
+                .map(Value::Decimal)
+                .map_err(|e| SqlError::TypeError(e.to_string())),
+            Value::Text(s) => s
+                .trim()
+                .parse::<Decimal>()
+                .map(Value::Decimal)
+                .map_err(|_| SqlError::TypeError(format!("cannot cast '{s}' to DECIMAL"))),
+            other => Err(SqlError::TypeError(format!(
+                "cannot cast {} to DECIMAL",
+                other
+            ))),
+        },
 
-        SqlType::Boolean => {
-            match val {
-                Value::Boolean(b) => Ok(Value::Boolean(*b)),
-                Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
-                Value::SmallInt(i) => Ok(Value::Boolean(*i != 0)),
-                Value::Text(s) => match s.to_lowercase().as_str() {
-                    "true" | "t" | "yes" | "1" => Ok(Value::Boolean(true)),
-                    "false" | "f" | "no" | "0" => Ok(Value::Boolean(false)),
-                    _ => Err(SqlError::TypeError(format!("cannot cast '{s}' to BOOLEAN"))),
-                },
-                other => Err(SqlError::TypeError(format!("cannot cast {} to BOOLEAN", other))),
-            }
-        }
+        SqlType::Boolean => match val {
+            Value::Boolean(b) => Ok(Value::Boolean(*b)),
+            Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
+            Value::SmallInt(i) => Ok(Value::Boolean(*i != 0)),
+            Value::Text(s) => match s.to_lowercase().as_str() {
+                "true" | "t" | "yes" | "1" => Ok(Value::Boolean(true)),
+                "false" | "f" | "no" | "0" => Ok(Value::Boolean(false)),
+                _ => Err(SqlError::TypeError(format!("cannot cast '{s}' to BOOLEAN"))),
+            },
+            other => Err(SqlError::TypeError(format!(
+                "cannot cast {} to BOOLEAN",
+                other
+            ))),
+        },
 
-        other => Err(SqlError::TypeError(format!("CAST to {other} not supported"))),
+        other => Err(SqlError::TypeError(format!(
+            "CAST to {other} not supported"
+        ))),
     }
 }
 
@@ -565,7 +638,11 @@ mod tests {
 
     #[test]
     fn column_ref() {
-        let row = vec![Value::Integer(1), Value::Text("hello".to_string()), Value::Boolean(true)];
+        let row = vec![
+            Value::Integer(1),
+            Value::Text("hello".to_string()),
+            Value::Boolean(true),
+        ];
         let expr = ScalarExpr::ColumnRef { index: 1 };
         assert_eq!(eval_row(&expr, &row), Value::Text("hello".to_string()));
     }
@@ -687,6 +764,9 @@ mod tests {
     fn parameter() {
         let expr = ScalarExpr::Parameter(0);
         let params = vec![Value::Text("test_param".to_string())];
-        assert_eq!(eval_params(&expr, &params), Value::Text("test_param".to_string()));
+        assert_eq!(
+            eval_params(&expr, &params),
+            Value::Text("test_param".to_string())
+        );
     }
 }

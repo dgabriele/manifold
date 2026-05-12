@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::schema::TableId;
 use crate::catalog::Catalog;
+use crate::catalog::schema::TableId;
 
 /// Statistics for a single table, used by the optimizer for cost estimation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

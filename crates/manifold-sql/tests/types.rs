@@ -33,7 +33,8 @@ fn integer_roundtrip() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", &[])
         .unwrap();
-    db.execute("INSERT INTO t (id, val) VALUES (1, 42)", &[]).unwrap();
+    db.execute("INSERT INTO t (id, val) VALUES (1, 42)", &[])
+        .unwrap();
     let result = db.query("SELECT val FROM t WHERE id = 1", &[]).unwrap();
     assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 42);
 }
@@ -43,7 +44,8 @@ fn bigint_roundtrip() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val BIGINT)", &[])
         .unwrap();
-    db.execute("INSERT INTO t (id, val) VALUES (1, 9999999999)", &[]).unwrap();
+    db.execute("INSERT INTO t (id, val) VALUES (1, 9999999999)", &[])
+        .unwrap();
     let result = db.query("SELECT val FROM t WHERE id = 1", &[]).unwrap();
     assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 9999999999);
 }
@@ -53,7 +55,8 @@ fn smallint_roundtrip() {
     let (db, _dir) = test_db();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val SMALLINT)", &[])
         .unwrap();
-    db.execute("INSERT INTO t (id, val) VALUES (1, 100)", &[]).unwrap();
+    db.execute("INSERT INTO t (id, val) VALUES (1, 100)", &[])
+        .unwrap();
     let result = db.query("SELECT val FROM t WHERE id = 1", &[]).unwrap();
     assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 100);
 }
@@ -222,11 +225,8 @@ fn blob_type_roundtrip() {
 #[test]
 fn boolean_type_roundtrip() {
     let (db, _dir) = test_db();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)",
-        &[],
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)", &[])
+        .unwrap();
 
     db.execute("INSERT INTO t (id, flag) VALUES (1, TRUE)", &[])
         .unwrap();
@@ -234,14 +234,10 @@ fn boolean_type_roundtrip() {
         .unwrap();
 
     // Query each row individually to avoid ordering issues.
-    let result = db
-        .query("SELECT flag FROM t WHERE id = 1", &[])
-        .unwrap();
+    let result = db.query("SELECT flag FROM t WHERE id = 1", &[]).unwrap();
     assert_eq!(result.rows()[0].get::<bool>(0).unwrap(), true);
 
-    let result = db
-        .query("SELECT flag FROM t WHERE id = 2", &[])
-        .unwrap();
+    let result = db.query("SELECT flag FROM t WHERE id = 2", &[]).unwrap();
     assert_eq!(result.rows()[0].get::<bool>(0).unwrap(), false);
 }
 
@@ -418,9 +414,7 @@ fn null_in_arithmetic() {
         .unwrap();
 
     // NULL + 1 should be NULL.
-    let result = db
-        .query("SELECT val + 1 FROM t WHERE id = 1", &[])
-        .unwrap();
+    let result = db.query("SELECT val + 1 FROM t WHERE id = 1", &[]).unwrap();
     assert_eq!(result.row_count(), 1);
     let val = result.rows()[0].get::<Value>(0).unwrap();
     assert_eq!(val, Value::Null, "NULL + 1 should be NULL");

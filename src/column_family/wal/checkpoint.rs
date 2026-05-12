@@ -335,41 +335,40 @@ impl CheckpointManager {
                 // Apply logical ops directly to the B-tree via a normal write transaction.
                 // We go through ensure_database().begin_write() (the Database directly),
                 // NOT ColumnFamily::begin_write(), to avoid re-entering deferred flush mode.
-                let cf = database.column_family(&entry.cf_name).map_err(|e| {
-                    io::Error::other(format!("CF '{}' error: {e}", entry.cf_name))
-                })?;
+                let cf = database
+                    .column_family(&entry.cf_name)
+                    .map_err(|e| io::Error::other(format!("CF '{}' error: {e}", entry.cf_name)))?;
 
-                let db = cf.ensure_database().map_err(|e| {
-                    io::Error::other(format!("DB init error: {e}"))
-                })?;
-                let txn = db.begin_write().map_err(|e| {
-                    io::Error::other(format!("begin_write error: {e}"))
-                })?;
+                let db = cf
+                    .ensure_database()
+                    .map_err(|e| io::Error::other(format!("DB init error: {e}")))?;
+                let txn = db
+                    .begin_write()
+                    .map_err(|e| io::Error::other(format!("begin_write error: {e}")))?;
 
                 {
                     let table_def: crate::TableDefinition<&[u8], &[u8]> =
                         crate::TableDefinition::new(&payload.table_name);
-                    let mut table = txn.open_table(table_def).map_err(|e| {
-                        io::Error::other(format!("open_table error: {e}"))
-                    })?;
+                    let mut table = txn
+                        .open_table(table_def)
+                        .map_err(|e| io::Error::other(format!("open_table error: {e}")))?;
                     for op in &payload.ops {
                         match &op.value {
                             Some(v) => {
-                                table.insert(op.key.as_slice(), v.as_slice()).map_err(|e| {
-                                    io::Error::other(format!("insert error: {e}"))
-                                })?;
+                                table
+                                    .insert(op.key.as_slice(), v.as_slice())
+                                    .map_err(|e| io::Error::other(format!("insert error: {e}")))?;
                             }
                             None => {
-                                table.remove(op.key.as_slice()).map_err(|e| {
-                                    io::Error::other(format!("remove error: {e}"))
-                                })?;
+                                table
+                                    .remove(op.key.as_slice())
+                                    .map_err(|e| io::Error::other(format!("remove error: {e}")))?;
                             }
                         }
                     }
                 }
-                txn.commit().map_err(|e| {
-                    io::Error::other(format!("commit error: {e}"))
-                })?;
+                txn.commit()
+                    .map_err(|e| io::Error::other(format!("commit error: {e}")))?;
 
                 return Ok(());
             }

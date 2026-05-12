@@ -43,10 +43,7 @@ fn explain_shows_join() {
         .explain("SELECT * FROM a JOIN b ON a.id = b.a_id")
         .unwrap();
     let lower = plan.to_lowercase();
-    assert!(
-        lower.contains("join"),
-        "expected Join in plan, got: {plan}"
-    );
+    assert!(lower.contains("join"), "expected Join in plan, got: {plan}");
 }
 
 #[test]
@@ -56,9 +53,7 @@ fn index_improves_explain() {
         .unwrap();
     db.execute("CREATE INDEX idx_name ON t (name)", &[])
         .unwrap();
-    let plan = db
-        .explain("SELECT * FROM t WHERE name = 'test'")
-        .unwrap();
+    let plan = db.explain("SELECT * FROM t WHERE name = 'test'").unwrap();
     let lower = plan.to_lowercase();
     // The optimizer may or may not use the index yet; just check the plan is valid.
     assert!(
@@ -85,9 +80,7 @@ fn analyze_then_query() {
     let result = db.query("SELECT COUNT(*) FROM t", &[]).unwrap();
     assert_eq!(result.rows()[0].get::<i64>(0).unwrap(), 3);
 
-    let result = db
-        .query("SELECT name FROM t WHERE id = 2", &[])
-        .unwrap();
+    let result = db.query("SELECT name FROM t WHERE id = 2", &[]).unwrap();
     assert_eq!(result.row_count(), 1);
     assert_eq!(result.rows()[0].get::<String>(0).unwrap(), "bob");
 }

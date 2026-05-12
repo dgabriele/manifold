@@ -625,10 +625,12 @@ impl TransactionalMemory {
 
         // Verify what was serialized by deserializing it back
         let _verified_header =
-            crate::tree_store::page_store::header::UnrepairedDatabaseHeader::from_bytes(&header_bytes)
-                .map_err(|e| {
-                    StorageError::Corrupted(format!("Failed to verify serialized header: {e}"))
-                })?;
+            crate::tree_store::page_store::header::UnrepairedDatabaseHeader::from_bytes(
+                &header_bytes,
+            )
+            .map_err(|e| {
+                StorageError::Corrupted(format!("Failed to verify serialized header: {e}"))
+            })?;
 
         self.storage
             .write(0, DB_HEADER_SIZE, true)?
@@ -941,7 +943,12 @@ impl TransactionalMemory {
         // Use non_durable_commit to apply the transaction state
         // This updates the secondary slot with the new roots
         use crate::tree_store::page_store::fast_hash::PageNumberHashSet;
-        self.non_durable_commit(data_root, system_root, transaction_id, PageNumberHashSet::default())
+        self.non_durable_commit(
+            data_root,
+            system_root,
+            transaction_id,
+            PageNumberHashSet::default(),
+        )
     }
 
     pub(crate) fn get_page(&self, page_number: PageNumber, hint: PageHint) -> Result<PageImpl> {
