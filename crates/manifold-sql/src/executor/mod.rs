@@ -301,22 +301,6 @@ fn build_read_query_executor(
         LogicalPlan::Aggregate {
             group_by,
             aggregates,
-            input,
-            ..
-        } if group_by.is_empty()
-            && aggregates.len() == 1
-            && aggregates[0].func == AggregateFunc::Count
-            && aggregates[0].arg.is_none()
-            && matches!(input.as_ref(), LogicalPlan::Scan { .. }) =>
-        {
-            if let LogicalPlan::Scan { table_name, .. } = input.as_ref() {
-                return Ok(Box::new(scan::CountScan::from_read_txn(txn, table_name)?));
-            }
-            unreachable!()
-        }
-        LogicalPlan::Aggregate {
-            group_by,
-            aggregates,
             schema,
             input,
         } => {
@@ -510,22 +494,6 @@ fn build_write_query_executor(
         LogicalPlan::Aggregate {
             group_by,
             aggregates,
-            input,
-            ..
-        } if group_by.is_empty()
-            && aggregates.len() == 1
-            && aggregates[0].func == AggregateFunc::Count
-            && aggregates[0].arg.is_none()
-            && matches!(input.as_ref(), LogicalPlan::Scan { .. }) =>
-        {
-            if let LogicalPlan::Scan { table_name, .. } = input.as_ref() {
-                return Ok(Box::new(scan::CountScan::from_write_txn(txn, table_name)?));
-            }
-            unreachable!()
-        }
-        LogicalPlan::Aggregate {
-            group_by,
-            aggregates,
             schema,
             input,
         } => {
@@ -682,10 +650,7 @@ where
 /// The returned left index is the plan-space column index (0-based into the left
 /// schema). The returned right index is relative to the right table's own schema
 /// (i.e. `plan_index - left_width`).
-fn extract_equi_join_keys(
-    cond: &ScalarExpr,
-    left_width: usize,
-) -> Option<(usize, usize)> {
+fn extract_equi_join_keys(cond: &ScalarExpr, left_width: usize) -> Option<(usize, usize)> {
     if let ScalarExpr::BinaryOp {
         op: crate::binder::BinaryOp::Eq,
         left,
@@ -1496,7 +1461,10 @@ fn execute_insert_inner(
     // Whether PK=rowid applies (column 0 is INTEGER/BIGINT PRIMARY KEY).
     let has_pk_rowid = !schema.columns.is_empty()
         && schema.columns[0].is_primary_key
-        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+        && matches!(
+            schema.columns[0].sql_type,
+            SqlType::Integer | SqlType::BigInt
+        );
 
     // Get indexes for this table, skipping the redundant PK index when PK=rowid
     // (uniqueness is already enforced by the duplicate-rowid check below).
@@ -1659,7 +1627,10 @@ fn execute_update(
 
     let has_pk_rowid = !schema.columns.is_empty()
         && schema.columns[0].is_primary_key
-        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+        && matches!(
+            schema.columns[0].sql_type,
+            SqlType::Integer | SqlType::BigInt
+        );
 
     let indexes: Vec<IndexDef> = catalog
         .indexes_for_table(schema.id)
@@ -1738,7 +1709,10 @@ fn execute_delete(
 
     let has_pk_rowid = !schema.columns.is_empty()
         && schema.columns[0].is_primary_key
-        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+        && matches!(
+            schema.columns[0].sql_type,
+            SqlType::Integer | SqlType::BigInt
+        );
 
     let indexes: Vec<IndexDef> = catalog
         .indexes_for_table(schema.id)
@@ -2282,7 +2256,10 @@ fn execute_rowid_update(
     // Update indexes: remove old entries, add new
     let has_pk_rowid = !schema.columns.is_empty()
         && schema.columns[0].is_primary_key
-        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+        && matches!(
+            schema.columns[0].sql_type,
+            SqlType::Integer | SqlType::BigInt
+        );
     let indexes: Vec<_> = catalog
         .indexes_for_table(schema.id)
         .into_iter()
@@ -2348,7 +2325,10 @@ fn execute_rowid_delete(
     // Update indexes
     let has_pk_rowid = !schema.columns.is_empty()
         && schema.columns[0].is_primary_key
-        && matches!(schema.columns[0].sql_type, SqlType::Integer | SqlType::BigInt);
+        && matches!(
+            schema.columns[0].sql_type,
+            SqlType::Integer | SqlType::BigInt
+        );
     let indexes: Vec<_> = catalog
         .indexes_for_table(schema.id)
         .into_iter()

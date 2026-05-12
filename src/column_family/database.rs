@@ -586,21 +586,24 @@ impl ColumnFamilyDatabase {
         };
 
         // Start checkpoint manager if WAL is enabled
+        // Share the CF map between the checkpoint manager and the live database
+        // so that CFs created after init are visible to the checkpoint thread.
+        let shared_cfs = Arc::new(RwLock::new(column_families));
+
         let checkpoint_manager = if let Some(ref journal_arc) = wal_journal {
             let config = CheckpointConfig {
                 interval: std::time::Duration::from_secs(60),
                 max_wal_size: 64 * 1024 * 1024,
             };
 
-            // Create database Arc for checkpoint manager (temporary, will be replaced by self)
             let db_arc = Arc::new(Self {
                 path: path.clone(),
                 header_backend: Arc::clone(&header_backend),
                 handle_pool: Arc::clone(&handle_pool),
-                column_families: Arc::new(RwLock::new(column_families.clone())),
+                column_families: Arc::clone(&shared_cfs),
                 header: Arc::clone(&header),
                 wal_journal: Some(Arc::clone(journal_arc)),
-                checkpoint_manager: None, // Will be set after creation
+                checkpoint_manager: None,
                 deferred_flush,
             });
 
@@ -615,7 +618,7 @@ impl ColumnFamilyDatabase {
             path,
             header_backend,
             handle_pool,
-            column_families: Arc::new(RwLock::new(column_families)),
+            column_families: shared_cfs,
             header,
             wal_journal,
             checkpoint_manager,

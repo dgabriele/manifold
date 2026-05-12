@@ -219,9 +219,7 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let cf_db = manifold::column_family::ColumnFamilyDatabase::builder()
             .pool_size(64) // WAL enabled (group commit batching)
-            // deferred_flush is available but not default — it improves random write
-            // throughput but adds merge-iterator overhead to reads. Enable for
-            // write-heavy workloads once per-table deferred flush is implemented.
+            .deferred_flush(true) // Skip CoW B-tree on writes; checkpoint flushes to B-tree
             .open(path)?;
 
         let cf = cf_db
