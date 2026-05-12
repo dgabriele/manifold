@@ -591,10 +591,14 @@ fn build_write_query_executor(
     }
 }
 
-/// Build a NestedLoopJoin from left/right sub-plans.
+/// Build a join executor from left/right sub-plans.
 ///
 /// The `build_child` closure constructs an executor for a child plan node
 /// (abstracting over read vs write transaction).
+///
+/// When the condition is a simple equi-join (`col_a = col_b`) and the join
+/// type is INNER or LEFT, a hash join is used for O(n+m) performance.
+/// Otherwise, falls back to the nested-loop join.
 fn build_join_executor<F>(
     build_child: F,
     join_type: crate::binder::JoinType,
@@ -613,6 +617,37 @@ where
 
     let left_plan_width = left.schema().map_or(0, |s| s.len());
     let right_plan_width = right.schema().map_or(0, |s| s.len());
+
+    // Try hash join for equi-join conditions on INNER / LEFT joins.
+    if matches!(
+        join_type,
+        crate::binder::JoinType::Inner | crate::binder::JoinType::Left
+    ) {
+        if let Some(cond) = condition {
+            if let Some((left_key_plan, right_key_plan)) =
+                extract_equi_join_keys(cond, left_plan_width)
+            {
+                let left_exec = build_child(left)?;
+                let right_exec = build_child(right)?;
+
+                // Map plan-space column indices to raw-row indices (including rowid prefix).
+                let left_key_idx = left_key_plan + left_skip;
+                let right_key_idx = right_key_plan + right_skip;
+
+                return Ok(Box::new(join::HashJoinExecutor::new(
+                    left_exec,
+                    right_exec,
+                    join_type,
+                    left_key_idx,
+                    right_key_idx,
+                    left_skip,
+                    right_skip,
+                    left_plan_width,
+                    right_plan_width,
+                )?));
+            }
+        }
+    }
 
     let left_exec = build_child(left)?;
     let right_exec = build_child(right)?;
@@ -636,6 +671,40 @@ where
         left_plan_width,
         right_plan_width,
     )?))
+}
+
+/// Try to extract equi-join keys from a condition expression.
+///
+/// Returns `Some((left_col_plan_idx, right_col_relative_idx))` if the condition
+/// is `ColumnRef(X) = ColumnRef(Y)` where one column is from the left table
+/// (plan index < `left_width`) and the other from the right (plan index >= `left_width`).
+///
+/// The returned left index is the plan-space column index (0-based into the left
+/// schema). The returned right index is relative to the right table's own schema
+/// (i.e. `plan_index - left_width`).
+fn extract_equi_join_keys(
+    cond: &ScalarExpr,
+    left_width: usize,
+) -> Option<(usize, usize)> {
+    if let ScalarExpr::BinaryOp {
+        op: crate::binder::BinaryOp::Eq,
+        left,
+        right,
+    } = cond
+    {
+        if let (ScalarExpr::ColumnRef { index: a }, ScalarExpr::ColumnRef { index: b }) =
+            (left.as_ref(), right.as_ref())
+        {
+            // One must be a left column, the other a right column.
+            if *a < left_width && *b >= left_width {
+                return Some((*a, *b - left_width));
+            }
+            if *b < left_width && *a >= left_width {
+                return Some((*b, *a - left_width));
+            }
+        }
+    }
+    None
 }
 
 /// Shift all ColumnRef indices in a ScalarExpr by a given offset.

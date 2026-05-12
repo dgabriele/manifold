@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::binder::JoinType;
 use crate::error::Result;
 use crate::expr::eval::evaluate;
@@ -197,6 +199,162 @@ impl super::Executor for NestedLoopJoin {
 
             // Move to next left row.
             self.current_left = None;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hash join for equi-join conditions
+// ---------------------------------------------------------------------------
+
+/// Convert a `Value` to a byte key for hash table lookup.
+fn hash_key(val: &Value) -> Vec<u8> {
+    match val {
+        Value::Integer(i) => i.to_le_bytes().to_vec(),
+        Value::SmallInt(i) => i.to_le_bytes().to_vec(),
+        Value::Text(s) => s.as_bytes().to_vec(),
+        Value::Null => vec![0xFF],
+        other => format!("{other:?}").into_bytes(),
+    }
+}
+
+/// Hash join operator for equi-join conditions (`col_a = col_b`).
+///
+/// Drains the right side into a hash table keyed by the join column,
+/// then probes with each left row for O(n+m) performance instead of
+/// the O(n*m) nested loop.
+pub struct HashJoinExecutor {
+    left: Box<dyn super::Executor>,
+    hash_table: HashMap<Vec<u8>, Vec<Vec<Value>>>,
+    current_left: Option<Vec<Value>>,
+    match_idx: usize,
+    current_matches: Vec<Vec<Value>>,
+    /// Index of the join key column in the raw left row (including rowid prefix).
+    left_key_idx: usize,
+    /// Number of leading columns to skip from left rows (e.g. 1 for rowid).
+    left_skip: usize,
+    /// Number of leading columns to skip from right rows (e.g. 1 for rowid).
+    right_skip: usize,
+    left_matched: bool,
+    join_type: JoinType,
+    /// Width of left side after skipping (for output).
+    left_width: usize,
+    /// Width of right side after skipping (for output / NULL padding).
+    right_width: usize,
+    done: bool,
+}
+
+impl HashJoinExecutor {
+    /// Create a new hash join executor.
+    ///
+    /// - `left_key_idx`: column index in the raw left row (including rowid) to use as key
+    /// - `right_key_idx`: column index in the raw right row (including rowid) to use as key
+    /// - `left_skip` / `right_skip`: how many leading columns to strip from output (rowid)
+    /// - `left_width` / `right_width`: output widths after skipping
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        left: Box<dyn super::Executor>,
+        mut right: Box<dyn super::Executor>,
+        join_type: JoinType,
+        left_key_idx: usize,
+        right_key_idx: usize,
+        left_skip: usize,
+        right_skip: usize,
+        left_width: usize,
+        right_width: usize,
+    ) -> Result<Self> {
+        // Drain the right side into a hash table keyed by the join column.
+        let mut hash_table: HashMap<Vec<u8>, Vec<Vec<Value>>> = HashMap::new();
+        while let Some(row) = right.next()? {
+            let key = hash_key(&row[right_key_idx]);
+            hash_table.entry(key).or_default().push(row);
+        }
+
+        Ok(Self {
+            left,
+            hash_table,
+            current_left: None,
+            match_idx: 0,
+            current_matches: Vec::new(),
+            left_key_idx,
+            left_skip,
+            right_skip,
+            left_matched: false,
+            join_type,
+            left_width,
+            right_width,
+            done: false,
+        })
+    }
+
+    /// Build a combined output row from left and right values (after skipping rowid prefixes).
+    fn combine(&self, left: &[Value], right: &[Value]) -> Vec<Value> {
+        let mut combined = Vec::with_capacity(self.left_width + self.right_width);
+        combined.extend_from_slice(&left[self.left_skip..]);
+        combined.extend_from_slice(&right[self.right_skip..]);
+        combined
+    }
+
+    /// Build a row with left values + NULLs for right side.
+    fn left_with_nulls(&self, left: &[Value]) -> Vec<Value> {
+        let mut combined = Vec::with_capacity(self.left_width + self.right_width);
+        combined.extend_from_slice(&left[self.left_skip..]);
+        combined.resize(self.left_width + self.right_width, Value::Null);
+        combined
+    }
+}
+
+impl super::Executor for HashJoinExecutor {
+    fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        loop {
+            // If we have remaining matches for the current left row, yield the next one.
+            if self.match_idx < self.current_matches.len() {
+                let right_row = &self.current_matches[self.match_idx];
+                self.match_idx += 1;
+                self.left_matched = true;
+                let left_row = self.current_left.as_ref().unwrap();
+                return Ok(Some(self.combine(left_row, right_row)));
+            }
+
+            // Finished all matches for the current left row.
+            // For LEFT join, if no matches were found, emit left + NULLs.
+            if self.current_left.is_some()
+                && self.join_type == JoinType::Left
+                && !self.left_matched
+            {
+                let left_row = self.current_left.take().unwrap();
+                let row = self.left_with_nulls(&left_row);
+                return Ok(Some(row));
+            }
+
+            // Fetch the next left row.
+            match self.left.next()? {
+                Some(left_row) => {
+                    // Probe the hash table with the left key.
+                    let key = hash_key(&left_row[self.left_key_idx]);
+                    self.current_matches = self
+                        .hash_table
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_default();
+                    // NULL keys should never match (SQL semantics: NULL != NULL).
+                    if left_row[self.left_key_idx] == Value::Null {
+                        self.current_matches.clear();
+                    }
+                    self.match_idx = 0;
+                    self.left_matched = false;
+                    self.current_left = Some(left_row);
+                }
+                None => {
+                    // Left side exhausted.
+                    self.done = true;
+                    return Ok(None);
+                }
+            }
         }
     }
 }
