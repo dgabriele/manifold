@@ -204,9 +204,8 @@ pub struct Database {
     catalog: Arc<Mutex<Catalog>>,
     /// Active SQL-level transaction started via BEGIN.
     active_txn: Mutex<Option<ActiveTransaction>>,
-    /// Statement cache: SQL string → optimized plan.
-    /// Avoids re-parsing/planning/optimizing repeated queries.
-    stmt_cache: Mutex<HashMap<String, LogicalPlan>>,
+    /// Statement cache: SQL string → optimized plan (Arc-shared, no clone cost).
+    stmt_cache: Mutex<HashMap<String, Arc<LogicalPlan>>>,
     /// Durability mode applied to auto-commit statements.
     auto_commit_durability: Mutex<manifold::Durability>,
 }
@@ -253,12 +252,12 @@ impl Database {
     }
 
     /// Compile SQL to an optimized plan, using the cache for repeated queries.
-    fn compile_cached(&self, sql: &str, catalog: &Catalog) -> Result<LogicalPlan> {
-        // Check cache first
+    fn compile_cached(&self, sql: &str, catalog: &Catalog) -> Result<Arc<LogicalPlan>> {
+        // Check cache first — Arc clone is just a ref count bump
         {
             let cache = self.stmt_cache.lock().unwrap();
             if let Some(plan) = cache.get(sql) {
-                return Ok(plan.clone());
+                return Ok(Arc::clone(plan));
             }
         }
 
@@ -287,13 +286,15 @@ impl Database {
                 | LogicalPlan::ReleaseSavepoint { .. }
                 | LogicalPlan::RollbackToSavepoint { .. }
         ) {
+            let arc = Arc::new(optimized);
             let mut cache = self.stmt_cache.lock().unwrap();
             if cache.len() < 256 {
-                cache.insert(sql.to_string(), optimized.clone());
+                cache.insert(sql.to_string(), Arc::clone(&arc));
             }
+            return Ok(arc);
         }
 
-        Ok(optimized)
+        Ok(Arc::new(optimized))
     }
 
     /// Invalidate the statement cache (e.g., after DDL changes).
@@ -320,7 +321,7 @@ impl Database {
         use planner::plan::LogicalPlan;
 
         let mut catalog = self.catalog.lock().unwrap();
-        let optimized = self.compile_cached(sql, &catalog)?;
+        let optimized = Arc::unwrap_or_clone(self.compile_cached(sql, &catalog)?);
 
         // DDL invalidates the statement cache
         if matches!(
@@ -437,7 +438,7 @@ impl Database {
     /// Execute a query and return the result set.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
         let catalog = self.catalog.lock().unwrap();
-        let optimized = self.compile_cached(sql, &catalog)?;
+        let optimized = Arc::unwrap_or_clone(self.compile_cached(sql, &catalog)?);
 
         // If there's an active explicit transaction, flush dirty tables then query.
         let mut active = self.active_txn.lock().unwrap();
