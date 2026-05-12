@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "sqlite_comparison"
 harness = false
+
+[[bench]]
+name = "api_workload"
+harness = false
