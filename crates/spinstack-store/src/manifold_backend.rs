@@ -336,6 +336,79 @@ impl Store for ManifoldStore {
         }
     }
 
+    fn fetch_page<T: StoreRecord>(&self, query: Query<T>) -> Result<(Vec<T>, u64)> {
+        let desc = query.build();
+        match desc {
+            QueryDescriptor::Scan {
+                filters,
+                order_by,
+                limit,
+                offset,
+                ..
+            } => {
+                let schema = T::schema();
+                let table_name = Self::data_table_name(T::TABLE_NAME);
+                let def = TableDefinition::<u64, &[u8]>::new(table_name);
+
+                let txn = self.cf.begin_read().map_err(map_txn_err)?;
+                let table = match txn.open_table(def) {
+                    Ok(t) => t,
+                    Err(manifold::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0)),
+                    Err(e) => return Err(map_table_err(e)),
+                };
+
+                // If no filters, total is O(1)
+                if filters.is_empty() {
+                    let total = table.len().map_err(map_storage_err)?;
+                    let results = self.fetch::<T>(
+                        // Rebuild query since we consumed it
+                        {
+                            let mut q = Query::<T>::new(T::TABLE_NAME);
+                            if let Some((col, dir)) = order_by { q = q.order_by_raw(col, dir); }
+                            if let Some(l) = limit { q = q.limit(l); }
+                            if let Some(o) = offset { q = q.offset(o); }
+                            q
+                        }
+                    )?;
+                    return Ok((results, total));
+                }
+
+                // Filtered: scan all, count matches, collect page
+                let mut matching: Vec<(u64, Vec<u8>)> = Vec::new();
+                let iter = table.iter().map_err(map_storage_err)?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(map_storage_err)?;
+                    let key = k.value();
+                    let bytes = v.value().to_vec();
+                    if Self::matches_filters(&bytes, key, &schema, &filters)? {
+                        matching.push((key, bytes));
+                    }
+                }
+
+                let total = matching.len() as u64;
+
+                let reverse = matches!(order_by, Some((0, Direction::Desc)));
+                if reverse {
+                    matching.reverse();
+                }
+
+                let skip = offset.unwrap_or(0) as usize;
+                let take = limit.unwrap_or(u32::MAX) as usize;
+                let results: Result<Vec<T>> = matching
+                    .into_iter()
+                    .skip(skip)
+                    .take(take)
+                    .map(|(_, bytes)| T::from_store_bytes(&bytes))
+                    .collect();
+
+                Ok((results?, total))
+            }
+            _ => Err(StoreError::BackendError(
+                "fetch_page only supports Scan descriptors".into(),
+            )),
+        }
+    }
+
     fn count<T: StoreRecord>(&self, query: Query<T>) -> Result<u64> {
         let desc = query.build_count();
         match desc {

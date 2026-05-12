@@ -285,6 +285,44 @@ impl Store for SqliteStore {
         }
     }
 
+    fn fetch_page<T: StoreRecord>(&self, query: Query<T>) -> Result<(Vec<T>, u64)> {
+        let desc = query.build();
+        match desc {
+            QueryDescriptor::Scan { filters, order_by, limit, offset, .. } => {
+                // Get total count (unfiltered is fast via SQL)
+                let total = if filters.is_empty() {
+                    let table = T::TABLE_NAME;
+                    let conn = self.conn.lock().unwrap();
+                    let mut stmt = conn.prepare_cached(&format!("SELECT COUNT(*) FROM {table}"))
+                        .map_err(map_sqlite_err)?;
+                    stmt.query_row([], |row| row.get::<_, i64>(0)).map_err(map_sqlite_err)? as u64
+                } else {
+                    // Filtered: fetch all without limit to count, rebuild query for page
+                    let mut count_q = Query::<T>::new(T::TABLE_NAME);
+                    for f in &filters {
+                        count_q = count_q.filter(f.clone());
+                    }
+                    self.count(count_q)?
+                };
+
+                // Fetch the page
+                let mut q = Query::<T>::new(T::TABLE_NAME);
+                for f in filters {
+                    q = q.filter(f);
+                }
+                if let Some((col, dir)) = order_by {
+                    q = q.order_by_raw(col, dir);
+                }
+                if let Some(l) = limit { q = q.limit(l); }
+                if let Some(o) = offset { q = q.offset(o); }
+                let results = self.fetch(q)?;
+
+                Ok((results, total))
+            }
+            _ => Err(StoreError::BackendError("fetch_page only supports Scan".into())),
+        }
+    }
+
     fn count<T: StoreRecord>(&self, query: Query<T>) -> Result<u64> {
         let desc = query.build_count();
         match desc {

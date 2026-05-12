@@ -11,6 +11,8 @@ pub trait Store: Sized {
     fn update<T: StoreRecord>(&self, record: &T) -> Result<()>;
     fn delete<T: StoreRecord>(&self, key: impl Into<u64>) -> Result<()>;
     fn fetch<T: StoreRecord>(&self, query: Query<T>) -> Result<Vec<T>>;
+    /// Fetch a page of results with total count (for pagination).
+    fn fetch_page<T: StoreRecord>(&self, query: Query<T>) -> Result<(Vec<T>, u64)>;
     fn count<T: StoreRecord>(&self, query: Query<T>) -> Result<u64>;
     fn execute_descriptor(&self, desc: QueryDescriptor) -> Result<Vec<Vec<u8>>>;
     fn transaction<F, R>(&self, f: F) -> Result<R>

@@ -20,6 +20,10 @@ impl<T> Query<T> {
     pub fn order_by<F>(mut self, field: Field<F>, dir: Direction) -> Self {
         self.order_by = Some((field.column_index, dir)); self
     }
+    /// Set order_by using raw column index (for internal rebuilding).
+    pub fn order_by_raw(mut self, column: u16, dir: Direction) -> Self {
+        self.order_by = Some((column, dir)); self
+    }
     pub fn limit(mut self, n: u32) -> Self { self.limit = Some(n); self }
     pub fn offset(mut self, n: u32) -> Self { self.offset = Some(n); self }
     pub fn build(self) -> QueryDescriptor {
