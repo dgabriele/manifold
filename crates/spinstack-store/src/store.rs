@@ -3,7 +3,9 @@ use crate::error::Result;
 use crate::query::Query;
 use crate::schema::StoreRecord;
 
-pub trait Store {
+pub trait Store: Sized {
+    type Txn<'a>: TransactionOps where Self: 'a;
+
     fn get<T: StoreRecord>(&self, key: impl Into<u64>) -> Result<Option<T>>;
     fn insert<T: StoreRecord>(&self, record: &T) -> Result<()>;
     fn update<T: StoreRecord>(&self, record: &T) -> Result<()>;
@@ -12,7 +14,7 @@ pub trait Store {
     fn count<T: StoreRecord>(&self, query: Query<T>) -> Result<u64>;
     fn execute_descriptor(&self, desc: QueryDescriptor) -> Result<Vec<Vec<u8>>>;
     fn transaction<F, R>(&self, f: F) -> Result<R>
-    where F: FnOnce(&dyn TransactionOps) -> Result<R>;
+    where F: for<'a> FnOnce(&Self::Txn<'a>) -> Result<R>;
 }
 
 pub trait TransactionOps {
