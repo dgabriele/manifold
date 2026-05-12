@@ -3,21 +3,32 @@
 [![CI](https://github.com/cberner/redb/actions/workflows/ci.yml/badge.svg)](https://github.com/cberner/redb/actions)
 [![License](https://img.shields.io/crates/l/redb)](https://crates.io/crates/redb)
 
-**A high-performance, ACID-compliant embedded database with column families, write-ahead logging, and WASM support.**
+**A high-performance, ACID-compliant embedded database with column families, write-ahead logging, SQL, and WASM support.**
 
-Manifold is a fork of [redb](https://github.com/cberner/redb) by Christopher Berner, extended with:
-- **Column families** for concurrent writes to independent databases in a single file
-- **Write-ahead log (WAL)** for fast, durable commits
-- **WASM support** via Origin Private File System (OPFS)
-- **Production-ready crash recovery** with comprehensive error handling
+Manifold is a fork of [redb](https://github.com/cberner/redb) v3.1.1 by Christopher Berner, extended with production features for high-concurrency workloads.
 
-Built on redb's solid foundation of copy-on-write B-trees, Manifold adds the architecture needed for high-concurrency workloads while maintaining full ACID guarantees.
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Manifold SQL](#manifold-sql)
+- [Additions Over redb](#additions-over-redb)
+- [Column Families](#column-families)
+- [Write-Ahead Log (WAL)](#write-ahead-log-wal)
+- [Deferred Flush](#deferred-flush)
+- [Performance](#performance)
+- [WASM Support](#wasm-support)
+- [Documentation](#documentation)
+- [Development](#development)
+- [Credits](#credits)
+- [License](#license)
 
 ---
 
 ## Quick Start
 
-### Basic Usage
+### Key-Value API
 
 ```rust
 use manifold::{Database, ReadableTable, TableDefinition};
@@ -36,210 +47,156 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let read_txn = db.begin_read()?;
     let table = read_txn.open_table(TABLE)?;
     assert_eq!(table.get("my_key")?.unwrap().value(), 123);
-
     Ok(())
 }
 ```
 
-### Column Families Example
+### Column Families
 
 ```rust
 use manifold::column_family::ColumnFamilyDatabase;
 use manifold::TableDefinition;
 
 const USERS: TableDefinition<u64, &str> = TableDefinition::new("users");
-const PRODUCTS: TableDefinition<u64, &str> = TableDefinition::new("products");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Single file, multiple independent databases
     let db = ColumnFamilyDatabase::builder().open("app.manifold")?;
-
-    // Auto-create column families on first access
     let users_cf = db.column_family_or_create("users")?;
-    let products_cf = db.column_family_or_create("products")?;
 
-    // Concurrent writes to different column families
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let txn = users_cf.begin_write()?;
-            let mut table = txn.open_table(USERS)?;
-            table.insert(&1, &"alice")?;
-            txn.commit()
-        });
+    let txn = users_cf.begin_write()?;
+    let mut table = txn.open_table(USERS)?;
+    table.insert(&1, &"alice")?;
+    drop(table);
+    txn.commit()?;
+    Ok(())
+}
+```
 
-        s.spawn(|| {
-            let txn = products_cf.begin_write()?;
-            let mut table = txn.open_table(PRODUCTS)?;
-            table.insert(&100, &"laptop")?;
-            txn.commit()
-        });
-    });
+### SQL
 
+```rust
+use manifold_sql::Database;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open("app.db")?;
+
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", &[])?;
+    db.execute("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)", &[])?;
+
+    let result = db.query("SELECT name, age FROM users WHERE id = 1", &[])?;
+    println!("{}: {}", result.rows()[0].get::<String>(0)?, result.rows()[0].get::<i64>(1)?);
     Ok(())
 }
 ```
 
 ---
 
-## Features
+## Manifold SQL
 
-### Core Features (from redb)
-- ✅ **Zero-copy**, thread-safe `BTreeMap`-based API
-- ✅ **Fully ACID-compliant** transactions with snapshot isolation
-- ✅ **MVCC** support for concurrent readers and writers without blocking
-- ✅ **Crash-safe by default** with automatic recovery
-- ✅ **Savepoints and rollbacks** for transaction control
-- ✅ **Stable file format** with upgrade paths
+`manifold-sql` is an embedded SQL engine built on Manifold's column family backend. It provides a familiar SQL interface over the high-performance B-tree storage.
 
-### Manifold Extensions
-- 🚀 **Column Families**: Multiple independent databases in a single file with concurrent write transactions
-- ⚡ **Write-Ahead Log (WAL)**: Fast durable commits (~0.5ms vs ~5ms) with group commit batching
-- 🌐 **WASM Support**: Full database functionality in browsers via OPFS (Chrome 102+, Edge 102+)
-- 🛡️ **Production Error Handling**: Comprehensive error messages, troubleshooting guides, and recovery procedures
-- 📊 **Crash Recovery Testing**: Process-based crash injection tests validate WAL replay correctness
+**Crate:** [`crates/manifold-sql`](crates/manifold-sql)
 
----
+### Supported SQL
 
-## Performance
+| Category | Features |
+|----------|----------|
+| **DDL** | CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX, DROP INDEX |
+| **DML** | INSERT, UPDATE, DELETE, SELECT |
+| **Queries** | WHERE, ORDER BY, GROUP BY, HAVING, LIMIT/OFFSET, DISTINCT |
+| **Joins** | INNER, LEFT, RIGHT, CROSS (hash join for equi-joins) |
+| **Aggregates** | COUNT, SUM, AVG, MIN, MAX |
+| **Subqueries** | IN, EXISTS, derived tables, scalar subqueries |
+| **Transactions** | BEGIN, COMMIT, ROLLBACK, SAVEPOINT |
+| **Types** | INTEGER, BIGINT, SMALLINT, REAL, TEXT, VARCHAR(n), BOOLEAN, DATE, TIMESTAMP, UUID, JSON, BLOB, DECIMAL |
+| **Other** | Prepared statements, EXPLAIN/ANALYZE, UNION/UNION ALL |
 
-### Manifold vs Vanilla redb 3.1.0
+### Optimizer
 
-**Concurrent Writes** (the killer feature):
+The query optimizer includes:
+- **Rowid direct lookup**: `WHERE pk = $1` does O(1) B-tree key access
+- **Rowid range scan**: `WHERE pk BETWEEN $1 AND $2` uses B-tree range iteration
+- **Index selection**: Secondary indexes for non-PK equality predicates
+- **Hash join**: O(n+m) for equi-join conditions (vs O(n*m) nested loop)
+- **Statement cache**: Repeated queries skip parse/bind/plan/optimize
+- **Predicate pushdown**, constant folding, join reordering
 
-| Threads | Manifold      | redb 2.6     | Speedup |
-|---------|---------------|--------------|---------|
-| 2       | 189K ops/sec  | 75K ops/sec  | **2.52x** |
-| 4       | 293K ops/sec  | 82K ops/sec  | **3.56x** |
-| 8       | **426K ops/sec** | 88K ops/sec  | **4.80x** |
+### Performance vs SQLite
 
-**Why?** Column families enable true parallel writes. Vanilla redb serializes all write transactions.
+Point lookups and range scans are near-parity. Full scans are ~2-3x SQLite due to row materialization overhead (streaming iteration planned).
 
-### WAL Performance
+| Benchmark | Manifold | SQLite | Ratio |
+|-----------|----------|--------|-------|
+| point_lookup (10K rows) | 2.8 us | 1.7 us | 1.6x |
+| range_scan (100 rows from 10K) | 80 us | 35 us | 2.3x |
+| full_scan (1K rows) | 739 us | 316 us | 2.3x |
+| group_by (10K rows) | 6.9 ms | 2.4 ms | 2.8x |
+| single_insert (auto-commit) | 73 us | 8 us | 9x |
+| bulk_insert (1K rows/txn) | 9.5 ms | 725 us | 13x |
+| update_by_pk | 73 us | 2.4 us | 30x |
+| delete_by_pk | 151 us | 15 us | 10x |
 
-| Configuration | Throughput     | Speedup |
-|---------------|----------------|---------|
-| WITH WAL      | 273K ops/sec   | **1.64x** |
-| WITHOUT WAL   | 166K ops/sec   | 1.00x   |
+Reads are near-parity (1.5-2.8x). Writes are 9-30x due to copy-on-write B-tree page mutations + WAL per auto-commit. Bulk writes in explicit transactions amortize this significantly.
 
-**Recovery:** ~326K entries/sec (20,000 entries in ~61ms)
-
-### Read Performance
-
-- **Read-heavy workload**: 6.74M ops/sec (8 concurrent readers)
-- **Mixed workload (50/50 R/W)**: 4.56M ops/sec (16 threads)
-- **Sequential reads**: 4.58M ops/sec
-
-### Comparison vs Other Databases
-
-|                           | manifold   | lmdb        | rocksdb        | sled       | fjall           | sqlite     |
-|---------------------------|------------|-------------|----------------|------------|-----------------|------------|
-| bulk load                 | 47912ms    | **10520ms** | 39093ms        | 41817ms    | 91075ms         | 55585ms    |
-| individual writes         | **51ms**   | 15753ms     | 20816ms        | 11038ms    | 5269ms          | 6803ms     |
-| batch writes              | 1782ms     | 6413ms      | 1355ms         | 2138ms     | **727ms**       | 90617ms    |
-| nosync writes             | 2483ms     | 591141ms    | **295ms**      | 463ms      | 853ms           | 283065ms   |
-| len()                     | **0ms**    | **0ms**     | 1413ms         | 3277ms     | 1525ms          | 66ms       |
-| random reads              | 2653ms     | **1874ms**  | 4202ms         | 2090ms     | 4540ms          | 10131ms    |
-| random reads              | 3097ms     | **1723ms**  | 4070ms         | 2185ms     | 4519ms          | 10382ms    |
-| random range reads        | 2229ms     | **1056ms**  | 5000ms         | 3310ms     | 4148ms          | 19729ms    |
-| random range reads        | 2051ms     | **1057ms**  | 5753ms         | 3450ms     | 4146ms          | 19330ms    |
-| random reads (4 threads)  | 4319ms     | **2059ms**  | 9234ms         | 3280ms     | 5785ms          | 39302ms    |
-| random reads (8 threads)  | 3432ms     | **1207ms**  | 9117ms         | 2126ms     | 3329ms          | 47882ms    |
-| random reads (16 threads) | 2838ms     | **1093ms**  | 8066ms         | 2057ms     | 3321ms          | 66441ms    |
-| random reads (32 threads) | 2866ms     | **1128ms**  | 8173ms         | 2077ms     | 3471ms          | 78306ms    |
-| removals                  | 53881ms    | **7349ms**  | 20050ms        | 15326ms    | 8049ms          | 56281ms    |
-| uncompacted size          | 4.00 GiB   | 2.59 GiB    | 1016.07 MiB    | 2.14 GiB   | **1010.61 MiB** | 1.10 GiB   |
-| compacted size            | N/A        | 1.26 GiB    | **459.17 MiB** | N/A        | 1010.61 MiB     | 562.31 MiB |
-
-Source code for benchmark: [lmdb_benchmark.rs](./crates/manifold-bench/benches/lmdb_benchmark.rs). Results collected on macOS.
-
-**Column Family Concurrent Write Benchmark:**
-
-For a more realistic comparison showcasing column family performance with concurrent writers, see the [cf_comparison_benchmark.rs](./crates/manifold-bench/benches/cf_comparison_benchmark.rs) which compares Manifold, RocksDB (with column families), and Fjall (with partitions) under concurrent write workloads.
-
-> **Note on Benchmarks**: These benchmarks test single-database performance. Manifold's primary advantage is **concurrent writes via column families** (see 4.8x speedup vs vanilla redb above). RocksDB and Fjall also support column families/partitions. For column-family-optimized benchmarks, run `cargo run --release --bin cf_comparison_benchmark`.
-
-### Deferred Flush (Write Optimization)
-
-Manifold offers an opt-in **deferred flush** mode that eliminates B-tree mutation from the commit path. When enabled, writes go to the WAL and an in-memory memtable — the B-tree is updated later by a background checkpoint. This matches the write architecture used by RocksDB and other LSM-based engines.
-
-```rust
-let db = ColumnFamilyDatabase::builder()
-    .deferred_flush(true)  // opt-in, default is false
-    .open("my_db.manifold")?;
-```
-
-**How it works:**
-- `insert()` / `remove()` append to the WAL and merge into a shared in-memory memtable — no B-tree pages are read, copied, or written
-- `commit()` cost is one sequential WAL write + one in-memory merge
-- `get()` checks the memtable first, then falls through to the B-tree (read-your-own-writes)
-- A background checkpoint periodically drains the memtable into the B-tree in sorted key order
-
-**Manifold vs RocksDB** (8-byte keys, 100-byte values, 1000-key batches):
-
-| Workload | Scale | Manifold | RocksDB | Ratio |
-|----------|-------|----------|---------|-------|
-| **Sequential Write** | 100K | 214K ops/s | 687K ops/s | 0.31x |
-| | 1M | 185K ops/s | 646K ops/s | 0.29x |
-| | 2M | 199K ops/s | 653K ops/s | 0.30x |
-| **Random Write** | 100K | 197K ops/s | 354K ops/s | 0.56x |
-| | 1M | 163K ops/s | 277K ops/s | 0.59x |
-| | 2M | 164K ops/s | 269K ops/s | 0.61x |
-| **Point Read** | 100K | 2.91M ops/s | 1.02M ops/s | **2.86x** |
-| | 1M | 1.83M ops/s | 507K ops/s | **3.62x** |
-| **Range Scan** | 100K | (B-tree advantage) | | |
-
-**Key takeaways:**
-- RocksDB's LSM tree wins on raw write throughput (~3x sequential, ~1.7x random) due to its append-only architecture
-- Manifold wins on reads (**2-3.6x faster** point lookups up to 5M keys) thanks to B-tree's single root-to-leaf traversal vs RocksDB's multi-level search
-- With deferred flush, Manifold's random write gap is **stable across scale** (~0.6x) instead of degrading (was 0.09x at 10M without deferred flush)
-- Manifold's column family isolation provides additional write scaling not shown in single-table benchmarks
-
-Source: [rocksdb_comparison.rs](./crates/manifold-bench/benches/rocksdb_comparison.rs)
+Source: [`crates/manifold-sql/benches/sqlite_comparison.rs`](crates/manifold-sql/benches/sqlite_comparison.rs)
 
 ---
 
-## Column Families Architecture
+## Additions Over redb
 
-### What Are Column Families?
+Manifold is forked from redb v3.1.1. Here is everything we've added:
 
-Column families allow multiple independent redb databases to coexist in a single physical file. Each column family:
-- Has its own B-tree root and transaction isolation
-- Supports independent write transactions (no cross-CF locking)
-- Maintains ACID guarantees within the column family
-- Shares the same file with other column families
+### Column Family Architecture
+Independent databases within a single file, each with its own B-tree root, transaction isolation, and write lock. Enables true concurrent writes across domains (users, products, orders). 4.8x write throughput at 8 threads vs vanilla redb's serial writes.
 
-### When to Use Column Families
+### Write-Ahead Log (WAL)
+Sequential log for fast durable commits (~0.5ms vs ~5ms without). Group commit batches concurrent fsyncs. Automatic crash recovery on open (~300K entries/sec replay).
 
-✅ **Good fit:**
-- Multi-tenant applications (one CF per tenant)
-- Domain separation (users, products, orders as separate CFs)
-- Concurrent write workloads where different threads write to different data domains
-- Scenarios where you'd otherwise use multiple database files
+### Deferred Flush Memtable
+Opt-in mode where writes skip B-tree mutation entirely, going to WAL + in-memory memtable. Background checkpoint drains to B-tree. Closes the random write gap with RocksDB from 0.09x to 0.6x.
 
-❌ **Not needed:**
-- Single-threaded write workloads
-- Cross-domain transactions (use tables within a single CF instead)
-- Simple key-value storage (vanilla redb is simpler)
+### Merge Iterator
+`Table::range()` and `ReadOnlyTable::range()` merge B-tree entries with memtable entries in correct key order using `K::compare()`. Handles tombstones, key deduplication, and range-bound filtering. Enables deferred flush mode for read-heavy workloads.
 
-### Architecture Details
+### SQL Engine (`manifold-sql`)
+Full SQL engine with parser, binder, planner, optimizer, and executor. 230+ tests. Prepared statements, subqueries, transactions, constraints, indexes. See [Manifold SQL](#manifold-sql) above.
+
+### Domain-Specific Crates
+- **`manifold-graph`** — Graph database built on Manifold (nodes, edges, traversals)
+- **`manifold-timeseries`** — Time-series storage with downsampling and retention policies
+- **`manifold-vectors`** — Vector similarity search (cosine, euclidean, dot product)
+
+### Upstream Sync
+Merged redb v3.1.1 through `upstream/master` (89 commits) including 14 bug fixes, 13 perf improvements, `Table::entry()` API, `PageResolver` abstraction, and `retain`/`extract_if` optimization.
+
+### Other Improvements
+- WASM/OPFS backend for browser support
+- Production error handling with comprehensive messages and recovery procedures
+- Process-based crash recovery tests
+- Savepoint bug fix (`restore_savepoint()` clearing `pending_table_updates`)
+- Write buffer (`insert_buffered`/`remove_buffered`) for batch operations
+
+---
+
+## Column Families
+
+Column families allow multiple independent databases to coexist in a single file. Each column family has its own B-tree root and write lock, enabling concurrent writes without cross-domain contention.
 
 ```
-┌─────────────────────────────────────────┐
-│         app.manifold (single file)      │
-├─────────────────────────────────────────┤
-│  Master Header (CRC-protected)          │
-├─────────────────────────────────────────┤
-│  Column Family "users"    (1GB)         │
-│  - Independent redb instance            │
-│  - Own transaction isolation            │
-├─────────────────────────────────────────┤
-│  Column Family "products" (512MB)       │
-│  - Concurrent writes with "users"       │
-│  - Own transaction isolation            │
-├─────────────────────────────────────────┤
-│  Column Family "orders"   (2GB)         │
-│  - Independent write transactions       │
-└─────────────────────────────────────────┘
++----------------------------------------------+
+|          app.manifold (single file)          |
++----------------------------------------------+
+|  Master Header (CRC-protected)               |
++----------------------------------------------+
+|  Column Family "users"    (1GB segment)      |
+|  - Own B-tree, own write lock                |
++----------------------------------------------+
+|  Column Family "products" (512MB segment)    |
+|  - Concurrent writes with "users"            |
++----------------------------------------------+
+|  Column Family "orders"   (2GB segment)      |
+|  - Independent transaction isolation         |
++----------------------------------------------+
 ```
 
 See [docs/design.md](docs/design.md) for implementation details.
@@ -248,41 +205,63 @@ See [docs/design.md](docs/design.md) for implementation details.
 
 ## Write-Ahead Log (WAL)
 
-### Why WAL?
+WAL appends commit records sequentially and fsyncs once, instead of fsyncing the entire B-tree. Group commit batches concurrent transactions into a single fsync.
 
-Traditional databases fsync the entire B-tree on every commit (~5ms). WAL appends commit records to a sequential log and fsyncs only that (~0.5ms), giving **~10x faster commits**.
+| Configuration | Commit Latency | Throughput |
+|---------------|----------------|------------|
+| With WAL | ~0.5ms | 273K ops/sec |
+| Without WAL | ~5ms | 166K ops/sec |
+| Recovery | | ~326K entries/sec |
 
-### Performance Characteristics
+See [docs/wal_design.md](docs/wal_design.md) and [docs/recovery_guarantees.md](docs/recovery_guarantees.md).
 
-- **Commit latency**: ~0.5ms (WAL) vs ~5ms (no WAL)
-- **Throughput**: 250K ops/sec @ 8 threads with WAL enabled
-- **Group commit**: Batches concurrent commits into single fsync
-- **Recovery**: Automatic on database open (~300K entries/sec)
+---
 
-### Durability Modes
+## Deferred Flush
+
+Opt-in mode where writes skip B-tree mutation, going to WAL + in-memory memtable. A background checkpoint drains the memtable to the B-tree in sorted order.
 
 ```rust
-use manifold::Durability;
-
-let txn = db.begin_write()?;
-// ...
-
-// Default: fsync on commit (data survives crashes)
-txn.set_durability(Durability::Immediate)?;
-txn.commit()?;
-
-// Fast path: no fsync (data may be lost on crash)
-txn.set_durability(Durability::None)?;
-txn.commit()?;
+let db = ColumnFamilyDatabase::builder()
+    .deferred_flush(true)
+    .open("my_db.manifold")?;
 ```
 
-### Recovery Guarantees
+**Manifold vs RocksDB** (deferred flush enabled, 2M keys):
 
-- ✅ Committed transactions with `Durability::Immediate`: **Survive crashes**
-- ⚠️ Committed transactions with `Durability::None`: **May be lost** (depends on checkpoint)
-- ❌ Uncommitted transactions: **Always lost** (expected ACID behavior)
+| Workload | Manifold | RocksDB | Ratio |
+|----------|----------|---------|-------|
+| Sequential Write | 199K ops/s | 653K ops/s | 0.30x |
+| Random Write | 164K ops/s | 269K ops/s | 0.61x |
+| Point Read | 1.83M ops/s | 507K ops/s | **3.62x** |
 
-See [docs/recovery_guarantees.md](docs/recovery_guarantees.md) for detailed recovery semantics.
+Source: [rocksdb_comparison.rs](./crates/manifold-bench/benches/rocksdb_comparison.rs)
+
+---
+
+## Performance
+
+### Manifold vs Vanilla redb
+
+**Concurrent Writes** (the killer feature):
+
+| Threads | Manifold | redb | Speedup |
+|---------|----------|------|---------|
+| 2 | 189K ops/sec | 75K ops/sec | **2.52x** |
+| 4 | 293K ops/sec | 82K ops/sec | **3.56x** |
+| 8 | **426K ops/sec** | 88K ops/sec | **4.80x** |
+
+### Manifold vs Other Databases
+
+|                           | manifold   | lmdb        | rocksdb        | sled       | fjall           | sqlite     |
+|---------------------------|------------|-------------|----------------|------------|-----------------|------------|
+| bulk load                 | 47912ms    | **10520ms** | 39093ms        | 41817ms    | 91075ms         | 55585ms    |
+| individual writes         | **51ms**   | 15753ms     | 20816ms        | 11038ms    | 5269ms          | 6803ms     |
+| batch writes              | 1782ms     | 6413ms      | 1355ms         | 2138ms     | **727ms**       | 90617ms    |
+| random reads              | 2653ms     | **1874ms**  | 4202ms         | 2090ms     | 4540ms          | 10131ms    |
+| random range reads        | 2229ms     | **1056ms**  | 5000ms         | 3310ms     | 4148ms          | 19729ms    |
+
+Source: [lmdb_benchmark.rs](./crates/manifold-bench/benches/lmdb_benchmark.rs)
 
 ---
 
@@ -291,186 +270,48 @@ See [docs/recovery_guarantees.md](docs/recovery_guarantees.md) for detailed reco
 Manifold runs in browsers using the Origin Private File System (OPFS):
 
 ```javascript
-// worker.js
 import init, { WasmDatabase } from './manifold.js';
-
 await init();
 const db = await WasmDatabase.new("app.db");
 const cf = db.column_family_or_create("users");
-
-// Write data
 cf.write("user_1", "alice");
-
-// Read data
-const value = cf.read("user_1");
-console.log(value); // "alice"
 ```
 
-**Requirements:**
-- Modern browser (Chrome 102+, Edge 102+)
-- Web Worker context (OPFS sync access requirement)
-- HTTPS or localhost (secure context)
-
-**Performance:** Same as native (OPFS provides synchronous file access in workers)
-
-See [examples/wasm/](examples/wasm/) for complete examples.
+Requirements: Chrome 102+ / Edge 102+, Web Worker context, HTTPS.
 
 ---
 
 ## Documentation
 
-### Guides
-- [Design Document](docs/design.md) - Architecture and implementation details
-- [WAL Design](docs/wal_design.md) - Write-ahead log implementation
-- [Recovery Guarantees](docs/recovery_guarantees.md) - Crash recovery and durability semantics
-- [Troubleshooting Guide](TROUBLESHOOTING.md) - Common errors and solutions
-
-### Examples
-- [Column Families](examples/column_families.rs) - Multi-tenant and domain separation
-- [Error Handling](examples/error_handling.rs) - Production error handling patterns
-- [WAL Comparison](examples/wal_comparison.rs) - WAL vs no-WAL performance
-- [WASM Usage](examples/wasm/) - Browser database with OPFS
-
-### API Documentation
-- Coming soon: docs.rs link once published
-
----
-
-## Error Handling
-
-Manifold provides comprehensive error handling with clear messages:
-
-```rust
-use manifold::column_family::ColumnFamilyDatabase;
-
-match ColumnFamilyDatabase::open("data.manifold") {
-    Ok(db) => { /* use database */ }
-    Err(e) => {
-        eprintln!("Database error: {}", e);
-        // Error includes context: corruption details, I/O errors, etc.
-        // See TROUBLESHOOTING.md for recovery procedures
-    }
-}
-```
-
-**Error categories:**
-- Storage errors (corruption, I/O, disk full)
-- Table errors (type mismatches, missing tables)
-- Transaction errors (conflicts, isolation violations)
-- Column family errors (not found, already exists)
-
-See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for common issues and solutions.
-
----
-
-## Testing
-
-Manifold includes comprehensive test coverage:
-
-- **98 unit tests**: Core functionality
-- **9 crash recovery tests**: Process-based crash injection validates WAL replay
-- **Multiple benchmark suites**: Performance validation
-
-**Run tests:**
-```bash
-cargo test --lib                      # Unit tests
-cargo test --test crash_recovery_tests # Crash injection tests (Unix/macOS)
-```
-
-**Run benchmarks:**
-```bash
-cargo run --release --bin lmdb_benchmark           # vs other databases
-cargo run --release --bin redb_comparison_benchmark # vs vanilla redb
-cargo bench                                         # criterion benchmarks
-```
-
----
-
-## Production Readiness
-
-Manifold is production-ready with:
-
-- ✅ **Stable file format** (inherited from redb)
-- ✅ **Comprehensive error handling** (Phase 2 complete)
-- ✅ **Crash recovery validation** (process-based crash tests)
-- ✅ **Clear documentation** (guides, examples, troubleshooting)
-- ✅ **Performance benchmarks** (validated against redb and competitors)
-- ✅ **WASM support** (full functionality in browsers)
-
-**Known limitations:**
-- Column families are auto-created; manual sizing planned for v3.2
-- WAL checkpointing is time/size-based; manual checkpoint API planned
-- No replication or distributed features (single-process database)
-
-See [FINALIZATION_PLAN.md](FINALIZATION_PLAN.md) for roadmap.
-
----
-
-## Credits
-
-Manifold is a fork of [redb](https://github.com/cberner/redb) by Christopher Berner.
-
-**Original redb features:**
-- Copy-on-write B-tree implementation
-- ACID transactions with MVCC
-- Zero-copy reads
-- Savepoints and recovery
-
-**Manifold additions:**
-- Column family architecture by Tom (Hyperspatial)
-- Write-ahead log implementation
-- WASM/OPFS backend
-- Production error handling and crash recovery
-
-We're deeply grateful to Christopher Berner for creating redb and maintaining it as a high-quality, production-ready embedded database. Manifold builds on that solid foundation.
-
----
-
-## License
-
-Licensed under either of:
-
-* [Apache License, Version 2.0](LICENSE-APACHE)
-* [MIT License](LICENSE-MIT)
-
-at your option.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+- [Design Document](docs/design.md) — Architecture and implementation details
+- [WAL Design](docs/wal_design.md) — Write-ahead log implementation
+- [Recovery Guarantees](docs/recovery_guarantees.md) — Crash recovery and durability semantics
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — Common errors and solutions
+- [SpinStack Integration](docs/spinstack-integration-guide.md) — Using Manifold in SpinStack
 
 ---
 
 ## Development
 
-### Building from Source
-
 ```bash
-git clone https://github.com/hyperbasedev/manifold
-cd manifold
 cargo build --release
+just test                    # clippy + fmt + deny + full test suite
+just test_all                # includes workspace crates
+cargo bench -p manifold-sql  # SQL benchmarks
 ```
 
-### Running Tests
-
-```bash
-cargo test --all-targets
-cargo clippy --all-targets
-```
-
-### Extra Development Dependencies
-
-For benchmarking and fuzzing:
-```bash
-cargo install cargo-deny --locked
-cargo install cargo-fuzz --locked
-```
-
-For WASM development:
-```bash
-cargo install wasm-pack
-```
+See [AGENTS.md](AGENTS.md) for detailed development setup and conventions.
 
 ---
 
-**Status:** Stable and actively maintained. Phase 2 (Production Error Handling) complete. Phase 3 (API Polish) in progress.
+## Credits
+
+Manifold is a fork of [redb](https://github.com/cberner/redb) by Christopher Berner. We're deeply grateful for his work creating and maintaining redb as a high-quality, production-ready embedded database.
+
+**Original redb foundation:** Copy-on-write B-tree, ACID transactions with MVCC, zero-copy reads, savepoints and recovery, stable file format.
+
+---
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.
