@@ -280,6 +280,11 @@ pub enum LogicalPlan {
         rowid_expr: ScalarExpr,
         assignments: Vec<(usize, ScalarExpr)>,
     },
+    /// Direct rowid DELETE — finds the row by PK and removes it.
+    RowidDelete {
+        table_name: String,
+        rowid_expr: ScalarExpr,
+    },
     /// An empty plan (no rows, no schema).
     Empty,
     /// BEGIN TRANSACTION.
@@ -317,6 +322,7 @@ impl LogicalPlan {
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
             | LogicalPlan::RowidUpdate { .. }
+            | LogicalPlan::RowidDelete { .. }
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }

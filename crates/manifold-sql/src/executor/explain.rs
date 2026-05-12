@@ -67,6 +67,16 @@ fn format_node(plan: &LogicalPlan, depth: usize, out: &mut String) {
                 format_expr_brief(rowid_expr)
             ));
         }
+        LogicalPlan::RowidDelete {
+            table_name,
+            rowid_expr,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pfx}RowidDelete {table_name} [{}]\n",
+                format_expr_brief(rowid_expr)
+            ));
+        }
         LogicalPlan::Filter { predicate, input } => {
             out.push_str(&format!("{pfx}Filter ({})\n", format_expr_brief(predicate)));
             format_node(input, depth + 1, out);

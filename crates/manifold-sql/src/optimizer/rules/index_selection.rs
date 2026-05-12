@@ -186,6 +186,12 @@ fn select_plan(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
             input,
         } => {
             let input = select_plan(*input, catalog)?;
+            if let LogicalPlan::RowidLookup { rowid_expr, .. } = &input {
+                return Ok(LogicalPlan::RowidDelete {
+                    table_name,
+                    rowid_expr: rowid_expr.clone(),
+                });
+            }
             Ok(LogicalPlan::Delete {
                 table_id,
                 table_name,
