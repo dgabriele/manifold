@@ -21,6 +21,8 @@ members = [
     "crates/manifold-graph",
     "crates/manifold-timeseries", "crates/manifold-properties",
     "crates/manifold-sql",
+    "crates/spinstack-store",
+    "crates/spinstack-store-macros",
 ]
 default-members = [".", "crates/manifold-derive"]
 
