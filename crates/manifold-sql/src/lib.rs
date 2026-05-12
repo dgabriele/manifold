@@ -440,7 +440,6 @@ impl Database {
         let catalog = self.catalog.lock().unwrap();
         let optimized = Arc::unwrap_or_clone(self.compile_cached(sql, &catalog)?);
 
-        // If there's an active explicit transaction, flush dirty tables then query.
         let mut active = self.active_txn.lock().unwrap();
         if let Some(state) = active.as_mut() {
             executor::flush_dirty_tables(&state.write_txn, &mut state.dirty_tables)?;
