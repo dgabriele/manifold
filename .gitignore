@@ -42,3 +42,4 @@ flamegraph.svg
 credentials.json
 secrets.json
 .worktrees/
+crates/manifold-bench/.benchmark_rocksdb_comparison/
