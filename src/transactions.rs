@@ -1836,6 +1836,7 @@ impl WriteTransaction {
         let all_ops: Vec<(String, WALOp)> =
             std::mem::take(&mut *self.pending_deferred_ops.lock().unwrap());
 
+
         if all_ops.is_empty() {
             // Nothing to commit
             return Ok(());

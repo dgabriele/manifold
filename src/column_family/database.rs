@@ -393,10 +393,7 @@ impl ColumnFamilyDatabase {
             for entry in entries_for_cf {
                 match &entry.payload {
                     super::wal::entry::WALPayload::LogicalOps(payload) => {
-                        // Replay LogicalOps into the shared memtable. The B-tree
-                        // metadata (table definitions) is restored by Transaction
-                        // entries; LogicalOps carry only data that lives in the
-                        // memtable until the next checkpoint flushes it to B-tree.
+                        // Replay LogicalOps into the shared memtable.
                         if let Some(cf_state) = column_families.get(cf_name)
                             && let Some(memtable) = &cf_state.memtable
                         {
@@ -576,7 +573,7 @@ impl ColumnFamilyDatabase {
                 .read_from(0)
                 .map_err(|e| DatabaseError::Storage(StorageError::from(e)))?;
 
-            if !entries.is_empty() {
+                if !entries.is_empty() {
                 Self::perform_wal_recovery(&column_families, &handle_pool, &journal)?;
             }
 
