@@ -530,10 +530,7 @@ pub struct CountScan {
 }
 
 impl CountScan {
-    pub fn from_read_txn(
-        txn: &manifold::ReadTransaction,
-        table_name: &str,
-    ) -> Result<Self> {
+    pub fn from_read_txn(txn: &manifold::ReadTransaction, table_name: &str) -> Result<Self> {
         let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
         let count = match txn.open_table(def) {
@@ -544,10 +541,7 @@ impl CountScan {
         Ok(Self { count: Some(count) })
     }
 
-    pub fn from_write_txn(
-        txn: &manifold::WriteTransaction,
-        table_name: &str,
-    ) -> Result<Self> {
+    pub fn from_write_txn(txn: &manifold::WriteTransaction, table_name: &str) -> Result<Self> {
         let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
         let table = txn.open_table(def)?;

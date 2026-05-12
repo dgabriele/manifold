@@ -322,9 +322,7 @@ impl super::Executor for HashJoinExecutor {
 
             // Finished all matches for the current left row.
             // For LEFT join, if no matches were found, emit left + NULLs.
-            if self.current_left.is_some()
-                && self.join_type == JoinType::Left
-                && !self.left_matched
+            if self.current_left.is_some() && self.join_type == JoinType::Left && !self.left_matched
             {
                 let left_row = self.current_left.take().unwrap();
                 let row = self.left_with_nulls(&left_row);
@@ -336,11 +334,7 @@ impl super::Executor for HashJoinExecutor {
                 Some(left_row) => {
                     // Probe the hash table with the left key.
                     let key = hash_key(&left_row[self.left_key_idx]);
-                    self.current_matches = self
-                        .hash_table
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_default();
+                    self.current_matches = self.hash_table.get(&key).cloned().unwrap_or_default();
                     // NULL keys should never match (SQL semantics: NULL != NULL).
                     if left_row[self.left_key_idx] == Value::Null {
                         self.current_matches.clear();
