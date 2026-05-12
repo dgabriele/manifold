@@ -197,12 +197,15 @@ struct ActiveTransaction {
 /// write performance (group commit batching, sequential I/O).
 pub struct Database {
     /// Column family database (WAL-enabled).
-    _cf_db: manifold::column_family::ColumnFamilyDatabase,
+    cf_db: manifold::column_family::ColumnFamilyDatabase,
     /// The single column family used for all SQL data.
     cf: manifold::column_family::ColumnFamily,
     catalog: Arc<Mutex<Catalog>>,
     /// Active SQL-level transaction started via BEGIN.
     active_txn: Mutex<Option<ActiveTransaction>>,
+    /// Statement cache: SQL string → optimized plan.
+    /// Avoids re-parsing/planning/optimizing repeated queries.
+    stmt_cache: Mutex<HashMap<String, LogicalPlan>>,
 }
 
 impl Database {
@@ -213,14 +216,14 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let cf_db = manifold::column_family::ColumnFamilyDatabase::builder()
             .pool_size(64) // WAL enabled (group commit batching)
-            // Note: deferred_flush(true) would further improve write perf but requires
-            // merge iterators in Table::range() for correct memtable visibility.
-            // See docs/deferred-flush-todo.md for the path forward.
+            // deferred_flush is available but not default — it improves random write
+            // throughput but adds merge-iterator overhead to reads. Enable for
+            // write-heavy workloads once per-table deferred flush is implemented.
             .open(path)?;
 
-        let cf = cf_db.column_family_or_create("default").map_err(|e| {
-            SqlError::Internal(format!("failed to open column family: {e}"))
-        })?;
+        let cf = cf_db
+            .column_family_or_create("default")
+            .map_err(|e| SqlError::Internal(format!("failed to open column family: {e}")))?;
 
         // Check if system tables exist.
         let needs_init = {
@@ -240,35 +243,95 @@ impl Database {
         let catalog = catalog::persist::load_catalog(&read_txn)?;
 
         Ok(Self {
-            _cf_db: cf_db,
+            cf_db,
             cf,
             catalog: Arc::new(Mutex::new(catalog)),
             active_txn: Mutex::new(None),
+            stmt_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Compile SQL to an optimized plan, using the cache for repeated queries.
+    fn compile_cached(&self, sql: &str, catalog: &Catalog) -> Result<LogicalPlan> {
+        // Check cache first
+        {
+            let cache = self.stmt_cache.lock().unwrap();
+            if let Some(plan) = cache.get(sql) {
+                return Ok(plan.clone());
+            }
+        }
+
+        // Cache miss — parse, bind, plan, optimize
+        let stmts = parser::parse(sql)?;
+        let stmt = stmts
+            .first()
+            .ok_or_else(|| SqlError::Parse("empty SQL".into()))?;
+        let dummy_params: Vec<Value> = vec![Value::Null; count_params(stmt)];
+        let bound = binder::bind(catalog, stmt, &dummy_params)?;
+        let plan = planner::plan(catalog, &bound)?;
+        let optimized = optimizer::optimize(plan, catalog)?;
+
+        // Only cache non-DDL plans (DML + queries)
+        if !matches!(
+            optimized,
+            LogicalPlan::CreateTable { .. }
+                | LogicalPlan::DropTable { .. }
+                | LogicalPlan::AlterTable { .. }
+                | LogicalPlan::CreateIndex { .. }
+                | LogicalPlan::DropIndex { .. }
+                | LogicalPlan::BeginTransaction
+                | LogicalPlan::CommitTransaction
+                | LogicalPlan::RollbackTransaction
+                | LogicalPlan::Savepoint { .. }
+                | LogicalPlan::ReleaseSavepoint { .. }
+                | LogicalPlan::RollbackToSavepoint { .. }
+        ) {
+            let mut cache = self.stmt_cache.lock().unwrap();
+            if cache.len() < 256 {
+                cache.insert(sql.to_string(), optimized.clone());
+            }
+        }
+
+        Ok(optimized)
+    }
+
+    /// Invalidate the statement cache (e.g., after DDL changes).
+    fn invalidate_cache(&self) {
+        self.stmt_cache.lock().unwrap().clear();
+    }
+
+    /// Force a WAL checkpoint, flushing memtable data to the B-tree.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.cf_db
+            .checkpoint()
+            .map_err(|e| SqlError::Internal(format!("checkpoint error: {e}")))
     }
 
     /// Execute a mutating SQL statement. Returns the number of rows affected.
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
         use planner::plan::LogicalPlan;
 
-        let stmts = parser::parse(sql)?;
-        let stmt = stmts
-            .first()
-            .ok_or_else(|| SqlError::Parse("empty SQL".into()))?;
-
         let mut catalog = self.catalog.lock().unwrap();
-        let bound = binder::bind(&catalog, stmt, params)?;
-        let plan = planner::plan(&catalog, &bound)?;
-        let optimized = optimizer::optimize(plan, &catalog)?;
+        let optimized = self.compile_cached(sql, &catalog)?;
+
+        // DDL invalidates the statement cache
+        if matches!(
+            optimized,
+            LogicalPlan::CreateTable { .. }
+                | LogicalPlan::DropTable { .. }
+                | LogicalPlan::AlterTable { .. }
+                | LogicalPlan::CreateIndex { .. }
+                | LogicalPlan::DropIndex { .. }
+        ) {
+            self.invalidate_cache();
+        }
 
         // Handle transaction-control plans at the Database level.
         match &optimized {
             LogicalPlan::BeginTransaction => {
                 let mut active = self.active_txn.lock().unwrap();
                 if active.is_some() {
-                    return Err(SqlError::Transaction(
-                        "transaction already active".into(),
-                    ));
+                    return Err(SqlError::Transaction("transaction already active".into()));
                 }
                 let write_txn = self.cf.begin_write()?;
                 *active = Some(ActiveTransaction {
@@ -280,9 +343,9 @@ impl Database {
             }
             LogicalPlan::CommitTransaction => {
                 let mut active = self.active_txn.lock().unwrap();
-                let mut state = active.take().ok_or_else(|| {
-                    SqlError::Transaction("no active transaction".into())
-                })?;
+                let mut state = active
+                    .take()
+                    .ok_or_else(|| SqlError::Transaction("no active transaction".into()))?;
                 // Flush all dirty tables before committing.
                 executor::flush_dirty_tables(&state.write_txn, &mut state.dirty_tables)?;
                 state.write_txn.commit()?;
@@ -290,9 +353,9 @@ impl Database {
             }
             LogicalPlan::RollbackTransaction => {
                 let mut active = self.active_txn.lock().unwrap();
-                let state = active.take().ok_or_else(|| {
-                    SqlError::Transaction("no active transaction".into())
-                })?;
+                let state = active
+                    .take()
+                    .ok_or_else(|| SqlError::Transaction("no active transaction".into()))?;
                 let _ = state.write_txn.abort();
                 return Ok(0);
             }
@@ -301,9 +364,10 @@ impl Database {
                 let state = active.as_mut().ok_or_else(|| {
                     SqlError::Transaction("SAVEPOINT requires an active transaction".into())
                 })?;
-                let sp = state.write_txn.ephemeral_savepoint().map_err(|e| {
-                    SqlError::Transaction(format!("savepoint error: {e}"))
-                })?;
+                let sp = state
+                    .write_txn
+                    .ephemeral_savepoint()
+                    .map_err(|e| SqlError::Transaction(format!("savepoint error: {e}")))?;
                 state.savepoints.insert(name.clone(), sp);
                 return Ok(0);
             }
@@ -330,9 +394,10 @@ impl Database {
                 let sp = state.savepoints.get(name).ok_or_else(|| {
                     SqlError::Transaction(format!("savepoint '{}' does not exist", name))
                 })?;
-                state.write_txn.restore_savepoint(sp).map_err(|e| {
-                    SqlError::Transaction(format!("restore savepoint error: {e}"))
-                })?;
+                state
+                    .write_txn
+                    .restore_savepoint(sp)
+                    .map_err(|e| SqlError::Transaction(format!("restore savepoint error: {e}")))?;
                 return Ok(0);
             }
             _ => {}
@@ -360,15 +425,8 @@ impl Database {
 
     /// Execute a query and return the result set.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
-        let stmts = parser::parse(sql)?;
-        let stmt = stmts
-            .first()
-            .ok_or_else(|| SqlError::Parse("empty SQL".into()))?;
-
         let catalog = self.catalog.lock().unwrap();
-        let bound = binder::bind(&catalog, stmt, params)?;
-        let plan = planner::plan(&catalog, &bound)?;
-        let optimized = optimizer::optimize(plan, &catalog)?;
+        let optimized = self.compile_cached(sql, &catalog)?;
 
         // If there's an active explicit transaction, flush dirty tables then query.
         let mut active = self.active_txn.lock().unwrap();
@@ -657,7 +715,9 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if !self.finished && let Some(txn) = self.txn.take() {
+        if !self.finished
+            && let Some(txn) = self.txn.take()
+        {
             let _ = txn.abort();
         }
     }
