@@ -69,6 +69,9 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE posts (id INTEGER PRIMARY KEY, author_id INTEGER, content TEXT, created_at INTEGER)",
     "CREATE TABLE comments (id INTEGER PRIMARY KEY, post_id INTEGER, author_id INTEGER, body TEXT, created_at INTEGER)",
     "CREATE TABLE likes (id INTEGER PRIMARY KEY, post_id INTEGER, user_id INTEGER)",
+    "CREATE INDEX idx_posts_author ON posts (author_id)",
+    "CREATE INDEX idx_comments_post ON comments (post_id)",
+    "CREATE INDEX idx_likes_post ON likes (post_id)",
 ];
 
 const RUN_DURATION: Duration = Duration::from_secs(10);
@@ -299,7 +302,7 @@ fn run_op_manifold(db: &ManifoldDb, op: OpType, rng: &mut impl Rng, next_id: &mu
         }
         OpType::GetFeed => {
             let _ = db.query(
-                "SELECT id, author_id, content, created_at FROM posts ORDER BY created_at DESC LIMIT 20",
+                "SELECT id, author_id, content, created_at FROM posts ORDER BY id DESC LIMIT 20",
                 &[],
             )
             .unwrap();
@@ -424,7 +427,7 @@ fn run_op_sqlite(
         OpType::GetFeed => {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT id, author_id, content, created_at FROM posts ORDER BY created_at DESC LIMIT 20",
+                    "SELECT id, author_id, content, created_at FROM posts ORDER BY id DESC LIMIT 20",
                 )
                 .unwrap();
             let _ = stmt
