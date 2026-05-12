@@ -9,6 +9,7 @@ use rusqlite::{Connection, params};
 fn manifold_db() -> (ManifoldDb, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
     let db = ManifoldDb::open(dir.path().join("bench.db")).unwrap();
+    db.set_durability(manifold_sql::Durability::None);
     (db, dir)
 }
 
@@ -43,11 +44,13 @@ fn manifold_populated(n: usize) -> (ManifoldDb, tempfile::TempDir) {
     let path = dir.path().join("bench.db");
     {
         let db = ManifoldDb::open(&path).unwrap();
+        db.set_durability(manifold_sql::Durability::None);
         manifold_create_table(&db);
         manifold_populate(&db, n);
     }
     // Reopen: WAL recovery flushes data to B-tree
     let db = ManifoldDb::open(&path).unwrap();
+    db.set_durability(manifold_sql::Durability::None);
     (db, dir)
 }
 

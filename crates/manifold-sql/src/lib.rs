@@ -10,6 +10,7 @@ pub mod storage;
 pub mod types;
 
 pub use error::{Result, SqlError};
+pub use manifold::Durability;
 pub use types::{SqlType, Value};
 
 use std::collections::HashMap;
@@ -206,6 +207,8 @@ pub struct Database {
     /// Statement cache: SQL string → optimized plan.
     /// Avoids re-parsing/planning/optimizing repeated queries.
     stmt_cache: Mutex<HashMap<String, LogicalPlan>>,
+    /// Durability mode applied to auto-commit statements.
+    auto_commit_durability: Mutex<manifold::Durability>,
 }
 
 impl Database {
@@ -248,6 +251,7 @@ impl Database {
             catalog: Arc::new(Mutex::new(catalog)),
             active_txn: Mutex::new(None),
             stmt_cache: Mutex::new(HashMap::new()),
+            auto_commit_durability: Mutex::new(manifold::Durability::Immediate),
         })
     }
 
@@ -305,6 +309,13 @@ impl Database {
         self.cf_db
             .checkpoint()
             .map_err(|e| SqlError::Internal(format!("checkpoint error: {e}")))
+    }
+
+    /// Set the durability mode for auto-commit statements.
+    /// - `Durability::Immediate` (default): WAL fsync on every commit (crash-safe)
+    /// - `Durability::None`: skip fsync (faster, recent commits may be lost on crash)
+    pub fn set_durability(&self, durability: manifold::Durability) {
+        *self.auto_commit_durability.lock().unwrap() = durability;
     }
 
     /// Execute a mutating SQL statement. Returns the number of rows affected.
@@ -416,7 +427,10 @@ impl Database {
         } else {
             drop(active);
             // Auto-commit: start txn, execute, commit.
-            let write_txn = self.cf.begin_write()?;
+            let mut write_txn = self.cf.begin_write()?;
+            write_txn
+                .set_durability(*self.auto_commit_durability.lock().unwrap())
+                .map_err(|e| SqlError::Internal(format!("set_durability error: {e}")))?;
             let result = executor::execute_in_txn(&write_txn, &mut catalog, optimized, params)?;
             write_txn.commit()?;
             Ok(result)
