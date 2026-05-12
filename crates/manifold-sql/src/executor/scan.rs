@@ -1,7 +1,10 @@
-use manifold::{MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableDefinition};
+use manifold::{
+    MultimapTableDefinition, ReadableMultimapTable, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 
-use crate::catalog::schema::IndexDef;
 use crate::catalog::Catalog;
+use crate::catalog::schema::IndexDef;
 use crate::error::{Result, SqlError};
 use crate::expr::eval::evaluate;
 use crate::planner::plan::{PlanSchema, ScalarExpr};
@@ -35,8 +38,7 @@ impl TableScan {
             .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
         let col_types = table_schema.column_types();
 
-        let data_name: &'static str =
-            Box::leak(format!("data_{table_name}").into_boxed_str());
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
 
         let mut rows = Vec::new();
@@ -78,8 +80,7 @@ impl TableScan {
             .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
         let col_types = table_schema.column_types();
 
-        let data_name: &'static str =
-            Box::leak(format!("data_{table_name}").into_boxed_str());
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let def = TableDefinition::<u64, &[u8]>::new(data_name);
 
         let mut rows = Vec::new();
@@ -138,10 +139,7 @@ pub struct IndexPointScan {
 impl IndexPointScan {
     /// Resolve lookup values, encode them as an index key, look up matching
     /// rowids in the index table, and fetch the corresponding data rows.
-    fn resolve_lookup_values(
-        lookup_values: &[ScalarExpr],
-        params: &[Value],
-    ) -> Result<Vec<Value>> {
+    fn resolve_lookup_values(lookup_values: &[ScalarExpr], params: &[Value]) -> Result<Vec<Value>> {
         lookup_values
             .iter()
             .map(|expr| evaluate(expr, &[], params))
@@ -170,8 +168,7 @@ impl IndexPointScan {
         let values = Self::resolve_lookup_values(lookup_values, params)?;
         let key_bytes = encode_index_key(&values);
 
-        let data_name: &'static str =
-            Box::leak(format!("data_{table_name}").into_boxed_str());
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let data_def = TableDefinition::<u64, &[u8]>::new(data_name);
 
         let rowids = Self::lookup_rowids_read(txn, table_name, &index_def, &key_bytes)?;
@@ -214,8 +211,7 @@ impl IndexPointScan {
         let values = Self::resolve_lookup_values(lookup_values, params)?;
         let key_bytes = encode_index_key(&values);
 
-        let data_name: &'static str =
-            Box::leak(format!("data_{table_name}").into_boxed_str());
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
         let data_def = TableDefinition::<u64, &[u8]>::new(data_name);
 
         let rowids = Self::lookup_rowids_write(txn, table_name, &index_def, &key_bytes)?;
@@ -224,10 +220,7 @@ impl IndexPointScan {
         if !rowids.is_empty() {
             let data_table = txn.open_table(data_def)?;
             for rowid in rowids {
-                if let Some(row_guard) = data_table
-                    .get(rowid)
-                    .map_err(SqlError::Storage)?
-                {
+                if let Some(row_guard) = data_table.get(rowid).map_err(SqlError::Storage)? {
                     let mut row = vec![Value::Integer(rowid as i64)];
                     let decoded = decode_row(&col_types, row_guard.value())?;
                     row.extend(decoded);
@@ -315,5 +308,256 @@ impl super::Executor for IndexPointScan {
         } else {
             Ok(None)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct rowid lookup (PK = value)
+// ---------------------------------------------------------------------------
+
+/// Direct rowid lookup: fetches a single row by its u64 rowid key.
+/// Skips the index entirely — the data table IS the index for PK lookups.
+pub struct RowidLookupScan {
+    row: Option<Vec<Value>>,
+    done: bool,
+}
+
+impl RowidLookupScan {
+    fn resolve_rowid(rowid_expr: &ScalarExpr, params: &[Value]) -> Result<u64> {
+        let val = evaluate(rowid_expr, &[], params)?;
+        match val {
+            Value::Integer(i) if i > 0 => Ok(i as u64),
+            _ => Ok(0), // invalid rowid, will yield no results
+        }
+    }
+
+    pub fn from_read_txn(
+        txn: &manifold::ReadTransaction,
+        catalog: &Catalog,
+        table_name: &str,
+        rowid_expr: &ScalarExpr,
+        params: &[Value],
+    ) -> Result<Self> {
+        let table_schema = catalog
+            .get_table(table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
+        let col_types = table_schema.column_types();
+
+        let rowid = Self::resolve_rowid(rowid_expr, params)?;
+        if rowid == 0 {
+            return Ok(Self {
+                row: None,
+                done: false,
+            });
+        }
+
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
+        let def = TableDefinition::<u64, &[u8]>::new(data_name);
+
+        let row = match txn.open_table(def) {
+            Ok(table) => {
+                if let Some(guard) = table.get(rowid).map_err(SqlError::Storage)? {
+                    let mut r = vec![Value::Integer(rowid as i64)];
+                    r.extend(decode_row(&col_types, guard.value())?);
+                    Some(r)
+                } else {
+                    None
+                }
+            }
+            Err(manifold::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(SqlError::TableError(e)),
+        };
+
+        Ok(Self { row, done: false })
+    }
+
+    pub fn from_write_txn(
+        txn: &manifold::WriteTransaction,
+        catalog: &Catalog,
+        table_name: &str,
+        rowid_expr: &ScalarExpr,
+        params: &[Value],
+    ) -> Result<Self> {
+        let table_schema = catalog
+            .get_table(table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
+        let col_types = table_schema.column_types();
+
+        let rowid = Self::resolve_rowid(rowid_expr, params)?;
+        if rowid == 0 {
+            return Ok(Self {
+                row: None,
+                done: false,
+            });
+        }
+
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
+        let def = TableDefinition::<u64, &[u8]>::new(data_name);
+
+        let table = txn.open_table(def)?;
+        let row = if let Some(guard) = table.get(rowid).map_err(SqlError::Storage)? {
+            let mut r = vec![Value::Integer(rowid as i64)];
+            r.extend(decode_row(&col_types, guard.value())?);
+            Some(r)
+        } else {
+            None
+        };
+
+        Ok(Self { row, done: false })
+    }
+}
+
+impl super::Executor for RowidLookupScan {
+    fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        Ok(self.row.take())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rowid range scan (PK BETWEEN start AND end)
+// ---------------------------------------------------------------------------
+
+/// Rowid range scan: reads a contiguous range of rows using B-tree range lookup.
+pub struct RowidRangeScan {
+    rows: Vec<Vec<Value>>,
+    position: usize,
+}
+
+impl RowidRangeScan {
+    fn resolve_u64(expr: &ScalarExpr, params: &[Value]) -> Result<u64> {
+        let val = evaluate(expr, &[], params)?;
+        match val {
+            Value::Integer(i) => Ok(i as u64),
+            _ => Ok(0),
+        }
+    }
+
+    pub fn from_read_txn(
+        txn: &manifold::ReadTransaction,
+        catalog: &Catalog,
+        table_name: &str,
+        start_expr: &ScalarExpr,
+        end_expr: &ScalarExpr,
+        params: &[Value],
+    ) -> Result<Self> {
+        let table_schema = catalog
+            .get_table(table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
+        let col_types = table_schema.column_types();
+
+        let start = Self::resolve_u64(start_expr, params)?;
+        let end = Self::resolve_u64(end_expr, params)?;
+
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
+        let def = TableDefinition::<u64, &[u8]>::new(data_name);
+
+        let mut rows = Vec::new();
+        match txn.open_table(def) {
+            Ok(table) => {
+                let iter = table.range(start..=end).map_err(SqlError::Storage)?;
+                for entry in iter {
+                    let (key_guard, value_guard) = entry.map_err(SqlError::Storage)?;
+                    let rowid = key_guard.value();
+                    let mut row = vec![Value::Integer(rowid as i64)];
+                    row.extend(decode_row(&col_types, value_guard.value())?);
+                    rows.push(row);
+                }
+            }
+            Err(manifold::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(SqlError::TableError(e)),
+        }
+
+        Ok(Self { rows, position: 0 })
+    }
+
+    pub fn from_write_txn(
+        txn: &manifold::WriteTransaction,
+        catalog: &Catalog,
+        table_name: &str,
+        start_expr: &ScalarExpr,
+        end_expr: &ScalarExpr,
+        params: &[Value],
+    ) -> Result<Self> {
+        let table_schema = catalog
+            .get_table(table_name)
+            .ok_or_else(|| SqlError::TableNotFound(table_name.to_string()))?;
+        let col_types = table_schema.column_types();
+
+        let start = Self::resolve_u64(start_expr, params)?;
+        let end = Self::resolve_u64(end_expr, params)?;
+
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
+        let def = TableDefinition::<u64, &[u8]>::new(data_name);
+
+        let mut rows = Vec::new();
+        let table = txn.open_table(def)?;
+        let iter = table.range(start..=end).map_err(SqlError::Storage)?;
+        for entry in iter {
+            let (key_guard, value_guard) = entry.map_err(SqlError::Storage)?;
+            let rowid = key_guard.value();
+            let mut row = vec![Value::Integer(rowid as i64)];
+            row.extend(decode_row(&col_types, value_guard.value())?);
+            rows.push(row);
+        }
+
+        Ok(Self { rows, position: 0 })
+    }
+}
+
+impl super::Executor for RowidRangeScan {
+    fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        if self.position < self.rows.len() {
+            let row = self.rows[self.position].clone();
+            self.position += 1;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// O(1) COUNT(*) scan
+// ---------------------------------------------------------------------------
+
+/// O(1) row count: reads table.len() from B-tree metadata.
+pub struct CountScan {
+    count: Option<u64>,
+}
+
+impl CountScan {
+    pub fn from_read_txn(
+        txn: &manifold::ReadTransaction,
+        table_name: &str,
+    ) -> Result<Self> {
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
+        let def = TableDefinition::<u64, &[u8]>::new(data_name);
+        let count = match txn.open_table(def) {
+            Ok(table) => table.len().map_err(SqlError::Storage)?,
+            Err(manifold::TableError::TableDoesNotExist(_)) => 0,
+            Err(e) => return Err(SqlError::TableError(e)),
+        };
+        Ok(Self { count: Some(count) })
+    }
+
+    pub fn from_write_txn(
+        txn: &manifold::WriteTransaction,
+        table_name: &str,
+    ) -> Result<Self> {
+        let data_name: &'static str = Box::leak(format!("data_{table_name}").into_boxed_str());
+        let def = TableDefinition::<u64, &[u8]>::new(data_name);
+        let table = txn.open_table(def)?;
+        let count = table.len().map_err(SqlError::Storage)?;
+        Ok(Self { count: Some(count) })
+    }
+}
+
+impl super::Executor for CountScan {
+    fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        Ok(self.count.take().map(|c| vec![Value::Integer(c as i64)]))
     }
 }

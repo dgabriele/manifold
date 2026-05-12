@@ -12,10 +12,12 @@ mod values;
 
 use manifold::{MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::binder::AlterTableOp;
+use crate::ResultSet;
+use crate::Row;
+use crate::binder::{AggregateFunc, AlterTableOp};
+use crate::catalog::Catalog;
 use crate::catalog::persist;
 use crate::catalog::schema::{ColumnDef, ConstraintDef, IndexDef, TableSchema};
-use crate::catalog::Catalog;
 use crate::error::{Result, SqlError};
 use crate::expr::eval::evaluate;
 use crate::optimizer::statistics::{IndexStatistics, TableStatistics};
@@ -24,8 +26,6 @@ use crate::storage::catalog_tables::STATISTICS_TABLE;
 use crate::storage::index::encode_index_key;
 use crate::storage::row_format::{decode_row, encode_row};
 use crate::types::{SqlType, Value};
-use crate::ResultSet;
-use crate::Row;
 
 // ---------------------------------------------------------------------------
 // Executor trait
@@ -195,7 +195,32 @@ fn build_read_query_executor(
             ..
         } => {
             let scan = scan::IndexPointScan::from_read_txn(
-                txn, catalog, table_name, index_name, lookup_values, params,
+                txn,
+                catalog,
+                table_name,
+                index_name,
+                lookup_values,
+                params,
+            )?;
+            Ok(Box::new(scan))
+        }
+        LogicalPlan::RowidLookup {
+            table_name,
+            rowid_expr,
+            ..
+        } => {
+            let scan =
+                scan::RowidLookupScan::from_read_txn(txn, catalog, table_name, rowid_expr, params)?;
+            Ok(Box::new(scan))
+        }
+        LogicalPlan::RowidRangeScan {
+            table_name,
+            start_expr,
+            end_expr,
+            ..
+        } => {
+            let scan = scan::RowidRangeScan::from_read_txn(
+                txn, catalog, table_name, start_expr, end_expr, params,
             )?;
             Ok(Box::new(scan))
         }
@@ -209,13 +234,14 @@ fn build_read_query_executor(
             Ok(Box::new(filter::Filter::new(child, pred, params)))
         }
         LogicalPlan::Project {
-            expressions,
-            input,
-            ..
+            expressions, input, ..
         } => {
             let child = build_read_query_executor(txn, catalog, input, params)?;
             let exprs = if plan_has_scan_leaf(input) {
-                expressions.iter().map(|e| shift_column_refs(e, 1)).collect()
+                expressions
+                    .iter()
+                    .map(|e| shift_column_refs(e, 1))
+                    .collect()
             } else {
                 expressions.clone()
             };
@@ -224,11 +250,14 @@ fn build_read_query_executor(
         LogicalPlan::Sort { order_by, input } => {
             let child = build_read_query_executor(txn, catalog, input, params)?;
             let obs = if plan_has_scan_leaf(input) {
-                order_by.iter().map(|ob| crate::planner::plan::OrderByExpr {
-                    expr: shift_column_refs(&ob.expr, 1),
-                    asc: ob.asc,
-                    nulls_first: ob.nulls_first,
-                }).collect::<Vec<_>>()
+                order_by
+                    .iter()
+                    .map(|ob| crate::planner::plan::OrderByExpr {
+                        expr: shift_column_refs(&ob.expr, 1),
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                    .collect::<Vec<_>>()
             } else {
                 order_by.clone()
             };
@@ -251,9 +280,7 @@ fn build_read_query_executor(
                 .unwrap_or(0);
             Ok(Box::new(limit::Limit::new(child, count_val, offset_val)))
         }
-        LogicalPlan::Values { rows, .. } => {
-            Ok(Box::new(values::Values::new(rows.clone(), params)))
-        }
+        LogicalPlan::Values { rows, .. } => Ok(Box::new(values::Values::new(rows.clone(), params))),
         LogicalPlan::Join {
             join_type,
             left,
@@ -268,6 +295,22 @@ fn build_read_query_executor(
             condition.as_ref(),
             params,
         ),
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            input,
+            ..
+        } if group_by.is_empty()
+            && aggregates.len() == 1
+            && aggregates[0].func == AggregateFunc::Count
+            && aggregates[0].arg.is_none()
+            && matches!(input.as_ref(), LogicalPlan::Scan { .. }) =>
+        {
+            if let LogicalPlan::Scan { table_name, .. } = input.as_ref() {
+                return Ok(Box::new(scan::CountScan::from_read_txn(txn, table_name)?));
+            }
+            unreachable!()
+        }
         LogicalPlan::Aggregate {
             group_by,
             aggregates,
@@ -302,7 +345,9 @@ fn build_read_query_executor(
                 schema.clone(),
             )))
         }
-        LogicalPlan::Union { left, right, all, .. } => {
+        LogicalPlan::Union {
+            left, right, all, ..
+        } => {
             let left_exec = build_read_query_executor(txn, catalog, left, params)?;
             let right_exec = build_read_query_executor(txn, catalog, right, params)?;
             if *all {
@@ -313,7 +358,10 @@ fn build_read_query_executor(
         }
         LogicalPlan::Distinct { input } => {
             let child = build_read_query_executor(txn, catalog, input, params)?;
-            Ok(Box::new(union::UnionDistinct::new(child, Box::new(EmptyExecutor))?))
+            Ok(Box::new(union::UnionDistinct::new(
+                child,
+                Box::new(EmptyExecutor),
+            )?))
         }
         LogicalPlan::Explain { input } => {
             let formatted = explain::format_plan(input);
@@ -355,7 +403,33 @@ fn build_write_query_executor(
             ..
         } => {
             let scan = scan::IndexPointScan::from_write_txn(
-                txn, catalog, table_name, index_name, lookup_values, params,
+                txn,
+                catalog,
+                table_name,
+                index_name,
+                lookup_values,
+                params,
+            )?;
+            Ok(Box::new(scan))
+        }
+        LogicalPlan::RowidLookup {
+            table_name,
+            rowid_expr,
+            ..
+        } => {
+            let scan = scan::RowidLookupScan::from_write_txn(
+                txn, catalog, table_name, rowid_expr, params,
+            )?;
+            Ok(Box::new(scan))
+        }
+        LogicalPlan::RowidRangeScan {
+            table_name,
+            start_expr,
+            end_expr,
+            ..
+        } => {
+            let scan = scan::RowidRangeScan::from_write_txn(
+                txn, catalog, table_name, start_expr, end_expr, params,
             )?;
             Ok(Box::new(scan))
         }
@@ -369,13 +443,14 @@ fn build_write_query_executor(
             Ok(Box::new(filter::Filter::new(child, pred, params)))
         }
         LogicalPlan::Project {
-            expressions,
-            input,
-            ..
+            expressions, input, ..
         } => {
             let child = build_write_query_executor(txn, catalog, input, params)?;
             let exprs = if plan_has_scan_leaf(input) {
-                expressions.iter().map(|e| shift_column_refs(e, 1)).collect()
+                expressions
+                    .iter()
+                    .map(|e| shift_column_refs(e, 1))
+                    .collect()
             } else {
                 expressions.clone()
             };
@@ -384,11 +459,14 @@ fn build_write_query_executor(
         LogicalPlan::Sort { order_by, input } => {
             let child = build_write_query_executor(txn, catalog, input, params)?;
             let obs = if plan_has_scan_leaf(input) {
-                order_by.iter().map(|ob| crate::planner::plan::OrderByExpr {
-                    expr: shift_column_refs(&ob.expr, 1),
-                    asc: ob.asc,
-                    nulls_first: ob.nulls_first,
-                }).collect::<Vec<_>>()
+                order_by
+                    .iter()
+                    .map(|ob| crate::planner::plan::OrderByExpr {
+                        expr: shift_column_refs(&ob.expr, 1),
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                    .collect::<Vec<_>>()
             } else {
                 order_by.clone()
             };
@@ -411,9 +489,7 @@ fn build_write_query_executor(
                 .unwrap_or(0);
             Ok(Box::new(limit::Limit::new(child, count_val, offset_val)))
         }
-        LogicalPlan::Values { rows, .. } => {
-            Ok(Box::new(values::Values::new(rows.clone(), params)))
-        }
+        LogicalPlan::Values { rows, .. } => Ok(Box::new(values::Values::new(rows.clone(), params))),
         LogicalPlan::Join {
             join_type,
             left,
@@ -428,6 +504,22 @@ fn build_write_query_executor(
             condition.as_ref(),
             params,
         ),
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            input,
+            ..
+        } if group_by.is_empty()
+            && aggregates.len() == 1
+            && aggregates[0].func == AggregateFunc::Count
+            && aggregates[0].arg.is_none()
+            && matches!(input.as_ref(), LogicalPlan::Scan { .. }) =>
+        {
+            if let LogicalPlan::Scan { table_name, .. } = input.as_ref() {
+                return Ok(Box::new(scan::CountScan::from_write_txn(txn, table_name)?));
+            }
+            unreachable!()
+        }
         LogicalPlan::Aggregate {
             group_by,
             aggregates,
@@ -462,7 +554,9 @@ fn build_write_query_executor(
                 schema.clone(),
             )))
         }
-        LogicalPlan::Union { left, right, all, .. } => {
+        LogicalPlan::Union {
+            left, right, all, ..
+        } => {
             let left_exec = build_write_query_executor(txn, catalog, left, params)?;
             let right_exec = build_write_query_executor(txn, catalog, right, params)?;
             if *all {
@@ -473,7 +567,10 @@ fn build_write_query_executor(
         }
         LogicalPlan::Distinct { input } => {
             let child = build_write_query_executor(txn, catalog, input, params)?;
-            Ok(Box::new(union::UnionDistinct::new(child, Box::new(EmptyExecutor))?))
+            Ok(Box::new(union::UnionDistinct::new(
+                child,
+                Box::new(EmptyExecutor),
+            )?))
         }
         LogicalPlan::Explain { input } => {
             let formatted = explain::format_plan(input);
@@ -621,7 +718,10 @@ fn shift_column_refs(expr: &ScalarExpr, offset: usize) -> ScalarExpr {
 /// Check if a plan has a table scan at its leaf (meaning output rows include a rowid prefix).
 fn plan_has_scan_leaf(plan: &LogicalPlan) -> bool {
     match plan {
-        LogicalPlan::Scan { .. } | LogicalPlan::IndexScan { .. } => true,
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::RowidLookup { .. }
+        | LogicalPlan::RowidRangeScan { .. } => true,
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
@@ -719,9 +819,7 @@ fn execute_plan_mut(
             table_name, input, ..
         } => execute_delete(txn, catalog, table_name, input, params),
 
-        LogicalPlan::Analyze { table_name } => {
-            execute_analyze(txn, catalog, table_name.as_deref())
-        }
+        LogicalPlan::Analyze { table_name } => execute_analyze(txn, catalog, table_name.as_deref()),
 
         // EXPLAIN can also arrive via execute_mut when issued as a bare
         // statement (e.g. EXPLAIN CREATE TABLE …).  Just no-op.
@@ -849,23 +947,17 @@ fn execute_create_table(
 fn assign_constraint_id(catalog: &mut Catalog, c: &ConstraintDef) -> ConstraintDef {
     let id = catalog.next_constraint_id();
     match c {
-        ConstraintDef::PrimaryKey {
-            name, columns, ..
-        } => ConstraintDef::PrimaryKey {
+        ConstraintDef::PrimaryKey { name, columns, .. } => ConstraintDef::PrimaryKey {
             id,
             name: name.clone(),
             columns: columns.clone(),
         },
-        ConstraintDef::Unique {
-            name, columns, ..
-        } => ConstraintDef::Unique {
+        ConstraintDef::Unique { name, columns, .. } => ConstraintDef::Unique {
             id,
             name: name.clone(),
             columns: columns.clone(),
         },
-        ConstraintDef::NotNull {
-            name, column, ..
-        } => ConstraintDef::NotNull {
+        ConstraintDef::NotNull { name, column, .. } => ConstraintDef::NotNull {
             id,
             name: name.clone(),
             column: *column,
@@ -1213,7 +1305,10 @@ fn execute_drop_index(
         .get_table_by_id(index.table_id)
         .map(|s| s.name.clone())
         .ok_or_else(|| {
-            SqlError::Internal(format!("table with id {} not found for index", index.table_id))
+            SqlError::Internal(format!(
+                "table with id {} not found for index",
+                index.table_id
+            ))
         })?;
 
     let idx_tbl_name = index_table_name(&table_name, name, index.unique);
@@ -1243,7 +1338,15 @@ fn execute_insert(
     source: &LogicalPlan,
     params: &[Value],
 ) -> Result<u64> {
-    execute_insert_inner(txn, catalog, table_name, target_columns, source, params, false)
+    execute_insert_inner(
+        txn,
+        catalog,
+        table_name,
+        target_columns,
+        source,
+        params,
+        false,
+    )
 }
 
 fn execute_insert_no_flush(
@@ -1254,7 +1357,15 @@ fn execute_insert_no_flush(
     source: &LogicalPlan,
     params: &[Value],
 ) -> Result<u64> {
-    execute_insert_inner(txn, catalog, table_name, target_columns, source, params, true)
+    execute_insert_inner(
+        txn,
+        catalog,
+        table_name,
+        target_columns,
+        source,
+        params,
+        true,
+    )
 }
 
 fn execute_insert_inner(
@@ -1346,8 +1457,45 @@ fn execute_insert_inner(
         // Run all constraint checks (NOT NULL, type, VARCHAR length, UNIQUE, FK).
         check_insert_constraints(txn, catalog, &schema, &full_row)?;
 
-        let rowid = next_rowid;
-        next_rowid += 1;
+        // Use the PK value as the rowid when the first column is an INTEGER PRIMARY KEY.
+        // This mirrors SQLite's INTEGER PRIMARY KEY = rowid alias, enabling O(1)
+        // point lookups without going through a secondary index.
+        let rowid = if schema.columns[0].is_primary_key
+            && matches!(
+                schema.columns[0].sql_type,
+                SqlType::Integer | SqlType::BigInt
+            ) {
+            match &full_row[0] {
+                Value::Integer(v) => *v as u64,
+                _ => {
+                    let r = next_rowid;
+                    next_rowid += 1;
+                    r
+                }
+            }
+        } else {
+            let r = next_rowid;
+            next_rowid += 1;
+            r
+        };
+        // Ensure next_rowid stays ahead of any explicit PK value
+        if rowid >= next_rowid {
+            next_rowid = rowid + 1;
+        }
+
+        // When PK = rowid, check for duplicate before inserting.
+        if schema.columns[0].is_primary_key
+            && matches!(
+                schema.columns[0].sql_type,
+                SqlType::Integer | SqlType::BigInt
+            )
+            && data_table.get(rowid).map_err(SqlError::Storage)?.is_some()
+        {
+            return Err(SqlError::ConstraintViolation(format!(
+                "duplicate key value violates primary key constraint on column '{}'",
+                schema.columns[0].name
+            )));
+        }
 
         let encoded = encode_row(&col_types, &full_row)?;
         data_table.insert_buffered(rowid, encoded.as_slice())?;
@@ -1564,7 +1712,10 @@ fn check_insert_constraints(
                 if *v < i16::MIN as i64 || *v > i16::MAX as i64 {
                     return Err(SqlError::TypeError(format!(
                         "value {} out of range for column '{}' of type SMALLINT (range {}..{})",
-                        v, col.name, i16::MIN, i16::MAX
+                        v,
+                        col.name,
+                        i16::MIN,
+                        i16::MAX
                     )));
                 }
             }
@@ -1579,7 +1730,9 @@ fn check_insert_constraints(
         {
             return Err(SqlError::ConstraintViolation(format!(
                 "value for column '{}' exceeds VARCHAR({}) limit (got {} chars)",
-                col.name, max_len, s.len()
+                col.name,
+                max_len,
+                s.len()
             )));
         }
     }
@@ -1594,7 +1747,16 @@ fn check_insert_constraints(
             ..
         } = constraint
         {
-            check_fk_parent_exists(txn, catalog, name, schema, row, columns, ref_table, ref_columns)?;
+            check_fk_parent_exists(
+                txn,
+                catalog,
+                name,
+                schema,
+                row,
+                columns,
+                ref_table,
+                ref_columns,
+            )?;
         }
     }
 
@@ -1618,11 +1780,11 @@ fn check_fk_parent_exists(
         return Ok(());
     }
 
-    let parent_schema = catalog
-        .get_table(ref_table_name)
-        .ok_or_else(|| SqlError::ConstraintViolation(format!(
+    let parent_schema = catalog.get_table(ref_table_name).ok_or_else(|| {
+        SqlError::ConstraintViolation(format!(
             "FK '{fk_name}': referenced table '{ref_table_name}' not found"
-        )))?;
+        ))
+    })?;
 
     let parent_col_indices: Vec<usize> = ref_col_names
         .iter()
@@ -1645,9 +1807,9 @@ fn check_fk_parent_exists(
         .collect();
 
     // Check if there's a unique index on exactly the referenced columns.
-    let matching_index = parent_indexes.iter().find(|idx| {
-        idx.unique && idx.columns == parent_col_indices
-    });
+    let matching_index = parent_indexes
+        .iter()
+        .find(|idx| idx.unique && idx.columns == parent_col_indices);
 
     if let Some(idx) = matching_index {
         let key_bytes = encode_index_key(&child_values);
@@ -1908,8 +2070,10 @@ fn execute_analyze(
             .collect();
 
         // Track distinct values per index column set using encoded key bytes.
-        let mut distinct_sets: Vec<std::collections::HashSet<Vec<u8>>> =
-            indexes.iter().map(|_| std::collections::HashSet::new()).collect();
+        let mut distinct_sets: Vec<std::collections::HashSet<Vec<u8>>> = indexes
+            .iter()
+            .map(|_| std::collections::HashSet::new())
+            .collect();
 
         let mut row_count: u64 = 0;
 

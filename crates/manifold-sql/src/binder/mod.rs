@@ -3,8 +3,8 @@ pub mod statement;
 
 use sqlparser::ast::Statement;
 
-use crate::catalog::schema::{ColumnDef, ConstraintDef, TableId};
 use crate::catalog::Catalog;
+use crate::catalog::schema::{ColumnDef, ConstraintDef, TableId};
 use crate::error::Result;
 use crate::types::{SqlType, Value};
 
@@ -98,8 +98,15 @@ impl BoundExpr {
             BoundExpr::Column(col) => col.column_name.clone(),
             BoundExpr::Literal(val) => format!("{val}"),
             BoundExpr::Parameter(idx) => format!("${}", idx + 1),
-            BoundExpr::BinaryOp { op, left, right, .. } => {
-                format!("({} {} {})", left.display_name(), op.as_str(), right.display_name())
+            BoundExpr::BinaryOp {
+                op, left, right, ..
+            } => {
+                format!(
+                    "({} {} {})",
+                    left.display_name(),
+                    op.as_str(),
+                    right.display_name()
+                )
             }
             BoundExpr::UnaryOp { op, operand, .. } => {
                 format!("({}{})", op.as_str(), operand.display_name())
@@ -197,7 +204,7 @@ impl UnaryOp {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregateFunc {
     Count,
     Sum,
@@ -349,19 +356,21 @@ pub enum BoundStatement {
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
-    Savepoint { name: String },
-    ReleaseSavepoint { name: String },
-    RollbackToSavepoint { name: String },
+    Savepoint {
+        name: String,
+    },
+    ReleaseSavepoint {
+        name: String,
+    },
+    RollbackToSavepoint {
+        name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn bind(
-    catalog: &Catalog,
-    stmt: &Statement,
-    params: &[Value],
-) -> Result<BoundStatement> {
+pub fn bind(catalog: &Catalog, stmt: &Statement, params: &[Value]) -> Result<BoundStatement> {
     statement::bind_statement(catalog, stmt, params)
 }
