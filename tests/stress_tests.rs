@@ -15,8 +15,8 @@
 mod stress {
     use manifold::column_family::ColumnFamilyDatabase;
     use manifold::{
-        Database, Durability, MultimapTableDefinition, ReadableDatabase,
-        ReadableTable, ReadableTableMetadata, TableDefinition,
+        Database, Durability, MultimapTableDefinition, ReadableDatabase, ReadableTable,
+        ReadableTableMetadata, TableDefinition,
     };
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
@@ -96,8 +96,7 @@ mod stress {
         let writes_per_cf = 1000;
 
         for i in 0..num_cfs {
-            db.create_column_family(&format!("cf_{}", i), None)
-                .unwrap();
+            db.create_column_family(&format!("cf_{}", i), None).unwrap();
         }
 
         let barrier = Arc::new(Barrier::new(num_cfs));
@@ -607,11 +606,7 @@ mod stress {
             let rtxn = cf.begin_read().unwrap();
             let t = rtxn.open_table(TABLE_U64).unwrap();
             let val = t.get(&round).unwrap();
-            assert!(
-                val.is_some(),
-                "Round {} not visible after commit",
-                round
-            );
+            assert!(val.is_some(), "Round {} not visible after commit", round);
             assert_eq!(val.unwrap().value(), round);
 
             // All previous rounds should also be visible (monotonic)
@@ -654,11 +649,8 @@ mod stress {
                         let txn = db.begin_read().unwrap();
                         let t = txn.open_multimap_table(MMAP_TABLE).unwrap();
                         for key in 0u64..10 {
-                            let vals: Vec<u64> = t
-                                .get(&key)
-                                .unwrap()
-                                .map(|r| r.unwrap().value())
-                                .collect();
+                            let vals: Vec<u64> =
+                                t.get(&key).unwrap().map(|r| r.unwrap().value()).collect();
                             assert_eq!(vals.len(), 100, "Key {} should have 100 values", key);
                         }
                     }
@@ -719,7 +711,13 @@ mod stress {
             for i in 0u64..100 {
                 let val = t.get(&i).unwrap();
                 assert!(val.is_some(), "Round {}: key {} missing", round, i);
-                assert_eq!(val.unwrap().value(), i, "Round {}: key {} wrong value", round, i);
+                assert_eq!(
+                    val.unwrap().value(),
+                    i,
+                    "Round {}: key {} wrong value",
+                    round,
+                    i
+                );
             }
             assert!(t.get(&150u64).unwrap().is_none());
         }
@@ -843,11 +841,7 @@ mod stress {
     #[test]
     fn stress_large_values_concurrent() {
         let tmp = tmpfile();
-        let db = Arc::new(
-            ColumnFamilyDatabase::builder()
-                .open(tmp.path())
-                .unwrap(),
-        );
+        let db = Arc::new(ColumnFamilyDatabase::builder().open(tmp.path()).unwrap());
         db.create_column_family("cf", Some(64 * 1024 * 1024))
             .unwrap();
 
@@ -884,10 +878,7 @@ mod stress {
         let cf = db.column_family("cf").unwrap();
         let txn = cf.begin_read().unwrap();
         let t = txn.open_table(TABLE_BYTES).unwrap();
-        assert_eq!(
-            t.len().unwrap(),
-            (num_threads * entries_per_thread) as u64
-        );
+        assert_eq!(t.len().unwrap(), (num_threads * entries_per_thread) as u64);
 
         for tid in 0..num_threads {
             for i in 0..entries_per_thread {
@@ -975,10 +966,7 @@ mod stress {
         let cf = db.column_family("cf").unwrap();
         let txn = cf.begin_read().unwrap();
         let t = txn.open_table(TABLE_U64).unwrap();
-        assert_eq!(
-            t.len().unwrap(),
-            num_writers as u64 * writes_per_writer
-        );
+        assert_eq!(t.len().unwrap(), num_writers as u64 * writes_per_writer);
     }
 
     // ========================================================================
@@ -1290,8 +1278,7 @@ mod stress {
         {
             let db = Arc::new(ColumnFamilyDatabase::builder().open(&db_path).unwrap());
             for i in 0..num_cfs {
-                db.create_column_family(&format!("cf_{}", i), None)
-                    .unwrap();
+                db.create_column_family(&format!("cf_{}", i), None).unwrap();
             }
 
             let barrier = Arc::new(Barrier::new(num_cfs));
@@ -1663,10 +1650,18 @@ mod stress {
 
             // Verify removed keys return None
             for i in 0u64..10 {
-                assert!(t.get(&i).unwrap().is_none(), "Key {} should be tombstoned", i);
+                assert!(
+                    t.get(&i).unwrap().is_none(),
+                    "Key {} should be tombstoned",
+                    i
+                );
             }
             for i in 100u64..110 {
-                assert!(t.get(&i).unwrap().is_none(), "Key {} should be tombstoned", i);
+                assert!(
+                    t.get(&i).unwrap().is_none(),
+                    "Key {} should be tombstoned",
+                    i
+                );
             }
 
             // Verify surviving keys return values
@@ -1687,10 +1682,18 @@ mod stress {
         assert_eq!(t.len().unwrap(), 180);
 
         for i in 0u64..10 {
-            assert!(t.get(&i).unwrap().is_none(), "Key {} should not exist after commit", i);
+            assert!(
+                t.get(&i).unwrap().is_none(),
+                "Key {} should not exist after commit",
+                i
+            );
         }
         for i in 100u64..110 {
-            assert!(t.get(&i).unwrap().is_none(), "Key {} should not exist after commit", i);
+            assert!(
+                t.get(&i).unwrap().is_none(),
+                "Key {} should not exist after commit",
+                i
+            );
         }
         for i in 10u64..100 {
             assert_eq!(t.get(&i).unwrap().unwrap().value(), i * 10);
@@ -1732,10 +1735,18 @@ mod stress {
         // Spot-check first, middle, last keys from the shuffled order
         for &k in &[keys[0], keys[n as usize / 2], keys[n as usize - 1]] {
             let val = t.get(&k).unwrap().unwrap();
-            assert_eq!(val.value(), k.wrapping_mul(17), "Spot check failed for key {}", k);
+            assert_eq!(
+                val.value(),
+                k.wrapping_mul(17),
+                "Spot check failed for key {}",
+                k
+            );
         }
         // Also check boundary keys
-        assert_eq!(t.get(&0u64).unwrap().unwrap().value(), 0u64.wrapping_mul(17));
+        assert_eq!(
+            t.get(&0u64).unwrap().unwrap().value(),
+            0u64.wrapping_mul(17)
+        );
         assert_eq!(
             t.get(&(n - 1)).unwrap().unwrap().value(),
             (n - 1).wrapping_mul(17)
@@ -1802,9 +1813,7 @@ mod stress {
 
         // Pre-create the table without deferred flush so the schema exists in the B-tree.
         {
-            let db = ColumnFamilyDatabase::builder()
-                .open(&db_path)
-                .unwrap();
+            let db = ColumnFamilyDatabase::builder().open(&db_path).unwrap();
             db.create_column_family("cf", None).unwrap();
             let cf = db.column_family("cf").unwrap();
             let txn = cf.begin_write().unwrap();
@@ -1845,6 +1854,13 @@ mod stress {
             assert!(val.is_some(), "Key {} not visible after commit", k);
             assert_eq!(val.unwrap().value(), k * 7);
         }
+
+        // Also verify via iter() that range scanning works with deferred flush
+        let iter_count = t.iter().unwrap().count();
+        assert_eq!(
+            iter_count, 1000,
+            "iter() should see all 1000 keys in memtable"
+        );
     }
 
     /// Verifies deferred flush data survives close and reopen (WAL recovery).
@@ -1859,9 +1875,7 @@ mod stress {
 
         // Pre-create the table without deferred flush so the schema exists in the B-tree.
         {
-            let db = ColumnFamilyDatabase::builder()
-                .open(&db_path)
-                .unwrap();
+            let db = ColumnFamilyDatabase::builder().open(&db_path).unwrap();
             db.create_column_family("cf", None).unwrap();
             let cf = db.column_family("cf").unwrap();
             let txn = cf.begin_write().unwrap();
@@ -1881,8 +1895,8 @@ mod stress {
             let txn = cf.begin_write().unwrap();
             let mut t = txn.open_table(TABLE_BYTES_KV).unwrap();
             for i in 0u64..500 {
-                let key = i.to_be_bytes();
-                let val = (i * 3).to_be_bytes();
+                let key = i.to_le_bytes();
+                let val = (i * 3).to_le_bytes();
                 t.insert(key.as_slice(), val.as_slice()).unwrap();
             }
             drop(t);
@@ -1899,10 +1913,10 @@ mod stress {
             let rtxn = cf.begin_read().unwrap();
             let t = rtxn.open_table(TABLE_BYTES_KV).unwrap();
             for i in 0u64..500 {
-                let key = i.to_be_bytes();
+                let key = i.to_le_bytes();
                 let val = t.get(key.as_slice()).unwrap();
                 assert!(val.is_some(), "Key {} missing after reopen", i);
-                let expected = (i * 3).to_be_bytes();
+                let expected = (i * 3).to_le_bytes();
                 assert_eq!(val.unwrap().value(), expected.as_slice());
             }
         }
@@ -1920,9 +1934,7 @@ mod stress {
 
         // Pre-create column families and tables without deferred flush
         {
-            let db = ColumnFamilyDatabase::builder()
-                .open(&db_path)
-                .unwrap();
+            let db = ColumnFamilyDatabase::builder().open(&db_path).unwrap();
             for i in 0..num_cfs {
                 db.create_column_family(&format!("cf_{}", i), None).unwrap();
                 let cf = db.column_family(&format!("cf_{}", i)).unwrap();

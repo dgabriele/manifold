@@ -506,6 +506,10 @@ impl<K: Key, V: Value> EntryGuard<K, V> {
         self.page.memory()[self.key_range.clone()].to_vec()
     }
 
+    pub(crate) fn value_data(&self) -> Vec<u8> {
+        self.page.memory()[self.value_range.clone()].to_vec()
+    }
+
     pub(crate) fn key(&self) -> K::SelfType<'_> {
         K::from_bytes(&self.page.memory()[self.key_range.clone()])
     }

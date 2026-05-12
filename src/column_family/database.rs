@@ -21,7 +21,7 @@ use crate::{
 use super::builder::ColumnFamilyDatabaseBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use super::file_handle_pool::FileHandlePool;
-use super::header::{ColumnFamilyMetadata, FreeSegment, MasterHeader, Segment, PAGE_SIZE};
+use super::header::{ColumnFamilyMetadata, FreeSegment, MasterHeader, PAGE_SIZE, Segment};
 use super::partitioned_backend::PartitionedStorageBackend;
 use super::state::ColumnFamilyState;
 use super::wal::checkpoint::CheckpointManager;
@@ -393,34 +393,20 @@ impl ColumnFamilyDatabase {
             for entry in entries_for_cf {
                 match &entry.payload {
                     super::wal::entry::WALPayload::LogicalOps(payload) => {
-                        // During recovery, apply LogicalOps directly to the B-tree
-                        // (same as checkpoint). This means the memtable starts empty
-                        // after recovery, which is the simplest correct behavior.
-                        let txn = db.begin_write().map_err(|e| {
-                            DatabaseError::Storage(StorageError::from(io::Error::other(
-                                format!("recovery begin_write: {e}"),
-                            )))
-                        })?;
+                        // Replay LogicalOps into the shared memtable. The B-tree
+                        // metadata (table definitions) is restored by Transaction
+                        // entries; LogicalOps carry only data that lives in the
+                        // memtable until the next checkpoint flushes it to B-tree.
+                        if let Some(cf_state) = column_families.get(cf_name)
+                            && let Some(memtable) = &cf_state.memtable
                         {
-                            let table_def: crate::TableDefinition<&[u8], &[u8]> =
-                                crate::TableDefinition::new(&payload.table_name);
-                            let mut table = txn.open_table(table_def).map_err(|e| {
-                                DatabaseError::Storage(StorageError::from(io::Error::other(
-                                    format!("recovery open_table: {e}"),
-                                )))
-                            })?;
+                            let mut mem = memtable.write().unwrap();
+                            let table_mem =
+                                mem.tables.entry(payload.table_name.clone()).or_default();
                             for op in &payload.ops {
-                                match &op.value {
-                                    Some(v) => {
-                                        let _ = table.insert(op.key.as_slice(), v.as_slice());
-                                    }
-                                    None => {
-                                        let _ = table.remove(op.key.as_slice());
-                                    }
-                                }
+                                table_mem.insert(op.key.clone(), op.value.clone());
                             }
                         }
-                        let _ = txn.commit();
                         continue;
                     }
                     super::wal::entry::WALPayload::Transaction(_) => {}
@@ -441,13 +427,14 @@ impl ColumnFamilyDatabase {
                             length,
                         });
 
-                let system_root = txn_payload
-                    .system_root
-                    .map(|(page_num, checksum, length)| BtreeHeader {
-                        root: page_num,
-                        checksum,
-                        length,
-                    });
+                let system_root =
+                    txn_payload
+                        .system_root
+                        .map(|(page_num, checksum, length)| BtreeHeader {
+                            root: page_num,
+                            checksum,
+                            length,
+                        });
 
                 // Apply WAL transaction (updates secondary slot)
                 mem.apply_wal_transaction(

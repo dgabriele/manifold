@@ -25,7 +25,7 @@ pub(crate) struct ColumnFamilyState {
     /// Lazily initialized Database instance.
     pub db: Arc<RwLock<Option<Arc<Database>>>>,
     /// Shared memtable for deferred flush mode. Created once, shared across all
-    /// ColumnFamily handles for this CF so that read-after-write is visible.
+    /// `ColumnFamily` handles for this CF so that read-after-write is visible.
     pub memtable: Option<super::memtable::SharedMemtable>,
 }
 

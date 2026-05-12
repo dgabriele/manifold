@@ -10,7 +10,8 @@ use crate::types::{Key, MutInPlaceValue, Value};
 use crate::{AccessGuard, AccessGuardMut, StorageError, WriteTransaction};
 use crate::{Result, TableHandle};
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
@@ -217,10 +218,7 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
     /// Reads via `get()` will see the key as absent immediately.
     /// Note: `range()`, `iter()`, `first()`, and `last()` do NOT reflect buffered
     /// removes until `flush_overlay()` is called.
-    pub fn remove_buffered<'k>(
-        &mut self,
-        key: impl Borrow<K::SelfType<'k>>,
-    ) -> Result {
+    pub fn remove_buffered<'k>(&mut self, key: impl Borrow<K::SelfType<'k>>) -> Result {
         if self.transaction.is_deferred_flush() {
             self.remove(key)?;
             return Ok(());
@@ -382,8 +380,11 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
             let key_bytes = K::as_bytes(key.borrow()).as_ref().to_vec();
             let value_bytes = V::as_bytes(value.borrow()).as_ref().to_vec();
             // Push to transaction's deferred ops for WAL + memtable on commit
-            self.transaction
-                .push_deferred_op(&self.name, key_bytes.clone(), Some(value_bytes.clone()));
+            self.transaction.push_deferred_op(
+                &self.name,
+                key_bytes.clone(),
+                Some(value_bytes.clone()),
+            );
             // Also insert into overlay for read-your-own-writes within this transaction
             self.overlay.insert(key_bytes, Some(value_bytes));
             return Ok(None);
@@ -687,9 +688,7 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'_, K, 
         // Check local overlay first (current Table handle's buffered writes).
         if let Some(entry) = self.overlay.get(&key_bytes) {
             return match entry {
-                Some(value_bytes) => {
-                    Ok(Some(AccessGuard::with_owned_value(value_bytes.clone())))
-                }
+                Some(value_bytes) => Ok(Some(AccessGuard::with_owned_value(value_bytes.clone()))),
                 None => Ok(None), // tombstone
             };
         }
@@ -698,9 +697,7 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'_, K, 
         if self.transaction.is_deferred_flush() {
             if let Ok(value) = self.transaction.get_deferred_op(&self.name, &key_bytes) {
                 return match value {
-                    Some(value_bytes) => {
-                        Ok(Some(AccessGuard::with_owned_value(value_bytes)))
-                    }
+                    Some(value_bytes) => Ok(Some(AccessGuard::with_owned_value(value_bytes))),
                     None => Ok(None), // tombstone
                 };
             }
@@ -708,9 +705,7 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'_, K, 
             // that hasn't been checkpointed to the B-tree yet.
             if let Some(value) = self.transaction.get_from_memtable(&self.name, &key_bytes) {
                 return match value {
-                    Some(value_bytes) => {
-                        Ok(Some(AccessGuard::with_owned_value(value_bytes)))
-                    }
+                    Some(value_bytes) => Ok(Some(AccessGuard::with_owned_value(value_bytes))),
                     None => Ok(None), // tombstone
                 };
             }
@@ -718,27 +713,46 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for Table<'_, K, 
         self.tree.get(key.borrow())
     }
 
-    /// Note: buffered writes via `insert_buffered()` are NOT visible in range iteration
-    /// until `flush_overlay()` is called.
     fn range<'a, KR>(&self, range: impl RangeBounds<KR> + 'a) -> Result<Range<'_, K, V>>
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        self.tree
-            .range(&range)
-            .map(|x| Range::new(x, self.transaction.transaction_guard()))
+        if self.transaction.is_deferred_flush() {
+            let (lower, upper) = range_to_byte_bounds::<K, KR>(&range);
+            let btree_iter = self.tree.range(&range)?;
+            // Merge: memtable + deferred ops + overlay (highest priority last)
+            let mut merged = self.transaction.merged_memtable_for_table(&self.name);
+            for (k, v) in &self.overlay {
+                merged.insert(k.clone(), v.clone());
+            }
+            Ok(Range::new_merged(
+                btree_iter,
+                merged,
+                lower,
+                upper,
+                self.transaction.transaction_guard(),
+            ))
+        } else {
+            self.tree
+                .range(&range)
+                .map(|x| Range::new(x, self.transaction.transaction_guard()))
+        }
     }
 
-    /// Note: buffered writes via `insert_buffered()` are NOT visible until
-    /// `flush_overlay()` is called.
     fn first(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        self.tree.first()
+        if self.transaction.is_deferred_flush() {
+            self.range::<K::SelfType<'_>>(..)?.next().transpose()
+        } else {
+            self.tree.first()
+        }
     }
 
-    /// Note: buffered writes via `insert_buffered()` are NOT visible until
-    /// `flush_overlay()` is called.
     fn last(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        self.tree.last()
+        if self.transaction.is_deferred_flush() {
+            self.range::<K::SelfType<'_>>(..)?.next_back().transpose()
+        } else {
+            self.tree.last()
+        }
     }
 }
 
@@ -1040,11 +1054,25 @@ impl<K: Key + 'static, V: Value + 'static> ReadOnlyTable<K, V> {
     /// alive until it is dropped.
     pub fn range<'a, KR>(&self, range: impl RangeBounds<KR>) -> Result<Range<'static, K, V>>
     where
-        KR: Borrow<K::SelfType<'a>>,
+        KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        self.tree
-            .range(&range)
-            .map(|x| Range::new(x, self.transaction_guard.clone()))
+        if let Some(mem) = &self.memtable {
+            let (lower, upper) = range_to_byte_bounds::<K, KR>(&range);
+            let btree_iter = self.tree.range(&range)?;
+            let mem_entries: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+                mem.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            Ok(Range::new_merged(
+                btree_iter,
+                mem_entries,
+                lower,
+                upper,
+                self.transaction_guard.clone(),
+            ))
+        } else {
+            self.tree
+                .range(&range)
+                .map(|x| Range::new(x, self.transaction_guard.clone()))
+        }
     }
 }
 
@@ -1088,17 +1116,39 @@ impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for ReadOnlyTable
     where
         KR: Borrow<K::SelfType<'a>> + 'a,
     {
-        self.tree
-            .range(&range)
-            .map(|x| Range::new(x, self.transaction_guard.clone()))
+        if let Some(mem) = &self.memtable {
+            let (lower, upper) = range_to_byte_bounds::<K, KR>(&range);
+            let btree_iter = self.tree.range(&range)?;
+            let mem_entries: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+                mem.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            Ok(Range::new_merged(
+                btree_iter,
+                mem_entries,
+                lower,
+                upper,
+                self.transaction_guard.clone(),
+            ))
+        } else {
+            self.tree
+                .range(&range)
+                .map(|x| Range::new(x, self.transaction_guard.clone()))
+        }
     }
 
     fn first(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        self.tree.first()
+        if self.memtable.is_some() {
+            self.range::<K::SelfType<'_>>(..)?.next().transpose()
+        } else {
+            self.tree.first()
+        }
     }
 
     fn last(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        self.tree.last()
+        if self.memtable.is_some() {
+            self.range::<K::SelfType<'_>>(..)?.next_back().transpose()
+        } else {
+            self.tree.last()
+        }
     }
 }
 
@@ -1202,47 +1252,320 @@ impl<
 
 #[derive(Clone)]
 pub struct Range<'a, K: Key + 'static, V: Value + 'static> {
-    inner: BtreeRangeIter<K, V>,
+    inner: RangeInner<K, V>,
     _transaction_guard: Arc<TransactionGuard>,
     // This lifetime is here so that `&` can be held on `Table` preventing concurrent mutation
     _lifetime: PhantomData<&'a ()>,
 }
 
+#[derive(Clone)]
+enum RangeInner<K: Key + 'static, V: Value + 'static> {
+    BtreeOnly(BtreeRangeIter<K, V>),
+    Merged {
+        btree: BtreeRangeIter<K, V>,
+        /// Memtable entries in key order. `None` value = tombstone.
+        mem: VecDeque<(Vec<u8>, Option<Vec<u8>>)>,
+        /// Peeked btree entry converted to owned bytes: (key, value).
+        btree_peek: Option<(Vec<u8>, Vec<u8>)>,
+    },
+}
+
 impl<K: Key + 'static, V: Value + 'static> Range<'_, K, V> {
     pub(super) fn new(inner: BtreeRangeIter<K, V>, guard: Arc<TransactionGuard>) -> Self {
         Self {
-            inner,
+            inner: RangeInner::BtreeOnly(inner),
+            _transaction_guard: guard,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Create a range that merges B-tree results with in-memory entries.
+    /// Entries are re-sorted using `K::compare` to match B-tree key ordering
+    /// and filtered to `[lower, upper)` bounds.
+    /// Entries with `None` values are tombstones that suppress B-tree entries.
+    pub(super) fn new_merged(
+        btree: BtreeRangeIter<K, V>,
+        mem_entries: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        lower: std::ops::Bound<Vec<u8>>,
+        upper: std::ops::Bound<Vec<u8>>,
+        guard: Arc<TransactionGuard>,
+    ) -> Self {
+        if mem_entries.is_empty() {
+            return Self::new(btree, guard);
+        }
+        // Re-sort by K::compare since BTreeMap's byte ordering may differ
+        // from the key type's logical ordering (e.g., u64 uses little-endian bytes).
+        let mut sorted: Vec<(Vec<u8>, Option<Vec<u8>>)> = mem_entries
+            .into_iter()
+            .filter(|(k, _)| {
+                let above_lower = match &lower {
+                    std::ops::Bound::Unbounded => true,
+                    std::ops::Bound::Included(lo) => K::compare(k, lo) != Ordering::Less,
+                    std::ops::Bound::Excluded(lo) => K::compare(k, lo) == Ordering::Greater,
+                };
+                let below_upper = match &upper {
+                    std::ops::Bound::Unbounded => true,
+                    std::ops::Bound::Included(hi) => K::compare(k, hi) != Ordering::Greater,
+                    std::ops::Bound::Excluded(hi) => K::compare(k, hi) == Ordering::Less,
+                };
+                above_lower && below_upper
+            })
+            .collect();
+        sorted.sort_by(|(a, _), (b, _)| K::compare(a, b));
+        if sorted.is_empty() {
+            return Self::new(btree, guard);
+        }
+        Self {
+            inner: RangeInner::Merged {
+                btree,
+                mem: sorted.into_iter().collect(),
+                btree_peek: None,
+            },
             _transaction_guard: guard,
             _lifetime: PhantomData,
         }
     }
 }
 
+/// Convert typed range bounds to byte bounds for memtable filtering.
+fn range_to_byte_bounds<'a, K: Key + 'static, KR: Borrow<K::SelfType<'a>> + 'a>(
+    range: &impl RangeBounds<KR>,
+) -> (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>) {
+    let lower = match range.start_bound() {
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        std::ops::Bound::Included(k) => {
+            std::ops::Bound::Included(K::as_bytes(k.borrow()).as_ref().to_vec())
+        }
+        std::ops::Bound::Excluded(k) => {
+            std::ops::Bound::Excluded(K::as_bytes(k.borrow()).as_ref().to_vec())
+        }
+    };
+    let upper = match range.end_bound() {
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        std::ops::Bound::Included(k) => {
+            std::ops::Bound::Included(K::as_bytes(k.borrow()).as_ref().to_vec())
+        }
+        std::ops::Bound::Excluded(k) => {
+            std::ops::Bound::Excluded(K::as_bytes(k.borrow()).as_ref().to_vec())
+        }
+    };
+    (lower, upper)
+}
+
+/// Advance the btree iterator and convert the next entry to owned bytes.
+fn btree_next_owned<K: Key, V: Value>(
+    btree: &mut BtreeRangeIter<K, V>,
+) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
+    btree.next().map(|r| {
+        r.map(|entry| {
+            let kd = entry.key_data();
+            let vd = entry.value_data();
+            (kd, vd)
+        })
+    })
+}
+
 impl<'a, K: Key + 'static, V: Value + 'static> Iterator for Range<'a, K, V> {
     type Item = Result<(AccessGuard<'a, K>, AccessGuard<'a, V>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|x| {
-            x.map(|entry| {
-                let (page, key_range, value_range) = entry.into_raw();
-                let key = AccessGuard::with_page(page.clone(), key_range);
-                let value = AccessGuard::with_page(page, value_range);
-                (key, value)
-            })
-        })
+        match &mut self.inner {
+            RangeInner::BtreeOnly(btree) => btree.next().map(|x| {
+                x.map(|entry| {
+                    let (page, key_range, value_range) = entry.into_raw();
+                    let key = AccessGuard::with_page(page.clone(), key_range);
+                    let value = AccessGuard::with_page(page, value_range);
+                    (key, value)
+                })
+            }),
+            RangeInner::Merged {
+                btree,
+                mem,
+                btree_peek,
+            } => {
+                loop {
+                    // Fill btree peek buffer if empty
+                    if btree_peek.is_none()
+                        && let Some(result) = btree_next_owned(btree)
+                    {
+                        match result {
+                            Ok(entry) => *btree_peek = Some(entry),
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+
+                    match (btree_peek.as_ref(), mem.front()) {
+                        (None, None) => return None,
+                        (Some(_), None) => {
+                            let (k, v) = btree_peek.take().unwrap();
+                            return Some(Ok((
+                                AccessGuard::with_owned_value(k),
+                                AccessGuard::with_owned_value(v),
+                            )));
+                        }
+                        (None, Some((_, None))) => {
+                            // Tombstone with no btree entry to suppress — skip
+                            mem.pop_front();
+                        }
+                        (None, Some(_)) => {
+                            let (k, v) = mem.pop_front().unwrap();
+                            return Some(Ok((
+                                AccessGuard::with_owned_value(k),
+                                AccessGuard::with_owned_value(v.unwrap()),
+                            )));
+                        }
+                        (Some((bk, _)), Some((mk, _))) => {
+                            match K::compare(bk.as_slice(), mk.as_slice()) {
+                                Ordering::Less => {
+                                    let (k, v) = btree_peek.take().unwrap();
+                                    return Some(Ok((
+                                        AccessGuard::with_owned_value(k),
+                                        AccessGuard::with_owned_value(v),
+                                    )));
+                                }
+                                Ordering::Greater => {
+                                    let (k, v) = mem.pop_front().unwrap();
+                                    match v {
+                                        None => {} // tombstone, no btree match
+                                        Some(vb) => {
+                                            return Some(Ok((
+                                                AccessGuard::with_owned_value(k),
+                                                AccessGuard::with_owned_value(vb),
+                                            )));
+                                        }
+                                    }
+                                }
+                                Ordering::Equal => {
+                                    // Same key — memtable wins (newer data)
+                                    btree_peek.take();
+                                    let (k, v) = mem.pop_front().unwrap();
+                                    match v {
+                                        None => {} // tombstone suppresses btree entry
+                                        Some(vb) => {
+                                            return Some(Ok((
+                                                AccessGuard::with_owned_value(k),
+                                                AccessGuard::with_owned_value(vb),
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 impl<K: Key + 'static, V: Value + 'static> DoubleEndedIterator for Range<'_, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|x| {
-            x.map(|entry| {
-                let (page, key_range, value_range) = entry.into_raw();
-                let key = AccessGuard::with_page(page.clone(), key_range);
-                let value = AccessGuard::with_page(page, value_range);
-                (key, value)
-            })
-        })
+        match &mut self.inner {
+            RangeInner::BtreeOnly(btree) => btree.next_back().map(|x| {
+                x.map(|entry| {
+                    let (page, key_range, value_range) = entry.into_raw();
+                    let key = AccessGuard::with_page(page.clone(), key_range);
+                    let value = AccessGuard::with_page(page, value_range);
+                    (key, value)
+                })
+            }),
+            RangeInner::Merged {
+                btree,
+                mem,
+                btree_peek,
+            } => {
+                // Get the btree's back entry (if any), converting to owned bytes.
+                // Note: btree_peek is for forward iteration; back iteration fetches fresh.
+                let mut btree_back: Option<(Vec<u8>, Vec<u8>)> = None;
+                if let Some(result) = btree.next_back() {
+                    match result {
+                        Ok(entry) => btree_back = Some((entry.key_data(), entry.value_data())),
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+
+                // Also check if the forward-peeked entry is actually the largest remaining.
+                // If btree_peek is set and larger than btree_back, it should be considered.
+                // For simplicity, if btree_peek exists and is larger than the btree_back,
+                // swap them (put the larger one as btree_back, push the smaller one back
+                // by storing in btree_peek). If btree_back is None, take btree_peek.
+                if let Some(peeked) = btree_peek.take() {
+                    match &btree_back {
+                        None => btree_back = Some(peeked),
+                        Some((bk, _)) => {
+                            if peeked.0.as_slice() > bk.as_slice() {
+                                // peeked is larger — use it as the back, put btree_back into peek
+                                let old_back = btree_back.replace(peeked).unwrap();
+                                *btree_peek = Some(old_back);
+                            } else {
+                                // btree_back is larger — keep it, restore peek
+                                *btree_peek = Some(peeked);
+                            }
+                        }
+                    }
+                }
+
+                loop {
+                    match (&btree_back, mem.back()) {
+                        (None, None) => return None,
+                        (Some(_), None) => {
+                            let (k, v) = btree_back.unwrap();
+                            return Some(Ok((
+                                AccessGuard::with_owned_value(k),
+                                AccessGuard::with_owned_value(v),
+                            )));
+                        }
+                        (None, Some((_, None))) => {
+                            mem.pop_back();
+                        }
+                        (None, Some(_)) => {
+                            let (k, v) = mem.pop_back().unwrap();
+                            return Some(Ok((
+                                AccessGuard::with_owned_value(k),
+                                AccessGuard::with_owned_value(v.unwrap()),
+                            )));
+                        }
+                        (Some((bk, _)), Some((mk, _))) => {
+                            match K::compare(bk.as_slice(), mk.as_slice()) {
+                                Ordering::Greater => {
+                                    let (k, v) = btree_back.unwrap();
+                                    return Some(Ok((
+                                        AccessGuard::with_owned_value(k),
+                                        AccessGuard::with_owned_value(v),
+                                    )));
+                                }
+                                Ordering::Less => {
+                                    let (k, v) = mem.pop_back().unwrap();
+                                    match v {
+                                        None => {}
+                                        Some(vb) => {
+                                            return Some(Ok((
+                                                AccessGuard::with_owned_value(k),
+                                                AccessGuard::with_owned_value(vb),
+                                            )));
+                                        }
+                                    }
+                                }
+                                Ordering::Equal => {
+                                    // Same key — memtable wins
+                                    // btree_back already consumed from iterator
+                                    let (k, v) = mem.pop_back().unwrap();
+                                    match v {
+                                        None => {}
+                                        Some(vb) => {
+                                            return Some(Ok((
+                                                AccessGuard::with_owned_value(k),
+                                                AccessGuard::with_owned_value(vb),
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

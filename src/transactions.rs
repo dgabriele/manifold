@@ -880,6 +880,8 @@ pub struct WriteTransaction {
     deferred_flush: bool,
     deferred_memtable: Option<crate::column_family::memtable::SharedMemtable>,
     pending_deferred_ops: Mutex<Vec<(String, crate::column_family::wal::entry::WALOp)>>,
+    /// Maps savepoint ID → deferred ops count at savepoint creation, for rollback.
+    deferred_ops_savepoints: Mutex<BTreeMap<u64, usize>>,
 }
 
 impl WriteTransaction {
@@ -921,6 +923,7 @@ impl WriteTransaction {
             deferred_flush: false,
             deferred_memtable: None,
             pending_deferred_ops: Mutex::new(Vec::new()),
+            deferred_ops_savepoints: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -958,16 +961,20 @@ impl WriteTransaction {
     /// Pushes a deferred key-value operation for later WAL append + memtable merge.
     pub(crate) fn push_deferred_op(&self, table_name: &str, key: Vec<u8>, value: Option<Vec<u8>>) {
         use crate::column_family::wal::entry::WALOp;
-        self.pending_deferred_ops.lock().unwrap().push((
-            table_name.to_string(),
-            WALOp { key, value },
-        ));
+        self.pending_deferred_ops
+            .lock()
+            .unwrap()
+            .push((table_name.to_string(), WALOp { key, value }));
     }
 
     /// Look up a key in pending deferred ops for a given table.
     /// Returns the most recent value if found (Some(bytes) for insert, None for delete),
     /// or Err(()) if the key is not in pending ops.
-    pub(crate) fn get_deferred_op(&self, table_name: &str, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, ()> {
+    pub(crate) fn get_deferred_op(
+        &self,
+        table_name: &str,
+        key: &[u8],
+    ) -> std::result::Result<Option<Vec<u8>>, ()> {
         let ops = self.pending_deferred_ops.lock().unwrap();
         // Search in reverse to find the most recent op for this key
         for (tbl, op) in ops.iter().rev() {
@@ -980,13 +987,49 @@ impl WriteTransaction {
 
     /// Look up a key in the shared memtable (committed data from prior transactions
     /// that hasn't been checkpointed to the B-tree yet).
-    /// Returns Some(Some(bytes)) for a found value, Some(None) for a tombstone,
-    /// or None if the key is not in the memtable.
-    pub(crate) fn get_from_memtable(&self, table_name: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+    /// Returns `Some(Some(bytes))` for a found value, `Some(None)` for a tombstone,
+    /// or `None` if the key is not in the memtable.
+    #[allow(clippy::option_option)]
+    pub(crate) fn get_from_memtable(
+        &self,
+        table_name: &str,
+        key: &[u8],
+    ) -> Option<Option<Vec<u8>>> {
         let memtable = self.deferred_memtable.as_ref()?;
         let mem = memtable.read().unwrap();
         let table_mem = mem.tables.get(table_name)?;
         table_mem.entries.get(key).cloned()
+    }
+
+    /// Build a merged `BTreeMap` of all in-memory entries for a table, suitable for
+    /// range iteration. Merges memtable (committed prior txns) with deferred ops
+    /// (prior Table handles in this txn). Memtable is lower priority; deferred ops override.
+    /// Does NOT include the current Table handle's overlay (caller merges that separately).
+    pub(crate) fn merged_memtable_for_table(
+        &self,
+        table_name: &str,
+    ) -> std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        let mut merged = std::collections::BTreeMap::new();
+
+        // Layer 1: shared memtable (committed prior transactions, lowest priority)
+        if let Some(memtable) = &self.deferred_memtable {
+            let mem = memtable.read().unwrap();
+            if let Some(table_mem) = mem.tables.get(table_name) {
+                for (k, v) in &table_mem.entries {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        // Layer 2: deferred ops from prior Table handles in this transaction (higher priority)
+        let ops = self.pending_deferred_ops.lock().unwrap();
+        for (tbl, op) in ops.iter() {
+            if tbl == table_name {
+                merged.insert(op.key.clone(), op.value.clone());
+            }
+        }
+
+        merged
     }
 
     /// Disable WAL for this specific transaction.
@@ -1289,6 +1332,15 @@ impl WriteTransaction {
         #[cfg(feature = "logging")]
         debug!("Creating savepoint id={id:?}, txn_id={transaction_id:?}");
 
+        // Record deferred ops count for rollback
+        if self.deferred_flush {
+            let ops_len = self.pending_deferred_ops.lock().unwrap().len();
+            self.deferred_ops_savepoints
+                .lock()
+                .unwrap()
+                .insert(id.0, ops_len);
+        }
+
         let root = self.mem.get_data_root();
         let savepoint = Savepoint::new_ephemeral(
             &self.mem,
@@ -1421,6 +1473,16 @@ impl WriteTransaction {
         for persistent_savepoint in self.list_persistent_savepoints()? {
             if persistent_savepoint > savepoint.get_id().0 {
                 self.delete_persistent_savepoint(persistent_savepoint)?;
+            }
+        }
+
+        // Truncate deferred ops back to the savepoint's state
+        if self.deferred_flush {
+            let sp_id = savepoint.get_id().0;
+            let savepoints = self.deferred_ops_savepoints.lock().unwrap();
+            if let Some(&ops_len) = savepoints.get(&sp_id) {
+                let mut ops = self.pending_deferred_ops.lock().unwrap();
+                ops.truncate(ops_len);
             }
         }
 
@@ -1646,8 +1708,11 @@ impl WriteTransaction {
     }
 
     fn commit_inner(&mut self) -> Result<(), CommitError> {
+        // Handle deferred ops first (WAL LogicalOps + memtable), then fall
+        // through to the normal commit to persist B-tree metadata (table
+        // definitions, system tables, etc.).
         if self.deferred_flush {
-            return self.commit_inner_deferred();
+            self.commit_deferred_ops()?;
         }
 
         // Quick-repair requires 2-phase commit
@@ -1752,9 +1817,9 @@ impl WriteTransaction {
         Ok(())
     }
 
-    /// Deferred flush commit path: skip B-tree mutation entirely.
-    /// Appends `LogicalOps` to WAL and merges into the shared memtable.
-    fn commit_inner_deferred(&mut self) -> Result<(), CommitError> {
+    /// Handle deferred flush ops: append `LogicalOps` to WAL and merge into
+    /// the shared memtable. Called before the normal B-tree commit.
+    fn commit_deferred_ops(&mut self) -> Result<(), CommitError> {
         use crate::column_family::wal::entry::{WALEntry, WALOp};
 
         let wal_journal = self
@@ -2636,7 +2701,10 @@ impl ReadTransaction {
 
     /// Sets the memtable snapshot for this read transaction.
     /// When set, table reads will check the memtable before falling through to the B-tree.
-    pub(crate) fn set_memtable_snapshot(&mut self, snapshot: crate::column_family::memtable::MemtableSnapshot) {
+    pub(crate) fn set_memtable_snapshot(
+        &mut self,
+        snapshot: crate::column_family::memtable::MemtableSnapshot,
+    ) {
         self.memtable_snapshot = Some(snapshot);
     }
 
@@ -2650,7 +2718,9 @@ impl ReadTransaction {
             .get_table::<K, V>(definition.name(), TableType::Normal)?
             .ok_or_else(|| TableError::TableDoesNotExist(definition.name().to_string()))?;
 
-        let table_memtable = self.memtable_snapshot.as_ref()
+        let table_memtable = self
+            .memtable_snapshot
+            .as_ref()
             .and_then(|s| s.tables.get(definition.name()))
             .cloned();
 
